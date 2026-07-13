@@ -497,3 +497,13 @@ print("  - tables.md          : All tables in markdown")
 print("  - raw.txt            : Flat text with heading markers")
 print("  - report.txt         : Full diagnostic report")
 print("  - sections.csv       : Section summary statistics")
+
+######
+from docx_diagnostic_simple import DocxDiagnosticAnalyzer, load_docx_as_markdown
+from pathlib import Path
+
+markdown = load_docx_as_markdown(Path("your_file.docx"))
+analyzer = DocxDiagnosticAnalyzer(markdown, "your_file.docx")
+analyzer.analyze()
+
+print(analyzer.generate_report())
