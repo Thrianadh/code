@@ -1,0 +1,72 @@
+import json
+from docx import Document
+from docx.shared import Inches
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+import os
+
+def extract_paragraphs(doc):
+    """Extract all paragraphs from the document."""
+    paragraphs = []
+    for para in doc.paragraphs:
+        paragraphs.append({
+            "text": para.text,
+            "style": para.style.name,
+            "alignment": para.alignment,
+            "bold": any(run.bold for run in para.runs),
+            "italic": any(run.italic for run in para.runs),
+        })
+    return paragraphs
+
+def extract_tables(doc):
+    """Extract all tables from the document."""
+    tables = []
+    for table in doc.tables:
+        table_data = []
+        for row in table.rows:
+            row_data = [cell.text for cell in row.cells]
+            table_data.append(row_data)
+        tables.append(table_data)
+    return tables
+
+def extract_headings(doc):
+    """Extract headings (paragraphs with Heading styles)."""
+    headings = []
+    for para in doc.paragraphs:
+        if para.style.name.startswith("Heading"):
+            headings.append({
+                "text": para.text,
+                "level": int(para.style.name.split(" ")[-1]),  # e.g., "Heading 1" -> 1
+            })
+    return headings
+
+def save_to_json(data, output_file="extracted_data.json"):
+    """Save extracted data to a JSON file."""
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+    print(f"Data saved to {output_file}")
+
+def extract_docx(file_path):
+    """Main function to extract data from a .docx file."""
+    doc = Document(file_path)
+    data = {
+        "metadata": {
+            "file_name": os.path.basename(file_path),
+            "num_paragraphs": len(doc.paragraphs),
+            "num_tables": len(doc.tables),
+        },
+        "headings": extract_headings(doc),
+        "paragraphs": extract_paragraphs(doc),
+        "tables": extract_tables(doc),
+    }
+    return data
+
+if __name__ == "__main__":
+    # Example usage
+    input_file = "onenote_data.docx"  # Replace with your file path
+    output_file = "onenote_extracted_data.json"
+
+    if os.path.exists(input_file):
+        extracted_data = extract_docx(input_file)
+        save_to_json(extracted_data, output_file)
+    else:
+        print(f"Error: File '{input_file}' not found.")
