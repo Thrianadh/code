@@ -505,5 +505,65 @@ from pathlib import Path
 markdown = load_docx_as_markdown(Path("your_file.docx"))
 analyzer = DocxDiagnosticAnalyzer(markdown, "your_file.docx")
 analyzer.analyze()
+#####
+from pathlib import Path
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
+
+def extract_document_data(file_path: str):
+    path = Path(file_path)
+    if not path.exists():
+        print(f"Error: File {file_path} not found.")
+        return
+
+    # 1. Configure OCR options for PDFs and Images
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = True  # Enables OCR for scanned text/images
+    pipeline_options.do_table_structure = True  # Enables advanced table structure extraction
+    
+    # 2. Initialize Converter with options
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            InputFormat.IMAGE: PdfFormatOption(pipeline_options=pipeline_options)
+        }
+    )
+
+    # 3. Convert the document (Works for .docx, .pdf, .png, .jpg, etc.)
+    print(f"Processing {path.name}...")
+    result = converter.convert(path)
+    doc = result.document
+
+    # 4. Extract and print normal text
+    print("\n--- EXTRACTED TEXT ---")
+    print(doc.export_to_markdown()) # Markdown preserves headings and list formats
+
+    # 5. Extract and print tables specifically
+    print("\n--- EXTRACTED TABLES ---")
+    if hasattr(doc, 'tables') and doc.tables:
+        for i, table in enumerate(doc.tables):
+            print(f"\nTable {i+1}:")
+            # Convert the table data into a clean text grid layout
+            for row in table.data:
+                print(" | ".join([str(cell.text).strip() for cell in row]))
+    else:
+        # Fallback for structured document models
+        table_count = 0
+        for element, _ in doc.iterate_items():
+            if element.label == "Table":
+                table_count += 1
+                print(f"\nTable {table_count}:")
+                # Docling stores tables as structured grid elements
+                if hasattr(element, 'data'):
+                    for row in element.data:
+                        print(" | ".join([str(cell.text).strip() for cell in row]))
+
+# --- Execution Example ---
+# For a Word document containing text and tables:
+extract_document_data("sample_document.docx")
+
+# For an image file needing complete OCR:
+# extract_document_data("scanned_image.png")
 
 print(analyzer.generate_report())
