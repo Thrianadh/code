@@ -448,3 +448,52 @@ if __name__ == "__main__":
 
     else:
         print(f"Error: File '{input_file}' not found.")
+#####
+#!/usr/bin/env python3
+"""
+================================================================================
+USAGE: DOCX Diagnostic Extractor
+================================================================================
+
+Run this script to analyze your manually-transferred OneNote .docx file.
+It will identify all formatting challenges before RAG ingestion.
+
+================================================================================
+"""
+
+from docx_diagnostic_extractor import DocxDiagnosticExtractor
+
+# Step 1: Set your file path
+INPUT_FILE = "/path/to/your/manually_transferred_onenote.docx"
+OUTPUT_DIR = "./docx_diagnostic_output"
+
+# Step 2: Run extraction
+extractor = DocxDiagnosticExtractor(INPUT_FILE)
+report = extractor.run(OUTPUT_DIR)
+
+# Step 3: Inspect results
+print("\n" + "="*70)
+print("QUICK INSPECTION")
+print("="*70)
+
+print(f"\nTotal Paragraphs: {report.total_paragraphs}")
+print(f"Total Words:      {report.total_words}")
+print(f"Total Tables:     {report.total_tables}")
+print(f"Total Images:     {report.total_images}")
+print(f"Total Sections:   {report.total_sections}")
+
+print(f"\nHeadings Found ({len(report.headings_found)}):")
+for text, level in report.headings_found[:10]:
+    indent = "  " * (level - 1) if level > 0 else ""
+    print(f"  {indent}[H{level}] {text[:60]}")
+
+print(f"\nIssues Found ({len(report.recommendations)}):")
+for i, rec in enumerate(report.recommendations, 1):
+    print(f"  {i}. {rec}")
+
+print(f"\nOutput files saved to: {OUTPUT_DIR}")
+print("  - structured.json    : Full structured data")
+print("  - tables.md          : All tables in markdown")
+print("  - raw.txt            : Flat text with heading markers")
+print("  - report.txt         : Full diagnostic report")
+print("  - sections.csv       : Section summary statistics")
