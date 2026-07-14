@@ -1,629 +1,25 @@
-import json
-from docx import Document
-from docx.shared import Inches
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-import os
-
-def extract_paragraphs(doc):
-    """Extract all paragraphs from the document."""
-    paragraphs = []
-    for para in doc.paragraphs:
-        paragraphs.append({
-            "text": para.text,
-            "style": para.style.name,
-            "alignment": para.alignment,
-            "bold": any(run.bold for run in para.runs),
-            "italic": any(run.italic for run in para.runs),
-        })
-    return paragraphs
-
-def extract_tables(doc):
-    """Extract all tables from the document."""
-    tables = []
-    for table in doc.tables:
-        table_data = []
-        for row in table.rows:
-            row_data = [cell.text for cell in row.cells]
-            table_data.append(row_data)
-        tables.append(table_data)
-    return tables
-
-def extract_headings(doc):
-    """Extract headings (paragraphs with Heading styles)."""
-    headings = []
-    for para in doc.paragraphs:
-        if para.style.name.startswith("Heading"):
-            headings.append({
-                "text": para.text,
-                "level": int(para.style.name.split(" ")[-1]),  # e.g., "Heading 1" -> 1
-            })
-    return headings
-
-def save_to_json(data, output_file="extracted_data.json"):
-    """Save extracted data to a JSON file."""
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-    print(f"Data saved to {output_file}")
-
-def extract_docx(file_path):
-    """Main function to extract data from a .docx file."""
-    doc = Document(file_path)
-    data = {
-        "metadata": {
-            "file_name": os.path.basename(file_path),
-            "num_paragraphs": len(doc.paragraphs),
-            "num_tables": len(doc.tables),
-        },
-        "headings": extract_headings(doc),
-        "paragraphs": extract_paragraphs(doc),
-        "tables": extract_tables(doc),
-    }
-    return data
-
-if __name__ == "__main__":
-    # Example usage
-    input_file = "onenote_data.docx"  # Replace with your file path
-    output_file = "onenote_extracted_data.json"
-
-    if os.path.exists(input_file):
-        extracted_data = extract_docx(input_file)
-        save_to_json(extracted_data, output_file)
-###
-#!/usr/bin/env python3
-"""
-Simplified DOCX Diagnostic Extractor
-======================================
-Uses mammoth to convert .docx → markdown, then analyzes structure.
-Reuses helpers from common.py style.
-
-Outputs:
-  - report.txt          Human-readable diagnostic report
-  - sections.json       Detected sections with content
-  - tables.md           Tables found in markdown format
-  - raw.md              Full markdown text
-
-Usage:
-  python docx_diagnostic_simple.py --input file.docx --output ./report
-"""
-
-import argparse
-import json
-import os
-import re
-from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-
-import mammoth
-
-
-def load_docx_as_markdown(path: Path) -> str:
-    """Read .docx and return markdown (mammoth). Skips broken images."""
-    def _ignore_image(_image):
-        return []
-    with path.open("rb") as fh:
-        result = mammoth.convert_to_markdown(
-            fh, convert_image=mammoth.images.img_element(_ignore_image)
-        )
-    return result.value
-
-
-def looks_like_heading(line: str) -> Optional[str]:
-    """Detect __bold__ lines as pseudo-headings (OneNote copy-paste style)."""
-    match = re.match(r'^\s*__([^_].{2,120}?)__\s*$', line)
-    if not match:
-        return None
-    text = match.group(1).strip()
-    if len(text) > 120 or text.endswith('.'):
-        return None
-    return text
-
-
-def normalize_whitespace(text: str) -> str:
-    """Collapse blank lines and strip trailing whitespace."""
-    lines = [line.rstrip() for line in text.splitlines()]
-    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()
-
-
-def strip_markdown_bold(text: str) -> str:
-    """Remove __bold__ markers."""
-    return re.sub(r'__([^_]+)__', r'\1', text)
-
-
-# =============================================================================
-# DIAGNOSTIC ANALYZER
-# =============================================================================
-class DocxDiagnosticAnalyzer:
-    """Analyzes markdown from mammoth to find structure and issues."""
-
-    def __init__(self, markdown_text: str, filename: str):
-        self.text = normalize_whitespace(markdown_text)
-        self.filename = filename
-        self.lines = self.text.splitlines()
-        self.sections: List[Dict] = []
-        self.tables: List[str] = []
-        self.issues: List[str] = []
-
-    def analyze(self):
-        """Run all analysis steps."""
-        self._find_tables()
-        self._find_sections()
-        self._find_issues()
-
-    def _find_tables(self):
-        """Extract markdown tables (lines starting with |)."""
-        in_table = False
-        current_table = []
-
-        for line in self.lines:
-            stripped = line.strip()
-            if stripped.startswith('|'):
-                in_table = True
-                current_table.append(stripped)
-            elif in_table:
-                # Table ended
-                if len(current_table) >= 2:  # Need at least header + separator
-                    self.tables.append('\n'.join(current_table))
-                in_table = False
-                current_table = []
-
-        # Catch last table
-        if in_table and len(current_table) >= 2:
-            self.tables.append('\n'.join(current_table))
-
-    def _find_sections(self):
-        """Split markdown into sections by heading lines."""
-        current = {
-            'heading': 'Introduction',
-            'heading_level': 0,
-            'lines': [],
-            'tables': [],
-            'word_count': 0
-        }
-        table_idx = 0
-        tables_in_section = []
-
-        for line in self.lines:
-            heading_text = looks_like_heading(line)
-
-            if heading_text:
-                # Save previous section
-                current['word_count'] = len(' '.join(current['lines']).split())
-                current['tables'] = tables_in_section
-                self.sections.append(current)
-
-                # Start new section
-                current = {
-                    'heading': heading_text,
-                    'heading_level': 1,  # All __bold__ treated as H1
-                    'lines': [],
-                    'tables': [],
-                    'word_count': 0
-                }
-                tables_in_section = []
-
-            elif line.strip().startswith('|'):
-                # Table line - associate with current section
-                if table_idx < len(self.tables):
-                    tables_in_section.append(table_idx)
-                    table_idx += 1
-            else:
-                current['lines'].append(line)
-
-        # Save last section
-        current['word_count'] = len(' '.join(current['lines']).split())
-        current['tables'] = tables_in_section
-        self.sections.append(current)
-
-    def _find_issues(self):
-        """Detect common problems in the markdown."""
-        # 1. Check for images (mammoth usually drops them, but check for placeholders)
-        image_markers = ['[image]', '![]', 'Image:', 'Figure:']
-        image_count = sum(1 for line in self.lines if any(m in line for m in image_markers))
-        if image_count > 0:
-            self.issues.append(
-                f"🔴 Found {image_count} image reference(s). "
-                f"Images were skipped by mammoth — content may be missing. "
-                f"Consider manual transcription or OCR."
-            )
-
-        # 2. Check for tables
-        if self.tables:
-            self.issues.append(
-                f"🟡 Found {len(self.tables)} table(s). "
-                f"Verify row alignment in markdown output."
-            )
-
-            # Check for very wide tables (many columns)
-            for i, table in enumerate(self.tables):
-                first_line = table.split('\n')[0]
-                col_count = first_line.count('|') - 1
-                if col_count > 5:
-                    self.issues.append(
-                        f"🟡 Table {i+1} has {col_count} columns — "
-                        f"may be hard for LLM to read. Consider simplifying."
-                    )
-
-        # 3. Check for very long sections
-        long_sections = [s for s in self.sections if s['word_count'] > 1000]
-        if long_sections:
-            self.issues.append(
-                f"🟡 {len(long_sections)} section(s) have >1000 words. "
-                f"Consider splitting for better RAG retrieval."
-            )
-
-        # 4. Check for very short sections
-        short_sections = [s for s in self.sections if 0 < s['word_count'] < 20]
-        if short_sections:
-            self.issues.append(
-                f"🟡 {len(short_sections)} section(s) have <20 words. "
-                f"These may be formatting artifacts or empty headings."
-            )
-
-        # 5. Check for no headings at all
-        heading_sections = [s for s in self.sections if s['heading_level'] > 0]
-        if len(heading_sections) <= 1:
-            self.issues.append(
-                f"🔴 Only {len(heading_sections)} heading(s) detected. "
-                f"Document may lack structure. Check if bold text was preserved in OneNote transfer."
-            )
-
-        # 6. Check for potential multi-column (alternating short lines)
-        short_lines = [l for l in self.lines if 10 < len(l.strip()) < 60]
-        if len(short_lines) > 20:
-            # Check for pairs of lines with similar length (side-by-side)
-            pairs = 0
-            for i in range(0, len(short_lines)-1, 2):
-                if abs(len(short_lines[i]) - len(short_lines[i+1])) < 10:
-                    pairs += 1
-            if pairs > 5:
-                self.issues.append(
-                    "🟡 Potential multi-column layout detected (pairs of similar-length short lines). "
-                    "Verify addresses and paired data are not interleaved."
-                )
-
-        # 7. Check for embedded document references
-        doc_refs = ['.docx', '.pdf', '.xlsx', 'Template', 'Attachment']
-        ref_count = sum(1 for line in self.lines if any(r in line for r in doc_refs))
-        if ref_count > 0:
-            self.issues.append(
-                f"🟡 Found {ref_count} reference(s) to embedded documents/templates. "
-                f"Content from these files is not included in the markdown."
-            )
-
-        # 8. Check for URLs
-        urls = re.findall(r'https?://[^\s]+', self.text)
-        if urls:
-            self.issues.append(
-                f"🟡 Found {len(urls)} URL(s). External content is not included: "
-                f"{', '.join(urls[:3])}{'...' if len(urls) > 3 else ''}"
-            )
-
-        # 9. Check for numbered lists that might be procedures
-        numbered = [l for l in self.lines if re.match(r'^\s*\d+[\.\)]\s+', l.strip())]
-        if len(numbered) > 5:
-            self.issues.append(
-                f"🟡 Found {len(numbered)} numbered list items. "
-                f"Ensure these are grouped under correct section headings."
-            )
-
-    def generate_report(self) -> str:
-        """Generate human-readable diagnostic report."""
-        lines = [
-            "=" * 70,
-            "DOCX DIAGNOSTIC REPORT (Markdown-based)",
-            "=" * 70,
-            "",
-            f"File: {self.filename}",
-            f"",
-            f"STATISTICS",
-            f"  Total Lines:        {len(self.lines)}",
-            f"  Total Words:        {len(self.text.split())}",
-            f"  Sections Found:     {len(self.sections)}",
-            f"  Tables Found:       {len(self.tables)}",
-            f"  Issues Found:       {len(self.issues)}",
-            f"",
-            f"SECTIONS BREAKDOWN",
-        ]
-
-        for i, sec in enumerate(self.sections):
-            lines.append(
-                f"  [{i+1}] {sec['heading'][:50]} | "
-                f"{len(sec['lines'])} lines | {sec['word_count']} words | "
-                f"{len(sec['tables'])} tables"
-            )
-
-        lines.extend([
-            f"",
-            f"TABLES BREAKDOWN",
-        ])
-
-        for i, table in enumerate(self.tables):
-            first_line = table.split('\n')[0]
-            col_count = first_line.count('|') - 1
-            row_count = len([l for l in table.split('\n') if l.strip().startswith('|')])
-            lines.append(f"  [T{i+1}] {row_count} rows x {col_count} cols")
-
-        lines.extend([
-            f"",
-            f"ISSUES & RECOMMENDATIONS",
-        ])
-
-        if self.issues:
-            for issue in self.issues:
-                lines.append(f"  {issue}")
-        else:
-            lines.append("  ✅ No major issues detected.")
-
-        lines.extend([
-            f"",
-            f"RECOMMENDATIONS FOR RAG INGESTION",
-            f"  1. If images are missing: Manually transcribe critical screenshots or use OCR.",
-            f"  2. If tables are complex: Verify markdown row alignment before ingestion.",
-            f"  3. If sections are too long (>1000 words): Split into sub-sections.",
-            f"  4. If no headings detected: Add __bold__ lines as section markers in the docx.",
-            f"  5. If URLs are present: Decide whether to crawl them or keep as references.",
-            f"",
-            f"=" * 70,
-            f"END OF REPORT",
-            f"=" * 70,
-        ])
-
-        return '\n'.join(lines)
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
-def main():
-    parser = argparse.ArgumentParser(description="Simplified DOCX Diagnostic Extractor")
-    parser.add_argument("--input", "-i", required=True, help="Path to .docx file")
-    parser.add_argument("--output", "-o", default="./docx_diagnostic", help="Output directory")
-    args = parser.parse_args()
-
-    input_path = Path(args.input)
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Loading: {input_path}")
-    markdown = load_docx_as_markdown(input_path)
-    print(f"  Markdown length: {len(markdown)} chars, {len(markdown.splitlines())} lines")
-
-    print(f"Analyzing...")
-    analyzer = DocxDiagnosticAnalyzer(markdown, input_path.name)
-    analyzer.analyze()
-
-    # Save outputs
-    base = input_path.stem
-
-    # 1. Report
-    report_path = output_dir / f"{base}_report.txt"
-    report_path.write_text(analyzer.generate_report(), encoding="utf-8")
-    print(f"  ✓ Report: {report_path}")
-
-    # 2. Sections JSON
-    sections_path = output_dir / f"{base}_sections.json"
-    sections_data = [
-        {
-            "id": i+1,
-            "heading": s["heading"],
-            "word_count": s["word_count"],
-            "line_count": len(s["lines"]),
-            "table_count": len(s["tables"]),
-            "content": "\\n".join(s["lines"])[:500] + "..." if len("\\n".join(s["lines"])) > 500 else "\\n".join(s["lines"])
-        }
-        for i, s in enumerate(analyzer.sections)
-    ]
-    sections_path.write_text(json.dumps(sections_data, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"  ✓ Sections: {sections_path}")
-
-    # 3. Tables markdown
-    if analyzer.tables:
-        tables_path = output_dir / f"{base}_tables.md"
-        tables_md = "\n\n---\n\n".join(
-            f"## Table {i+1}\n\n{t}" for i, t in enumerate(analyzer.tables)
-        )
-        tables_path.write_text(tables_md, encoding="utf-8")
-        print(f"  ✓ Tables: {tables_path}")
-
-    # 4. Raw markdown
-    raw_path = output_dir / f"{base}_raw.md"
-    raw_path.write_text(markdown, encoding="utf-8")
-    print(f"  ✓ Raw markdown: {raw_path}")
-
-    # Print summary
-    print(f"\n{'='*70}")
-    print(f"SUMMARY")
-    print(f"{'='*70}")
-    print(f"Sections: {len(analyzer.sections)}")
-    print(f"Tables:   {len(analyzer.tables)}")
-    print(f"Issues:   {len(analyzer.issues)}")
-    print(f"\nTop issues:")
-    for issue in analyzer.issues[:5]:
-        print(f"  {issue}")
-    print(f"\nSee {output_dir} for full details.")
-
-
-if __name__ == "__main__":
-    main()
-
-    else:
-        print(f"Error: File '{input_file}' not found.")
-#####
-#!/usr/bin/env python3
-"""
-================================================================================
-USAGE: DOCX Diagnostic Extractor
-================================================================================
-
-Run this script to analyze your manually-transferred OneNote .docx file.
-It will identify all formatting challenges before RAG ingestion.
-
-================================================================================
-"""
-
-from docx_diagnostic_extractor import DocxDiagnosticExtractor
-
-# Step 1: Set your file path
-INPUT_FILE = "/path/to/your/manually_transferred_onenote.docx"
-OUTPUT_DIR = "./docx_diagnostic_output"
-
-# Step 2: Run extraction
-extractor = DocxDiagnosticExtractor(INPUT_FILE)
-report = extractor.run(OUTPUT_DIR)
-
-# Step 3: Inspect results
-print("\n" + "="*70)
-print("QUICK INSPECTION")
-print("="*70)
-
-print(f"\nTotal Paragraphs: {report.total_paragraphs}")
-print(f"Total Words:      {report.total_words}")
-print(f"Total Tables:     {report.total_tables}")
-print(f"Total Images:     {report.total_images}")
-print(f"Total Sections:   {report.total_sections}")
-
-print(f"\nHeadings Found ({len(report.headings_found)}):")
-for text, level in report.headings_found[:10]:
-    indent = "  " * (level - 1) if level > 0 else ""
-    print(f"  {indent}[H{level}] {text[:60]}")
-
-print(f"\nIssues Found ({len(report.recommendations)}):")
-for i, rec in enumerate(report.recommendations, 1):
-    print(f"  {i}. {rec}")
-
-print(f"\nOutput files saved to: {OUTPUT_DIR}")
-print("  - structured.json    : Full structured data")
-print("  - tables.md          : All tables in markdown")
-print("  - raw.txt            : Flat text with heading markers")
-print("  - report.txt         : Full diagnostic report")
-print("  - sections.csv       : Section summary statistics")
-
-######
-from docx_diagnostic_simple import DocxDiagnosticAnalyzer, load_docx_as_markdown
-from pathlib import Path
-
-markdown = load_docx_as_markdown(Path("your_file.docx"))
-analyzer = DocxDiagnosticAnalyzer(markdown, "your_file.docx")
-analyzer.analyze()
-#####
-from pathlib import Path
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
-
-def extract_document_data(file_path: str):
-    path = Path(file_path)
-    if not path.exists():
-        print(f"Error: File {file_path} not found.")
-        return
-
-    # 1. Configure OCR options for PDFs and Images
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True  # Enables OCR for scanned text/images
-    pipeline_options.do_table_structure = True  # Enables advanced table structure extraction
-    
-    # 2. Initialize Converter with options
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-            InputFormat.IMAGE: PdfFormatOption(pipeline_options=pipeline_options)
-        }
-    )
-
-    # 3. Convert the document (Works for .docx, .pdf, .png, .jpg, etc.)
-    print(f"Processing {path.name}...")
-    result = converter.convert(path)
-    doc = result.document
-
-    # 4. Extract and print normal text
-    print("\n--- EXTRACTED TEXT ---")
-    print(doc.export_to_markdown()) # Markdown preserves headings and list formats
-
-    # 5. Extract and print tables specifically
-    print("\n--- EXTRACTED TABLES ---")
-    if hasattr(doc, 'tables') and doc.tables:
-        for i, table in enumerate(doc.tables):
-            print(f"\nTable {i+1}:")
-            # Convert the table data into a clean text grid layout
-            for row in table.data:
-                print(" | ".join([str(cell.text).strip() for cell in row]))
-    else:
-        # Fallback for structured document models
-        table_count = 0
-        for element, _ in doc.iterate_items():
-            if element.label == "Table":
-                table_count += 1
-                print(f"\nTable {table_count}:")
-                # Docling stores tables as structured grid elements
-                if hasattr(element, 'data'):
-                    for row in element.data:
-                        print(" | ".join([str(cell.text).strip() for cell in row]))
-
-# --- Execution Example ---
-# For a Word document containing text and tables:
-extract_document_data("sample_document.docx")
-
-# For an image file needing complete OCR:
-# extract_document_data("scanned_image.png")
-
-print(analyzer.generate_report())
-#############
-python-docx>=0.8.11
-lxml>=4.9.0
-
-# Image processing & OCR
-Pillow>=9.0.0
-pytesseract>=0.3.10
-
-# Optional: Baidu Unlimited OCR via HuggingFace
-# transformers>=4.30.0
-# torch>=2.0.0
-# accelerate>=0.20.0
-
-#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
-"""
-OneNote DOCX Structured Extractor
-=================================
-Extracts text, tables, images, and multi-column layouts from .docx files
-while preserving reading order and structural integrity.
-
-Supports:
-- Plain text, headings, list items
-- Single / nested / multi-tables (including borderless column layouts)
-- Inline images with OCR (pytesseract + Baidu Unlimited OCR placeholder)
-- Headers & footers
-- Structured JSON output
-
-Usage:
-    python onenote_docx_extractor.py input.docx -o ./output --ocr pytesseract
-"""
+!pip install python-docx lxml Pillow pytesseract
 
 import os
 import sys
 import json
 import base64
 import io
-import argparse
 import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Tuple
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
 
-# ---------------------------------------------------------------------------
 # Core DOCX processing
-# ---------------------------------------------------------------------------
 from docx import Document
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from docx.section import Section
 from lxml import etree
 
-# ---------------------------------------------------------------------------
 # Image / OCR
-# ---------------------------------------------------------------------------
 try:
     from PIL import Image as PILImage
     PILLOW_AVAILABLE = True
@@ -643,16 +39,13 @@ except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
 
-# ---------------------------------------------------------------------------
-# Data Models
-# ---------------------------------------------------------------------------
 class ElementType(Enum):
     TEXT = "text"
     HEADING = "heading"
     LIST_ITEM = "list_item"
     TABLE = "table"
     IMAGE = "image"
-    COLUMN_LAYOUT = "column_layout"  # Borderless table used for columns
+    COLUMN_LAYOUT = "column_layout"
     HEADER = "header"
     FOOTER = "footer"
 
@@ -673,9 +66,6 @@ class ExtractedElement:
         }
 
 
-# ---------------------------------------------------------------------------
-# Main Extractor
-# ---------------------------------------------------------------------------
 class OneNoteDocxExtractor:
     """
     Production-grade extractor for OneNote-sourced DOCX files.
@@ -707,12 +97,10 @@ class OneNoteDocxExtractor:
         self.elements: List[ExtractedElement] = []
         self.reading_order = 0
         self.image_counter = 0
-        self._image_hashes = set()  # Deduplication
+        self._image_hashes = set()
 
-        # OCR pipeline (lazy init)
         self._baidu_pipeline = None
 
-        # Namespace map for XPath
         self._nsmap = {
             "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
             "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
@@ -724,16 +112,11 @@ class OneNoteDocxExtractor:
             "v": "urn:schemas-microsoft-com:vml",
         }
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def extract_all(self) -> Dict[str, Any]:
         """Run full extraction pipeline."""
         metadata = self._extract_metadata()
         self._process_body()
         self._process_headers_and_footers()
-
-        # Final safety sort (XML order is usually correct, but we enforce it)
         self.elements.sort(key=lambda e: e.reading_order)
 
         return {
@@ -744,15 +127,11 @@ class OneNoteDocxExtractor:
         }
 
     def save_json(self, data: Dict[str, Any], filename: str = "extracted_data.json") -> Path:
-        """Persist structured output to JSON."""
         out_path = self.output_dir / filename
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False, default=str)
         return out_path
 
-    # ------------------------------------------------------------------
-    # Metadata
-    # ------------------------------------------------------------------
     def _extract_metadata(self) -> Dict[str, Any]:
         cp = self.doc.core_properties
         return {
@@ -768,7 +147,6 @@ class OneNoteDocxExtractor:
         }
 
     def _detect_multi_column(self) -> bool:
-        """Check if any section uses multi-column layout."""
         for section in self.doc.sections:
             sectPr = section._sectPr
             cols = sectPr.find(qn("w:cols"))
@@ -778,14 +156,7 @@ class OneNoteDocxExtractor:
                     return True
         return False
 
-    # ------------------------------------------------------------------
-    # Body Processing (Reading Order Preservation)
-    # ------------------------------------------------------------------
     def _process_body(self):
-        """
-        Iterate body children in XML document order.
-        This guarantees reading order is preserved.
-        """
         body = self.doc.element.body
         for child in body:
             tag = etree.QName(child).localname
@@ -793,19 +164,13 @@ class OneNoteDocxExtractor:
                 self._process_paragraph(Paragraph(child, self.doc))
             elif tag == "tbl":
                 self._process_table(Table(child, self.doc))
-            # sectPr and other tags are ignored
 
     def _process_paragraph(self, para: Paragraph):
-        """Handle text, inline images, and runs."""
         text = para.text.strip()
         style = para.style.name if para.style else "Normal"
         images = self._extract_images_from_paragraph(para)
 
-        # If paragraph has both text and images, emit separate elements
-        # to preserve reading order (images usually appear inline)
         if text and images:
-            # Heuristic: if images are at start, emit them first
-            # We emit text block then images (or vice versa) based on XML order
             self._emit_text_element(para, text, style)
             for img in images:
                 self._add_element(ElementType.IMAGE, img)
@@ -816,7 +181,6 @@ class OneNoteDocxExtractor:
                 self._add_element(ElementType.IMAGE, img)
 
     def _emit_text_element(self, para: Paragraph, text: str, style: str):
-        """Classify and emit text element."""
         elem_type = self._classify_text_element(para, style)
         content = {
             "text": text,
@@ -830,7 +194,6 @@ class OneNoteDocxExtractor:
         self._add_element(elem_type, content)
 
     def _classify_text_element(self, para: Paragraph, style: str) -> ElementType:
-        """Determine if paragraph is heading, list, or normal text."""
         style_lower = style.lower()
         if "heading" in style_lower or style_lower.startswith("title"):
             return ElementType.HEADING
@@ -839,7 +202,6 @@ class OneNoteDocxExtractor:
         return ElementType.TEXT
 
     def _is_list_paragraph(self, para: Paragraph) -> bool:
-        """Check for numbering / bullet properties."""
         pPr = para._p.find(qn("w:pPr"))
         if pPr is None:
             return False
@@ -847,7 +209,6 @@ class OneNoteDocxExtractor:
         return numPr is not None
 
     def _extract_runs(self, para: Paragraph) -> List[Dict[str, Any]]:
-        """Extract per-run formatting for fine-grained reconstruction."""
         runs = []
         for run in para.runs:
             font = run.font
@@ -862,11 +223,7 @@ class OneNoteDocxExtractor:
             })
         return runs
 
-    # ------------------------------------------------------------------
-    # Image Extraction
-    # ------------------------------------------------------------------
     def _extract_images_from_paragraph(self, para: Paragraph) -> List[Dict[str, Any]]:
-        """Pull all inline images from paragraph runs."""
         images = []
         for run in para.runs:
             img = self._extract_image_from_run(run)
@@ -875,12 +232,9 @@ class OneNoteDocxExtractor:
         return images
 
     def _extract_image_from_run(self, run) -> Optional[Dict[str, Any]]:
-        """Extract image binary, save to disk, optionally OCR."""
         try:
-            # Find blip (binary large image payload)
             blip = run._element.find(".//a:blip", self._nsmap)
             if blip is None:
-                # Fallback: try vml (older Word format)
                 return self._extract_vml_image(run)
 
             embed = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
@@ -892,14 +246,13 @@ class OneNoteDocxExtractor:
                 return None
 
             image_bytes = image_part.blob
-            content_type = image_part.content_type  # e.g., image/png
+            content_type = image_part.content_type
             ext = content_type.split("/")[-1]
             if ext in ("jpeg", "jpg"):
                 ext = "jpg"
             elif ext not in ("png", "gif", "bmp", "tiff"):
                 ext = self.image_format
 
-            # Deduplication via hash
             img_hash = hashlib.md5(image_bytes).hexdigest()
             if img_hash in self._image_hashes:
                 return None
@@ -910,10 +263,7 @@ class OneNoteDocxExtractor:
             img_path = self.output_dir / "images" / filename
             img_path.write_bytes(image_bytes)
 
-            # Dimensions (optional)
             width, height = self._get_image_dimensions(image_bytes)
-
-            # OCR
             ocr_text = ""
             if self.use_ocr and PILLOW_AVAILABLE:
                 ocr_text = self._perform_ocr(image_bytes)
@@ -939,8 +289,6 @@ class OneNoteDocxExtractor:
             }
 
     def _extract_vml_image(self, run) -> Optional[Dict[str, Any]]:
-        """Handle legacy VML shapes (common in copied OneNote content)."""
-        # VML extraction is complex; return placeholder for now
         shape = run._element.find(".//v:shape", self._nsmap)
         if shape is not None:
             return {
@@ -951,7 +299,6 @@ class OneNoteDocxExtractor:
         return None
 
     def _get_image_dimensions(self, image_bytes: bytes) -> Tuple[Optional[int], Optional[int]]:
-        """Get image dimensions using Pillow."""
         if not PILLOW_AVAILABLE:
             return None, None
         try:
@@ -961,56 +308,29 @@ class OneNoteDocxExtractor:
             return None, None
 
     def _perform_ocr(self, image_bytes: bytes) -> str:
-        """Run OCR on image bytes."""
         if not PILLOW_AVAILABLE:
             return "[Pillow not installed]"
-
         try:
             img = PILImage.open(io.BytesIO(image_bytes))
-
             if self.ocr_engine == "pytesseract":
                 if not PYTESSERACT_AVAILABLE:
                     return "[pytesseract not installed]"
                 return pytesseract.image_to_string(img, lang=self.ocr_lang).strip()
-
             elif self.ocr_engine == "baidu":
                 return self._baidu_ocr(img)
-
             else:
                 return f"[Unknown OCR engine: {self.ocr_engine}]"
-
         except Exception as e:
             return f"[OCR Error: {str(e)}]"
 
-    def _baidu_ocr(self, img: "PILImage.Image") -> str:
-        """
-        Placeholder for Baidu Unlimited OCR (HuggingFace).
-        To enable:
-            1. pip install transformers torch pillow
-            2. Uncomment pipeline code below
-        """
+    def _baidu_ocr(self, img) -> str:
         if not TRANSFORMERS_AVAILABLE:
             return "[transformers not installed; run: pip install transformers torch]"
-
-        # Lazy init
         if self._baidu_pipeline is None:
-            # model_id = "baidu/Unlimited-OCR"
-            # self._baidu_pipeline = pipeline("image-to-text", model=model_id)
             return "[Baidu OCR pipeline not initialized — uncomment code in _baidu_ocr()]"
-
-        # result = self._baidu_pipeline(img)
-        # return result[0].get("generated_text", "")
         return "[Baidu OCR placeholder]"
 
-    # ------------------------------------------------------------------
-    # Table Processing
-    # ------------------------------------------------------------------
     def _process_table(self, table: Table):
-        """
-        Extract table content.
-        Detects borderless tables that are likely used for multi-column layouts
-        (common when OneNote content is pasted into Word).
-        """
         is_borderless = self._is_borderless_table(table)
         is_nested = self._is_nested_table(table)
 
@@ -1041,7 +361,6 @@ class OneNoteDocxExtractor:
         self._add_element(elem_type, table_data)
 
     def _extract_cell_content(self, cell) -> List[Dict[str, Any]]:
-        """Recursively extract paragraphs, images, and nested tables from a cell."""
         blocks = []
         for para in cell.paragraphs:
             text = para.text.strip()
@@ -1056,7 +375,6 @@ class OneNoteDocxExtractor:
                 blocks.append({"type": "image", "data": img})
 
         for nested_table in cell.tables:
-            # Recursively process nested table
             nested_data = {
                 "type": "nested_table",
                 "row_count": len(nested_table.rows),
@@ -1070,7 +388,6 @@ class OneNoteDocxExtractor:
         return blocks
 
     def _is_borderless_table(self, table: Table) -> bool:
-        """Heuristic: check if table has no visible borders."""
         try:
             tblPr = table._element.find(qn("w:tblPr"))
             if tblPr is None:
@@ -1078,7 +395,6 @@ class OneNoteDocxExtractor:
             borders = tblPr.find(qn("w:tblBorders"))
             if borders is None:
                 return True
-            # If all border values are "none" or missing, consider borderless
             for border in borders:
                 val = border.get(qn("w:val"))
                 if val and val != "none":
@@ -1088,7 +404,6 @@ class OneNoteDocxExtractor:
             return False
 
     def _is_nested_table(self, table: Table) -> bool:
-        """Check if table is inside another table."""
         parent = table._element.getparent()
         while parent is not None:
             if etree.QName(parent).localname == "tbl":
@@ -1097,16 +412,12 @@ class OneNoteDocxExtractor:
         return False
 
     def _is_merged_cell(self, cell) -> bool:
-        """Detect merged cells via gridSpan or vMerge."""
         tcPr = cell._tc.find(qn("w:tcPr"))
         if tcPr is None:
             return False
         return (tcPr.find(qn("w:gridSpan")) is not None or
                 tcPr.find(qn("w:vMerge")) is not None)
 
-    # ------------------------------------------------------------------
-    # Headers & Footers
-    # ------------------------------------------------------------------
     def _process_headers_and_footers(self):
         for section in self.doc.sections:
             for header in [section.header, section.first_page_header, section.even_page_header]:
@@ -1122,9 +433,6 @@ class OneNoteDocxExtractor:
         for table in part.tables:
             self._process_table(table)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     def _add_element(self, elem_type: ElementType, content: Any):
         self.reading_order += 1
         self.elements.append(ExtractedElement(
@@ -1132,62 +440,85 @@ class OneNoteDocxExtractor:
             content=content,
             reading_order=self.reading_order
         ))
+###		
+# ============================================
+# UPDATE THESE PATHS TO MATCH YOUR SYSTEM
+# ============================================
+DOCX_PATH = r"C:\Users\nagubadi175059\Documents\ED-Auto Phone Guide.docx"  # <-- CHANGE THIS
+OUTPUT_DIR = r"C:\Users\nagubadi175059\Documents\output"                   # <-- CHANGE THIS
 
+# Optional: Set Tesseract path if not in system PATH (Windows)
+# import pytesseract
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="onenote_docx_extractor.py",
-        description="Extract structured data from OneNote-exported DOCX files"
-    )
-    parser.add_argument("docx", help="Path to input .docx file")
-    parser.add_argument("-o", "--output", default="./output", help="Output directory")
-    parser.add_argument("--ocr", choices=["pytesseract", "baidu", "none"], default="pytesseract",
-                        help="OCR engine for images")
-    parser.add_argument("--ocr-lang", default="eng", help="OCR language code (e.g., eng, chi_sim)")
-    parser.add_argument("--no-images", action="store_true", help="Skip image extraction")
-    parser.add_argument("--json-name", default="extracted_data.json", help="Output JSON filename")
-    return parser
+# ============================================
+# RUN EXTRACTION
+# ============================================
+extractor = OneNoteDocxExtractor(
+    docx_path=DOCX_PATH,
+    output_dir=OUTPUT_DIR,
+    use_ocr=True,
+    ocr_engine="pytesseract",
+    ocr_lang="eng",
+    extract_images=True
+)
 
+print("Extracting... Please wait.")
+data = extractor.extract_all()
+json_path = extractor.save_json(data, filename="extracted_data.json")
 
-def main():
-    parser = build_argument_parser()
-    args = parser.parse_args()
+print(f"\n{'='*50}")
+print("EXTRACTION COMPLETE")
+print(f"{'='*50}")
+print(f"JSON saved to: {json_path}")
+print(f"Total elements: {data['total_elements']}")
+print(f"Tables: {data['metadata']['tables']}")
+print(f"Multi-column layouts: {data['metadata']['column_layout_detected']}")
+###
+#####
+# Show first 15 elements
+print("First 15 extracted elements:\n")
+for el in data['elements'][:15]:
+    print(f"[{el['reading_order']:03d}] {el['element_type'].upper()}")
+    if el['element_type'] in ('text', 'heading', 'list_item'):
+        text_preview = el['content']['text'][:120]
+        print(f"      Text: {text_preview}{'...' if len(el['content']['text']) > 120 else ''}")
+    elif el['element_type'] == 'table':
+        print(f"      Table: {el['content']['row_count']} rows x {el['content']['col_count']} cols")
+    elif el['element_type'] == 'column_layout':
+        print(f"      >>> COLUMN LAYOUT: {el['content']['col_count']} columns (borderless)")
+        for row in el['content']['rows'][:2]:
+            for cell in row:
+                print(f"         Col {cell['col_index']}: {cell['text'][:80]}...")
+    elif el['element_type'] == 'image':
+        print(f"      Image: {el['content']['filename']}")
+        ocr = el['content'].get('ocr_text', '')
+        if ocr:
+            print(f"      OCR: {ocr[:100]}...")
+    print()
+#####
+from IPython.display import Image, display
+import os
 
-    if not os.path.exists(args.docx):
-        print(f"Error: File not found: {args.docx}", file=sys.stderr)
-        sys.exit(1)
-
-    extractor = OneNoteDocxExtractor(
-        docx_path=args.docx,
-        output_dir=args.output,
-        use_ocr=(args.ocr != "none"),
-        ocr_engine=args.ocr if args.ocr != "none" else "pytesseract",
-        ocr_lang=args.ocr_lang,
-        extract_images=not args.no_images
-    )
-
-    print(f"Extracting: {args.docx}")
-    data = extractor.extract_all()
-    json_path = extractor.save_json(data, filename=args.json_name)
-
-    print(f"\nExtraction complete!")
-    print(f"  JSON output : {json_path}")
-    print(f"  Images dir  : {extractor.output_dir / 'images'}")
-    print(f"  Elements    : {data['total_elements']}")
-    print(f"  Tables      : {data['metadata']['tables']}")
-    print(f"  Multi-col   : {data['metadata']['column_layout_detected']}")
-
-    # Print quick summary of element types
-    type_counts = defaultdict(int)
-    for el in data["elements"]:
-        type_counts[el["element_type"]] += 1
-    print("\nElement breakdown:")
-    for t, c in sorted(type_counts.items()):
-        print(f"  {t:20s}: {c}")
-
-
-if __name__ == "__main__":
-    main()
+image_dir = os.path.join(OUTPUT_DIR, "images")
+if os.path.exists(image_dir):
+    image_files = sorted([f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.jpeg', '.gif'))])
+    print(f"Found {len(image_files)} images:\n")
+    for img_file in image_files[:5]:
+        img_path = os.path.join(image_dir, img_file)
+        print(f"--- {img_file} ---")
+        display(Image(filename=img_path, width=500))
+        for el in data['elements']:
+            if el['element_type'] == 'image' and el['content'].get('filename') == img_file:
+                print(f"OCR: {el['content'].get('ocr_text', 'N/A')[:200]}")
+                break
+        print()
+else:
+    print("No images directory found.")
+	
+####
+# Save a human-readable version
+pretty_path = os.path.join(OUTPUT_DIR, "extracted_data_pretty.json")
+with open(pretty_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+print(f"Pretty JSON saved to: {pretty_path}")
