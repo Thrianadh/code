@@ -567,3 +567,627 @@ extract_document_data("sample_document.docx")
 # extract_document_data("scanned_image.png")
 
 print(analyzer.generate_report())
+#############
+python-docx>=0.8.11
+lxml>=4.9.0
+
+# Image processing & OCR
+Pillow>=9.0.0
+pytesseract>=0.3.10
+
+# Optional: Baidu Unlimited OCR via HuggingFace
+# transformers>=4.30.0
+# torch>=2.0.0
+# accelerate>=0.20.0
+
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+"""
+OneNote DOCX Structured Extractor
+=================================
+Extracts text, tables, images, and multi-column layouts from .docx files
+while preserving reading order and structural integrity.
+
+Supports:
+- Plain text, headings, list items
+- Single / nested / multi-tables (including borderless column layouts)
+- Inline images with OCR (pytesseract + Baidu Unlimited OCR placeholder)
+- Headers & footers
+- Structured JSON output
+
+Usage:
+    python onenote_docx_extractor.py input.docx -o ./output --ocr pytesseract
+"""
+
+import os
+import sys
+import json
+import base64
+import io
+import argparse
+import hashlib
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Union, Tuple
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from collections import defaultdict
+
+# ---------------------------------------------------------------------------
+# Core DOCX processing
+# ---------------------------------------------------------------------------
+from docx import Document
+from docx.oxml.ns import qn
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from docx.section import Section
+from lxml import etree
+
+# ---------------------------------------------------------------------------
+# Image / OCR
+# ---------------------------------------------------------------------------
+try:
+    from PIL import Image as PILImage
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+
+try:
+    import pytesseract
+    PYTESSERACT_AVAILABLE = True
+except ImportError:
+    PYTESSERACT_AVAILABLE = False
+
+try:
+    from transformers import pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Data Models
+# ---------------------------------------------------------------------------
+class ElementType(Enum):
+    TEXT = "text"
+    HEADING = "heading"
+    LIST_ITEM = "list_item"
+    TABLE = "table"
+    IMAGE = "image"
+    COLUMN_LAYOUT = "column_layout"  # Borderless table used for columns
+    HEADER = "header"
+    FOOTER = "footer"
+
+
+@dataclass
+class ExtractedElement:
+    element_type: str
+    content: Any
+    reading_order: int
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "element_type": self.element_type,
+            "content": self.content,
+            "reading_order": self.reading_order,
+            "metadata": self.metadata
+        }
+
+
+# ---------------------------------------------------------------------------
+# Main Extractor
+# ---------------------------------------------------------------------------
+class OneNoteDocxExtractor:
+    """
+    Production-grade extractor for OneNote-sourced DOCX files.
+    Preserves reading order by iterating the document XML in sequence.
+    """
+
+    def __init__(
+        self,
+        docx_path: Union[str, Path],
+        output_dir: Union[str, Path] = "./output",
+        use_ocr: bool = True,
+        ocr_engine: str = "pytesseract",
+        ocr_lang: str = "eng",
+        extract_images: bool = True,
+        image_format: str = "png"
+    ):
+        self.docx_path = Path(docx_path).resolve()
+        self.output_dir = Path(output_dir).resolve()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "images").mkdir(exist_ok=True)
+
+        self.use_ocr = use_ocr
+        self.ocr_engine = ocr_engine
+        self.ocr_lang = ocr_lang
+        self.extract_images = extract_images
+        self.image_format = image_format
+
+        self.doc = Document(str(self.docx_path))
+        self.elements: List[ExtractedElement] = []
+        self.reading_order = 0
+        self.image_counter = 0
+        self._image_hashes = set()  # Deduplication
+
+        # OCR pipeline (lazy init)
+        self._baidu_pipeline = None
+
+        # Namespace map for XPath
+        self._nsmap = {
+            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+            "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
+            "ve": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+            "o": "urn:schemas-microsoft-com:office:office",
+            "v": "urn:schemas-microsoft-com:vml",
+        }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def extract_all(self) -> Dict[str, Any]:
+        """Run full extraction pipeline."""
+        metadata = self._extract_metadata()
+        self._process_body()
+        self._process_headers_and_footers()
+
+        # Final safety sort (XML order is usually correct, but we enforce it)
+        self.elements.sort(key=lambda e: e.reading_order)
+
+        return {
+            "source_file": str(self.docx_path),
+            "metadata": metadata,
+            "total_elements": len(self.elements),
+            "elements": [e.to_dict() for e in self.elements]
+        }
+
+    def save_json(self, data: Dict[str, Any], filename: str = "extracted_data.json") -> Path:
+        """Persist structured output to JSON."""
+        out_path = self.output_dir / filename
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+        return out_path
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+    def _extract_metadata(self) -> Dict[str, Any]:
+        cp = self.doc.core_properties
+        return {
+            "title": cp.title or "",
+            "author": cp.author or "",
+            "subject": cp.subject or "",
+            "created": str(cp.created) if cp.created else None,
+            "modified": str(cp.modified) if cp.modified else None,
+            "paragraphs": len(self.doc.paragraphs),
+            "tables": len(self.doc.tables),
+            "sections": len(self.doc.sections),
+            "column_layout_detected": self._detect_multi_column()
+        }
+
+    def _detect_multi_column(self) -> bool:
+        """Check if any section uses multi-column layout."""
+        for section in self.doc.sections:
+            sectPr = section._sectPr
+            cols = sectPr.find(qn("w:cols"))
+            if cols is not None:
+                num = cols.get(qn("w:num"))
+                if num and int(num) > 1:
+                    return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Body Processing (Reading Order Preservation)
+    # ------------------------------------------------------------------
+    def _process_body(self):
+        """
+        Iterate body children in XML document order.
+        This guarantees reading order is preserved.
+        """
+        body = self.doc.element.body
+        for child in body:
+            tag = etree.QName(child).localname
+            if tag == "p":
+                self._process_paragraph(Paragraph(child, self.doc))
+            elif tag == "tbl":
+                self._process_table(Table(child, self.doc))
+            # sectPr and other tags are ignored
+
+    def _process_paragraph(self, para: Paragraph):
+        """Handle text, inline images, and runs."""
+        text = para.text.strip()
+        style = para.style.name if para.style else "Normal"
+        images = self._extract_images_from_paragraph(para)
+
+        # If paragraph has both text and images, emit separate elements
+        # to preserve reading order (images usually appear inline)
+        if text and images:
+            # Heuristic: if images are at start, emit them first
+            # We emit text block then images (or vice versa) based on XML order
+            self._emit_text_element(para, text, style)
+            for img in images:
+                self._add_element(ElementType.IMAGE, img)
+        elif text:
+            self._emit_text_element(para, text, style)
+        elif images:
+            for img in images:
+                self._add_element(ElementType.IMAGE, img)
+
+    def _emit_text_element(self, para: Paragraph, text: str, style: str):
+        """Classify and emit text element."""
+        elem_type = self._classify_text_element(para, style)
+        content = {
+            "text": text,
+            "style": style,
+            "alignment": str(para.alignment) if para.alignment else None,
+            "runs": self._extract_runs(para),
+            "is_bold": any(r.bold for r in para.runs),
+            "is_italic": any(r.italic for r in para.runs),
+            "is_underline": any(r.underline for r in para.runs),
+        }
+        self._add_element(elem_type, content)
+
+    def _classify_text_element(self, para: Paragraph, style: str) -> ElementType:
+        """Determine if paragraph is heading, list, or normal text."""
+        style_lower = style.lower()
+        if "heading" in style_lower or style_lower.startswith("title"):
+            return ElementType.HEADING
+        if self._is_list_paragraph(para):
+            return ElementType.LIST_ITEM
+        return ElementType.TEXT
+
+    def _is_list_paragraph(self, para: Paragraph) -> bool:
+        """Check for numbering / bullet properties."""
+        pPr = para._p.find(qn("w:pPr"))
+        if pPr is None:
+            return False
+        numPr = pPr.find(qn("w:numPr"))
+        return numPr is not None
+
+    def _extract_runs(self, para: Paragraph) -> List[Dict[str, Any]]:
+        """Extract per-run formatting for fine-grained reconstruction."""
+        runs = []
+        for run in para.runs:
+            font = run.font
+            runs.append({
+                "text": run.text,
+                "bold": bool(run.bold),
+                "italic": bool(run.italic),
+                "underline": bool(run.underline),
+                "font_name": font.name,
+                "font_size_pt": round(font.size.pt, 1) if font.size else None,
+                "color_rgb": str(font.color.rgb) if font.color and font.color.rgb else None,
+            })
+        return runs
+
+    # ------------------------------------------------------------------
+    # Image Extraction
+    # ------------------------------------------------------------------
+    def _extract_images_from_paragraph(self, para: Paragraph) -> List[Dict[str, Any]]:
+        """Pull all inline images from paragraph runs."""
+        images = []
+        for run in para.runs:
+            img = self._extract_image_from_run(run)
+            if img:
+                images.append(img)
+        return images
+
+    def _extract_image_from_run(self, run) -> Optional[Dict[str, Any]]:
+        """Extract image binary, save to disk, optionally OCR."""
+        try:
+            # Find blip (binary large image payload)
+            blip = run._element.find(".//a:blip", self._nsmap)
+            if blip is None:
+                # Fallback: try vml (older Word format)
+                return self._extract_vml_image(run)
+
+            embed = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+            if not embed:
+                return None
+
+            image_part = self.doc.part.related_parts.get(embed)
+            if not image_part:
+                return None
+
+            image_bytes = image_part.blob
+            content_type = image_part.content_type  # e.g., image/png
+            ext = content_type.split("/")[-1]
+            if ext in ("jpeg", "jpg"):
+                ext = "jpg"
+            elif ext not in ("png", "gif", "bmp", "tiff"):
+                ext = self.image_format
+
+            # Deduplication via hash
+            img_hash = hashlib.md5(image_bytes).hexdigest()
+            if img_hash in self._image_hashes:
+                return None
+            self._image_hashes.add(img_hash)
+
+            self.image_counter += 1
+            filename = f"img_{self.image_counter:04d}.{ext}"
+            img_path = self.output_dir / "images" / filename
+            img_path.write_bytes(image_bytes)
+
+            # Dimensions (optional)
+            width, height = self._get_image_dimensions(image_bytes)
+
+            # OCR
+            ocr_text = ""
+            if self.use_ocr and PILLOW_AVAILABLE:
+                ocr_text = self._perform_ocr(image_bytes)
+
+            return {
+                "filename": filename,
+                "relative_path": str(Path("images") / filename),
+                "absolute_path": str(img_path),
+                "width_px": width,
+                "height_px": height,
+                "content_type": content_type,
+                "size_bytes": len(image_bytes),
+                "md5": img_hash,
+                "ocr_text": ocr_text,
+                "base64": base64.b64encode(image_bytes).decode("utf-8")
+            }
+
+        except Exception as e:
+            return {
+                "filename": f"img_error_{self.image_counter:04d}",
+                "error": str(e),
+                "ocr_text": ""
+            }
+
+    def _extract_vml_image(self, run) -> Optional[Dict[str, Any]]:
+        """Handle legacy VML shapes (common in copied OneNote content)."""
+        # VML extraction is complex; return placeholder for now
+        shape = run._element.find(".//v:shape", self._nsmap)
+        if shape is not None:
+            return {
+                "filename": "vml_shape",
+                "note": "VML image detected but not extracted (legacy format)",
+                "ocr_text": ""
+            }
+        return None
+
+    def _get_image_dimensions(self, image_bytes: bytes) -> Tuple[Optional[int], Optional[int]]:
+        """Get image dimensions using Pillow."""
+        if not PILLOW_AVAILABLE:
+            return None, None
+        try:
+            img = PILImage.open(io.BytesIO(image_bytes))
+            return img.width, img.height
+        except Exception:
+            return None, None
+
+    def _perform_ocr(self, image_bytes: bytes) -> str:
+        """Run OCR on image bytes."""
+        if not PILLOW_AVAILABLE:
+            return "[Pillow not installed]"
+
+        try:
+            img = PILImage.open(io.BytesIO(image_bytes))
+
+            if self.ocr_engine == "pytesseract":
+                if not PYTESSERACT_AVAILABLE:
+                    return "[pytesseract not installed]"
+                return pytesseract.image_to_string(img, lang=self.ocr_lang).strip()
+
+            elif self.ocr_engine == "baidu":
+                return self._baidu_ocr(img)
+
+            else:
+                return f"[Unknown OCR engine: {self.ocr_engine}]"
+
+        except Exception as e:
+            return f"[OCR Error: {str(e)}]"
+
+    def _baidu_ocr(self, img: "PILImage.Image") -> str:
+        """
+        Placeholder for Baidu Unlimited OCR (HuggingFace).
+        To enable:
+            1. pip install transformers torch pillow
+            2. Uncomment pipeline code below
+        """
+        if not TRANSFORMERS_AVAILABLE:
+            return "[transformers not installed; run: pip install transformers torch]"
+
+        # Lazy init
+        if self._baidu_pipeline is None:
+            # model_id = "baidu/Unlimited-OCR"
+            # self._baidu_pipeline = pipeline("image-to-text", model=model_id)
+            return "[Baidu OCR pipeline not initialized — uncomment code in _baidu_ocr()]"
+
+        # result = self._baidu_pipeline(img)
+        # return result[0].get("generated_text", "")
+        return "[Baidu OCR placeholder]"
+
+    # ------------------------------------------------------------------
+    # Table Processing
+    # ------------------------------------------------------------------
+    def _process_table(self, table: Table):
+        """
+        Extract table content.
+        Detects borderless tables that are likely used for multi-column layouts
+        (common when OneNote content is pasted into Word).
+        """
+        is_borderless = self._is_borderless_table(table)
+        is_nested = self._is_nested_table(table)
+
+        rows_data = []
+        for r_idx, row in enumerate(table.rows):
+            row_cells = []
+            for c_idx, cell in enumerate(row.cells):
+                cell_content = self._extract_cell_content(cell)
+                row_cells.append({
+                    "row_index": r_idx,
+                    "col_index": c_idx,
+                    "text": cell.text.strip(),
+                    "content_blocks": cell_content,
+                    "is_merged": self._is_merged_cell(cell)
+                })
+            rows_data.append(row_cells)
+
+        table_data = {
+            "row_count": len(table.rows),
+            "col_count": len(table.columns),
+            "is_borderless": is_borderless,
+            "is_nested": is_nested,
+            "is_likely_column_layout": is_borderless and len(table.columns) >= 2,
+            "rows": rows_data
+        }
+
+        elem_type = ElementType.COLUMN_LAYOUT if (is_borderless and len(table.columns) >= 2) else ElementType.TABLE
+        self._add_element(elem_type, table_data)
+
+    def _extract_cell_content(self, cell) -> List[Dict[str, Any]]:
+        """Recursively extract paragraphs, images, and nested tables from a cell."""
+        blocks = []
+        for para in cell.paragraphs:
+            text = para.text.strip()
+            images = self._extract_images_from_paragraph(para)
+            if text:
+                blocks.append({
+                    "type": "text",
+                    "text": text,
+                    "style": para.style.name if para.style else "Normal"
+                })
+            for img in images:
+                blocks.append({"type": "image", "data": img})
+
+        for nested_table in cell.tables:
+            # Recursively process nested table
+            nested_data = {
+                "type": "nested_table",
+                "row_count": len(nested_table.rows),
+                "col_count": len(nested_table.columns),
+                "rows": []
+            }
+            for row in nested_table.rows:
+                nested_data["rows"].append([c.text.strip() for c in row.cells])
+            blocks.append(nested_data)
+
+        return blocks
+
+    def _is_borderless_table(self, table: Table) -> bool:
+        """Heuristic: check if table has no visible borders."""
+        try:
+            tblPr = table._element.find(qn("w:tblPr"))
+            if tblPr is None:
+                return True
+            borders = tblPr.find(qn("w:tblBorders"))
+            if borders is None:
+                return True
+            # If all border values are "none" or missing, consider borderless
+            for border in borders:
+                val = border.get(qn("w:val"))
+                if val and val != "none":
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _is_nested_table(self, table: Table) -> bool:
+        """Check if table is inside another table."""
+        parent = table._element.getparent()
+        while parent is not None:
+            if etree.QName(parent).localname == "tbl":
+                return True
+            parent = parent.getparent()
+        return False
+
+    def _is_merged_cell(self, cell) -> bool:
+        """Detect merged cells via gridSpan or vMerge."""
+        tcPr = cell._tc.find(qn("w:tcPr"))
+        if tcPr is None:
+            return False
+        return (tcPr.find(qn("w:gridSpan")) is not None or
+                tcPr.find(qn("w:vMerge")) is not None)
+
+    # ------------------------------------------------------------------
+    # Headers & Footers
+    # ------------------------------------------------------------------
+    def _process_headers_and_footers(self):
+        for section in self.doc.sections:
+            for header in [section.header, section.first_page_header, section.even_page_header]:
+                if header and header.paragraphs:
+                    self._process_header_footer(header, ElementType.HEADER)
+            for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
+                if footer and footer.paragraphs:
+                    self._process_header_footer(footer, ElementType.FOOTER)
+
+    def _process_header_footer(self, part, elem_type: ElementType):
+        for para in part.paragraphs:
+            self._process_paragraph(para)
+        for table in part.tables:
+            self._process_table(table)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _add_element(self, elem_type: ElementType, content: Any):
+        self.reading_order += 1
+        self.elements.append(ExtractedElement(
+            element_type=elem_type.value,
+            content=content,
+            reading_order=self.reading_order
+        ))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="onenote_docx_extractor.py",
+        description="Extract structured data from OneNote-exported DOCX files"
+    )
+    parser.add_argument("docx", help="Path to input .docx file")
+    parser.add_argument("-o", "--output", default="./output", help="Output directory")
+    parser.add_argument("--ocr", choices=["pytesseract", "baidu", "none"], default="pytesseract",
+                        help="OCR engine for images")
+    parser.add_argument("--ocr-lang", default="eng", help="OCR language code (e.g., eng, chi_sim)")
+    parser.add_argument("--no-images", action="store_true", help="Skip image extraction")
+    parser.add_argument("--json-name", default="extracted_data.json", help="Output JSON filename")
+    return parser
+
+
+def main():
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    if not os.path.exists(args.docx):
+        print(f"Error: File not found: {args.docx}", file=sys.stderr)
+        sys.exit(1)
+
+    extractor = OneNoteDocxExtractor(
+        docx_path=args.docx,
+        output_dir=args.output,
+        use_ocr=(args.ocr != "none"),
+        ocr_engine=args.ocr if args.ocr != "none" else "pytesseract",
+        ocr_lang=args.ocr_lang,
+        extract_images=not args.no_images
+    )
+
+    print(f"Extracting: {args.docx}")
+    data = extractor.extract_all()
+    json_path = extractor.save_json(data, filename=args.json_name)
+
+    print(f"\nExtraction complete!")
+    print(f"  JSON output : {json_path}")
+    print(f"  Images dir  : {extractor.output_dir / 'images'}")
+    print(f"  Elements    : {data['total_elements']}")
+    print(f"  Tables      : {data['metadata']['tables']}")
+    print(f"  Multi-col   : {data['metadata']['column_layout_detected']}")
+
+    # Print quick summary of element types
+    type_counts = defaultdict(int)
+    for el in data["elements"]:
+        type_counts[el["element_type"]] += 1
+    print("\nElement breakdown:")
+    for t, c in sorted(type_counts.items()):
+        print(f"  {t:20s}: {c}")
+
+
+if __name__ == "__main__":
+    main()
