@@ -522,3 +522,240 @@ pretty_path = os.path.join(OUTPUT_DIR, "extracted_data_pretty.json")
 with open(pretty_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False, default=str)
 print(f"Pretty JSON saved to: {pretty_path}")
+
+#########
+#########
+import json
+from pathlib import Path
+from typing import Dict, Any, List
+
+
+class JsonToMarkdownConverter:
+    """
+    Converts extracted JSON data into a clean Markdown report.
+    Preserves reading order and handles all element types.
+    """
+
+    def __init__(self, data: Dict[str, Any], output_dir: str = "./output"):
+        self.data = data
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.md_lines: List[str] = []
+
+    def convert(self) -> str:
+        """Run full conversion and return markdown string."""
+        self._add_header()
+        self._add_metadata()
+        self._add_elements()
+        self._add_footer()
+        return "\n".join(self.md_lines)
+
+    def save_markdown(self, filename: str = "extracted_report.md") -> Path:
+        """Save markdown to file and return path."""
+        md_content = self.convert()
+        md_path = self.output_dir / filename
+        md_path.write_text(md_content, encoding="utf-8")
+        return md_path
+
+    def _add_header(self):
+        self.md_lines.extend([
+            "# OneNote Extraction Report",
+            "",
+            f"**Source File:** `{self.data.get('source_file', 'N/A')}`",
+            f"**Total Elements:** {self.data.get('total_elements', 0)}",
+            "",
+            "---",
+            ""
+        ])
+
+    def _add_metadata(self):
+        meta = self.data.get("metadata", {})
+        self.md_lines.extend([
+            "## Document Metadata",
+            "",
+            "| Property | Value |",
+            "|----------|-------|",
+            f"| Title | {meta.get('title', 'N/A')} |",
+            f"| Author | {meta.get('author', 'N/A')} |",
+            f"| Subject | {meta.get('subject', 'N/A')} |",
+            f"| Created | {meta.get('created', 'N/A')} |",
+            f"| Modified | {meta.get('modified', 'N/A')} |",
+            f"| Paragraphs | {meta.get('paragraphs', 'N/A')} |",
+            f"| Tables | {meta.get('tables', 'N/A')} |",
+            f"| Sections | {meta.get('sections', 'N/A')} |",
+            f"| Multi-Column Layout Detected | {meta.get('column_layout_detected', False)} |",
+            "",
+            "---",
+            ""
+        ])
+
+    def _add_elements(self):
+        self.md_lines.extend([
+            "## Extracted Content",
+            "",
+            "The following content is presented in exact **reading order**.",
+            "",
+        ])
+
+        elements = self.data.get("elements", [])
+        for el in elements:
+            elem_type = el.get("element_type", "unknown")
+            content = el.get("content", {})
+            order = el.get("reading_order", 0)
+
+            self.md_lines.append(f"\n<!-- Element #{order} | Type: {elem_type} -->\n")
+
+            if elem_type == "heading":
+                self._render_heading(content)
+            elif elem_type == "text":
+                self._render_text(content)
+            elif elem_type == "list_item":
+                self._render_list_item(content)
+            elif elem_type == "table":
+                self._render_table(content)
+            elif elem_type == "column_layout":
+                self._render_column_layout(content)
+            elif elem_type == "image":
+                self._render_image(content)
+            elif elem_type in ("header", "footer"):
+                self._render_header_footer(elem_type, content)
+            else:
+                self._render_unknown(elem_type, content)
+
+    def _add_footer(self):
+        self.md_lines.extend([
+            "",
+            "---",
+            "",
+            "*Report generated from OneNote DOCX Extraction Pipeline*",
+            ""
+        ])
+
+    def _render_heading(self, content: Dict[str, Any]):
+        text = content.get("text", "")
+        style = content.get("style", "")
+        level = self._infer_heading_level(style)
+        self.md_lines.append(f"{'#' * level} {text}")
+        self.md_lines.append("")
+
+    def _render_text(self, content: Dict[str, Any]):
+        text = content.get("text", "")
+        is_bold = content.get("is_bold", False)
+        is_italic = content.get("is_italic", False)
+        is_underline = content.get("is_underline", False)
+
+        if is_bold:
+            text = f"**{text}**"
+        if is_italic:
+            text = f"*{text}*"
+        if is_underline:
+            text = f"<u>{text}</u>"
+
+        self.md_lines.append(text)
+        self.md_lines.append("")
+
+    def _render_list_item(self, content: Dict[str, Any]):
+        text = content.get("text", "")
+        self.md_lines.append(f"- {text}")
+
+    def _render_table(self, content: Dict[str, Any]):
+        rows = content.get("rows", [])
+        if not rows:
+            return
+
+        header_row = rows[0]
+        headers = [cell.get("text", "") for cell in header_row]
+        self.md_lines.append("| " + " | ".join(headers) + " |")
+        self.md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+        for row in rows[1:]:
+            cells = [cell.get("text", "").replace("|", "\\|") for cell in row]
+            self.md_lines.append("| " + " | ".join(cells) + " |")
+
+        self.md_lines.append("")
+
+    def _render_column_layout(self, content: Dict[str, Any]):
+        """Render borderless multi-column layouts as a markdown table."""
+        rows = content.get("rows", [])
+        col_count = content.get("col_count", 2)
+
+        if not rows:
+            return
+
+        self.md_lines.append("> **Column Layout Detected** — Content arranged side-by-side")
+        self.md_lines.append("")
+
+        for row in rows:
+            cells = [cell.get("text", "").replace("\n", "<br>").replace("|", "\\|") for cell in row]
+            while len(cells) < col_count:
+                cells.append("")
+            self.md_lines.append("| " + " | ".join(cells) + " |")
+
+        self.md_lines.append("")
+
+    def _render_image(self, content: Dict[str, Any]):
+        filename = content.get("filename", "unknown")
+        rel_path = content.get("relative_path", "")
+        width = content.get("width_px", "?")
+        height = content.get("height_px", "?")
+        ocr_text = content.get("ocr_text", "")
+
+        self.md_lines.append(f"**Image:** `{filename}` ({width}x{height}px)")
+        if rel_path:
+            self.md_lines.append(f"\n![{filename}]({rel_path})")
+        if ocr_text:
+            self.md_lines.append("")
+            self.md_lines.append("> **OCR Text:**")
+            self.md_lines.append(f"> {ocr_text.replace(chr(10), ' > ')}")
+        self.md_lines.append("")
+
+    def _render_header_footer(self, elem_type: str, content: Dict[str, Any]):
+        text = content.get("text", "") if isinstance(content, dict) else str(content)
+        self.md_lines.append(f"*{elem_type.capitalize()}:* {text}")
+        self.md_lines.append("")
+
+    def _render_unknown(self, elem_type: str, content: Any):
+        text = str(content) if not isinstance(content, dict) else content.get("text", str(content))
+        self.md_lines.append(f"`[{elem_type}]` {text}")
+        self.md_lines.append("")
+
+    def _infer_heading_level(self, style: str) -> int:
+        style_lower = style.lower()
+        if "heading 1" in style_lower or "title" in style_lower:
+            return 1
+        elif "heading 2" in style_lower:
+            return 2
+        elif "heading 3" in style_lower:
+            return 3
+        elif "heading 4" in style_lower:
+            return 4
+        elif "heading 5" in style_lower:
+            return 5
+        elif "heading 6" in style_lower:
+            return 6
+        else:
+            return 2
+			
+#######
+# ============================================
+# CONVERT JSON TO MARKDOWN
+# ============================================
+converter = JsonToMarkdownConverter(data, output_dir=OUTPUT_DIR)
+
+# Generate and save
+md_path = converter.save_markdown("extracted_report.md")
+print(f"Markdown report saved to: {md_path}")
+
+# Preview first 3000 characters
+print(f"\n{'='*60}")
+print("PREVIEW (first 3000 chars):")
+print(f"{'='*60}\n")
+print(converter.convert()[:3000])
+
+
+#######
+# Show the complete markdown content
+from IPython.display import Markdown, display
+
+md_content = converter.convert()
+display(Markdown(md_content))
