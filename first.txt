@@ -759,3 +759,29 @@ from IPython.display import Markdown, display
 
 md_content = converter.convert()
 display(Markdown(md_content))
+#########
+Ch.13 Borгowers - Return to School / Title IV|What is a T4 letter?
+Ch.13 Borгowers - Return to School / Title IV|Requirements: What to send in for the review
+Ch.13 Borгowers - Return to School / Title IV|School denied my T4 letter
+Ch.13 Borгowers - Return to School / Title IV|What can I do now that my school has denied my financial aid?
+Ch.7 Borrowers -returns to school / Title IV|What is a T4 letter?
+Ch.7 Borrowers -returns to school / Title IV|Requirements: What to send in for the review
+Making Payments During Active Bankruptcy|I want to make a payment
+Making Payments During Active Bankruptcy|What is my payment amount?
+Making Payments During Active Bankruptcy|I want to payoff/negotiate balance
+Adversary/Stipulation Accounts|I am going to file an adversary case/lawsuit against ECMC, what is your address?
+Balance Dispute: POC PIF|My student loans were paid in full during bankruptcy, why do I owe a balance?
+Consolidation|I want to consolidate
+Consolidation|What is the status of my consolidation?
+Consolidation|How do I consolidate?
+Credit reporting|Default Borrower: I am in bankruptcy. Why are my student loans being reported as default on my credit report? I am in an active bankruptcy and should not be in default.
+Default Dispute|Why are my student loans being reported as in default? I don't believe they should be in default.
+How to get out of default|ACTIVE BANKRUPTCY BOROWER: I want to get out of default. What do I need to do.
+How payments are applied|I have been making payments for the past several months. How come my balance is still so high?
+What happens to my student loans after bankruptcy?|What happens to my student loans after bankruptcy?
+"Loan Forgiveness|
+TPD, Closed School Discharge, BDR, Discharge due to death, Public Service Loan Forgiveness, Teacher Loan forgiveness; any mentions of loan forgiveness"
+I want to negotiate my balance, pay my student loan in full, or settle the balance|During an active bankruptcy, ECMC cannot enter into repayment arrangements, negotiate settlements, or compromise any portion of the loan balance due to the protections of the bankruptcy automatic stay. Once the bankruptcy concludes, the loan will either return to repayment status or be referred to collections, depending on the borrower's circumstances. Agents should not discuss or speculate on f future repayment, settlement, or collection options.
+Consolidation/ Consolidate student loans: "I want to consolidate my loans"|I want to get out of default
+Consolidation/ Consolidate student loans: "I want to consolidate my loans"|I want to consolidate my student loans
+Consolidation/ Consolidate student loans: "I want to consolidate my loans"|How do I consolidate?
