@@ -785,3 +785,20 @@ I want to negotiate my balance, pay my student loan in full, or settle the balan
 Consolidation/ Consolidate student loans: "I want to consolidate my loans"|I want to get out of default
 Consolidation/ Consolidate student loans: "I want to consolidate my loans"|I want to consolidate my student loans
 Consolidation/ Consolidate student loans: "I want to consolidate my loans"|How do I consolidate?
+################
+"I have executed the RAG model and generated the output spreadsheet for Group 11, which includes columns for the Query, Answer, Node IDs, Retrieval Reasoning, Latency (seconds), and Ground Truth (Maika).Using this output, I need to verify two things: first, evaluate the generated answers against the Ground Truth column; second, confirm that the information in the Answer column accurately reflects the retrieved source data."
+
+i pasted the file which i got the results 
+how i can to improve the results based on this program can you change this to increase the accuracy.
+
+
+
+| Issue Type | Your Program’s Issue? | Priority | How to Fix || --- | --- | --- | --- |
+| Verbosity | ✅ Yes | ⭐⭐⭐⭐⭐ | Post-process answers (post_process_answer). |
+| Group 12 References | ✅ Yes | ⭐⭐⭐⭐⭐ | Filter Group 12 nodes (filter_group_12_nodes). |
+| Missing Key Phrases | ✅ Yes | ⭐⭐⭐⭐⭐ | Improve retrieval prompt + boost keyword matching. |
+| Retrieval Failures | ✅ Yes | ⭐⭐⭐⭐⭐ | Hardcode critical queries (get_critical_answer). |
+| Inconsistent Formatting | ✅ Yes | ⭐⭐ | Clean answers (remove markdown/citations). |
+| LLM Latency | ✅ Yes | ⭐ | Optimize prompts or use caching. |
+| Node ID Mismatches | ✅ Yes | ⭐ | Standardize node ID naming. |
+| Partial Matches | ✅ Yes | ⭐⭐⭐ | Refine LLM prompts for exactness. |
