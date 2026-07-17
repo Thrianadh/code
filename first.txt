@@ -160,3 +160,28 @@ if __name__ == "__main__":
     }
 
     print_summary(results)
+#########
+import json
+import boto3
+
+bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+NOVA_MODEL_ID = "us.amazon.nova-lite-v1:0"
+
+def ask_nova(prompt: str, max_tokens: int = 1024, temperature: float = 0.0) -> str:
+    """Call Amazon Nova Lite via Bedrock Converse API."""
+    try:
+        resp = bedrock.converse(
+            modelId=NOVA_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as e:
+        print(f"[Nova Error] {e}")
+        return ""
+
+
+# Example usage
+if __name__ == "__main__":
+    answer = ask_nova("What is the automatic stay in bankruptcy?")
+    print(answer)
