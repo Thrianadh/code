@@ -802,3 +802,456 @@ how i can to improve the results based on this program can you change this to in
 | LLM Latency | ✅ Yes | ⭐ | Optimize prompts or use caching. |
 | Node ID Mismatches | ✅ Yes | ⭐ | Standardize node ID naming. |
 | Partial Matches | ✅ Yes | ⭐⭐⭐ | Refine LLM prompts for exactness. |
+
+
+############
+"""
+Vectorless RAG — Step 1 & Step 2
+================================
+Corpus extraction + Dual Index Builder (Tree + Flat Term Index)
+
+Processes:
+  - .docx  (text, tables, images in reading order)
+  - .pdf   (text page-by-page, searchable PDFs)
+  - .txt   (raw text)
+
+Outputs:
+  - corpus.json      : normalized document content
+  - tree_index.json  : hierarchical document tree with Claude summaries
+  - term_index.json  : flat term index via Nova Lite unsupervised extraction
+
+Requirements:
+  pip install python-docx lxml pdfplumber boto3
+"""
+
+import os
+import re
+import json
+import base64
+import hashlib
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+
+import boto3
+from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from docx.oxml.ns import qn
+from lxml import etree
+
+# ---------------------------------------------------------------------------
+# CONFIG — edit these paths
+# ---------------------------------------------------------------------------
+DOCS_DIR = Path(r"/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/documents")
+OUTPUT_DIR = Path(r"/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output")
+BEDROCK_REGION = "us-east-1"
+CLAUDE_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+NOVA_MODEL_ID = "us.amazon.nova-lite-v1:0"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# BEDROCK CLIENT
+# ---------------------------------------------------------------------------
+bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+
+
+def bedrock_chat(model_id: str, prompt: str, image_bytes: Optional[bytes] = None, max_tokens: int = 1024) -> str:
+    """Call Bedrock Converse API. Supports text-only or text + image."""
+    content = []
+    if image_bytes:
+        # Detect format from magic bytes
+        fmt = "png"
+        if image_bytes[:3] == b"\xff\xd8\xff":
+            fmt = "jpeg"
+        elif image_bytes[:4] == b"GIF89a" or image_bytes[:4] == b"GIF87a":
+            fmt = "gif"
+        content.append({"image": {"format": fmt, "source": {"bytes": image_bytes}}})
+
+    content.append({"text": prompt})
+
+    try:
+        resp = bedrock.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": content}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as e:
+        print(f"  [Bedrock Error] {e}")
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# TEXT CLEANING
+# ---------------------------------------------------------------------------
+def clean_text(text: str) -> str:
+    text = re.sub(r"\*\*|__|~~", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# STEP 1A — DOCX EXTRACTION (Reading Order: paragraphs + tables + images)
+# ---------------------------------------------------------------------------
+def extract_docx(path: Path) -> Dict[str, Any]:
+    """
+    Extract text, tables, and images from a .docx in exact reading order.
+    Returns a list of ordered blocks with type markers.
+    """
+    doc = Document(str(path))
+    blocks: List[Dict[str, Any]] = []
+    image_counter = 0
+
+    # Namespace map for image lookup
+    nsmap = {
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+
+    for child in doc.element.body:
+        tag = etree.QName(child).localname
+
+        if tag == "p":
+            para = Paragraph(child, doc)
+            text = para.text.strip() if para.text else ""
+            if text:
+                blocks.append({"type": "text", "content": text})
+
+            # Check for inline images in this paragraph
+            blips = child.findall(".//a:blip", nsmap)
+            for blip in blips:
+                embed = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+                if embed:
+                    image_part = doc.part.related_parts.get(embed)
+                    if image_part:
+                        image_counter += 1
+                        img_bytes = image_part.blob
+                        # Describe image via Bedrock
+                        desc = describe_image(img_bytes, image_counter, path.name)
+                        blocks.append({"type": "image", "content": desc, "img_index": image_counter})
+
+        elif tag == "tbl":
+            table = Table(child, doc)
+            rows = []
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                blocks.append({"type": "table", "content": "\n".join(rows)})
+
+    # Build full text preserving reading order
+    full_text_parts = []
+    for b in blocks:
+        if b["type"] == "text":
+            full_text_parts.append(b["content"])
+        elif b["type"] == "table":
+            full_text_parts.append(f"\n[TABLE]\n{b[\'content\']}")
+        elif b["type"] == "image":
+            full_text_parts.append(f"\n[IMAGE: {b[\'content\']}]")
+
+    return {
+        "doc_id": path.stem,
+        "doc_type": "docx",
+        "source_path": str(path),
+        "blocks": blocks,
+        "full_text": clean_text("\n".join(full_text_parts)),
+    }
+
+
+def describe_image(image_bytes: bytes, idx: int, doc_name: str) -> str:
+    """Use Claude multimodal to describe an image from the docx."""
+    prompt = (
+        "Describe this image in 1-2 sentences. It is from an ECMC bankruptcy phone guide. "
+        "If it contains a screenshot, UI, or form, describe what is shown. Be concise."
+    )
+    desc = bedrock_chat(CLAUDE_MODEL_ID, prompt, image_bytes=image_bytes, max_tokens=200)
+    if not desc:
+        desc = f"[Image {idx} in {doc_name} — description unavailable]"
+    return desc
+
+
+# ---------------------------------------------------------------------------
+# STEP 1B — PDF EXTRACTION (Searchable text, page by page)
+# ---------------------------------------------------------------------------
+try:
+    import pdfplumber
+    HAS_PDFPLUMBER = True
+except ImportError:
+    HAS_PDFPLUMBER = False
+
+
+def extract_pdf(path: Path) -> Dict[str, Any]:
+    """Extract text page-by-page from searchable PDFs."""
+    if not HAS_PDFPLUMBER:
+        raise ImportError("pdfplumber not installed. Run: pip install pdfplumber")
+
+    pages = []
+    full_parts = []
+    with pdfplumber.open(str(path)) as pdf:
+        for i, page in enumerate(pdf.pages, 1):
+            text = page.extract_text()
+            if text and text.strip():
+                cleaned = clean_text(text.strip())
+                pages.append({"page_num": i, "text": cleaned})
+                full_parts.append(cleaned)
+
+    return {
+        "doc_id": path.stem,
+        "doc_type": "pdf",
+        "source_path": str(path),
+        "pages": pages,
+        "full_text": "\n\n".join(full_parts),
+    }
+
+
+# ---------------------------------------------------------------------------
+# STEP 1C — TXT EXTRACTION
+# ---------------------------------------------------------------------------
+def extract_txt(path: Path) -> Dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    return {
+        "doc_id": path.stem,
+        "doc_type": "txt",
+        "source_path": str(path),
+        "full_text": clean_text(text),
+    }
+
+
+# ---------------------------------------------------------------------------
+# STEP 1D — BUILD CORPUS
+# ---------------------------------------------------------------------------
+def build_corpus(docs_dir: Path) -> List[Dict[str, Any]]:
+    """Walk docs_dir and extract all supported files."""
+    corpus = []
+    files = sorted(docs_dir.iterdir())
+
+    for f in files:
+        if f.suffix.lower() == ".docx":
+            print(f"[Extracting DOCX] {f.name}")
+            corpus.append(extract_docx(f))
+        elif f.suffix.lower() == ".pdf":
+            print(f"[Extracting PDF ] {f.name}")
+            corpus.append(extract_pdf(f))
+        elif f.suffix.lower() == ".txt":
+            print(f"[Extracting TXT ] {f.name}")
+            corpus.append(extract_txt(f))
+
+    # Save corpus
+    corpus_path = OUTPUT_DIR / "corpus.json"
+    with open(corpus_path, "w", encoding="utf-8") as fh:
+        json.dump(corpus, fh, indent=2, ensure_ascii=False, default=str)
+    print(f"\n[Corpus saved] {corpus_path} ({len(corpus)} documents)")
+    return corpus
+
+
+# ---------------------------------------------------------------------------
+# STEP 2A — SPLIT INTO GROUP SECTIONS (same logic as before, improved)
+# ---------------------------------------------------------------------------
+def split_group_sections(full_text: str, doc_id: str) -> List[Dict[str, Any]]:
+    """
+    Split document text by GROUP headers (handles hyphens, en-dashes, em-dashes).
+    Then split each group by sub-headers (ALL CAPS or ends with :).
+    """
+    pattern = r"(GROUP\s+\d+\s*[-–—]{1,2}\s*[^\n]+)(.*?)(?=GROUP\s+\d+\s*[-–—]{1,2}|\Z)"
+    matches = list(re.finditer(pattern, full_text, re.DOTALL | re.IGNORECASE))
+
+    if not matches:
+        # No GROUP headers found; treat whole doc as one section
+        if len(full_text.strip()) >= 80:
+            return [{"section_id": f"{doc_id}_S000", "title": doc_id, "text": full_text.strip()}]
+        return []
+
+    sections = []
+    for i, m in enumerate(matches):
+        group_title = clean_text(m.group(1).strip())
+        body = clean_text(m.group(2).strip())
+        lines = body.split("\n")
+        current_title = group_title
+        current_lines = []
+        sub_idx = 0
+
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            letters = re.sub(r"[^a-zA-Z]", "", s)
+            is_header = (letters.isupper() and len(letters) > 10) or (s.endswith(":") and len(s) < 150)
+
+            if is_header and s != group_title:
+                if current_lines:
+                    sec_text = "\n".join(current_lines)
+                    if len(sec_text) >= 80:
+                        sections.append({
+                            "section_id": f"{doc_id}_G{i}_S{sub_idx:03d}",
+                            "title": current_title,
+                            "text": sec_text,
+                            "group": group_title,
+                        })
+                        sub_idx += 1
+                current_title = s
+                current_lines = []
+            else:
+                current_lines.append(s)
+
+        if current_lines:
+            sec_text = "\n".join(current_lines)
+            if len(sec_text) >= 80:
+                sections.append({
+                    "section_id": f"{doc_id}_G{i}_S{sub_idx:03d}",
+                    "title": current_title,
+                    "text": sec_text,
+                    "group": group_title,
+                })
+
+        if not sections and body:
+            sections.append({
+                "section_id": f"{doc_id}_G{i}_S000",
+                "title": group_title,
+                "text": body,
+                "group": group_title,
+            })
+
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# STEP 2B — BUILD TREE INDEX (Claude summarizes each section)
+# ---------------------------------------------------------------------------
+def summarize_section(title: str, text: str) -> str:
+    """Ask Claude to generate a 1-2 sentence summary of a section."""
+    prompt = (
+        f"Summarize the following ECMC bankruptcy guide section in 1-2 sentences. "
+        f"Be specific about what information it contains. Do not use generic phrases.\n\n"
+        f"Title: {title}\n"
+        f"Content: {text[:2000]}\n\n"
+        f"Summary:"
+    )
+    summary = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=150)
+    return summary or f"Section about {title}"
+
+
+def build_tree_index(corpus: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build hierarchical tree with Claude-generated summaries."""
+    tree = {"root": "ECMC Bankruptcy Corpus", "documents": {}}
+
+    for doc in corpus:
+        doc_id = doc["doc_id"]
+        print(f"[Tree Build] {doc_id}")
+
+        # For DOCX: use GROUP sections; for PDF/TXT: use pages or whole doc
+        if doc["doc_type"] == "docx":
+            sections = split_group_sections(doc["full_text"], doc_id)
+        elif doc["doc_type"] == "pdf":
+            sections = []
+            for p in doc.get("pages", []):
+                sections.append({
+                    "section_id": f"{doc_id}_P{p[\'page_num\']}",
+                    "title": f"Page {p[\'page_num\']}",
+                    "text": p["text"],
+                    "group": doc_id,
+                })
+        else:
+            sections = [{
+                "section_id": f"{doc_id}_S000",
+                "title": doc_id,
+                "text": doc["full_text"],
+                "group": doc_id,
+            }]
+
+        nodes = []
+        for i, sec in enumerate(sections):
+            if i % 5 == 0:
+                print(f"  Summarizing {i+1}/{len(sections)}")
+            summary = summarize_section(sec["title"], sec["text"])
+            nodes.append({
+                "node_id": sec["section_id"],
+                "title": sec["title"],
+                "group": sec.get("group", ""),
+                "summary": summary,
+                "full_text": sec["text"],
+            })
+
+        tree["documents"][doc_id] = nodes
+
+    tree_path = OUTPUT_DIR / "tree_index.json"
+    with open(tree_path, "w", encoding="utf-8") as fh:
+        json.dump(tree, fh, indent=2, ensure_ascii=False, default=str)
+    print(f"\n[Tree Index saved] {tree_path}")
+    return tree
+
+
+# ---------------------------------------------------------------------------
+# STEP 2C — BUILD FLAT TERM INDEX (Nova Lite unsupervised extraction)
+# ---------------------------------------------------------------------------
+def extract_terms_nova(full_text: str, doc_id: str) -> List[Dict[str, Any]]:
+    """Ask Nova Lite to extract domain-specific terms from a document."""
+    prompt = (
+        "You are analyzing an ECMC bankruptcy student loan document. "
+        "Extract all important domain-specific terms that a borrower or agent might ask about. "
+        "Include legal terms, procedures, forms, and loan statuses. "
+        "Return ONLY a JSON array of objects with this exact shape:\n"
+        '[{"term": "Exact Term", "aliases": ["alias1", "alias2"], "category": "legal|procedure|form|status"}]\n\n'
+        "Document text:\n"
+        f"{full_text[:4000]}\n\n"
+        "Terms (JSON only):"
+    )
+    resp = bedrock_chat(NOVA_MODEL_ID, prompt, max_tokens=1024)
+
+    terms = []
+    try:
+        # Clean markdown fences
+        cleaned = re.sub(r"```json\s*|\s*```", "", resp).strip()
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            terms = parsed
+        elif isinstance(parsed, dict) and "terms" in parsed:
+            terms = parsed["terms"]
+    except Exception as e:
+        print(f"  [Term Parse Error] {e} — raw: {resp[:200]}")
+
+    return terms
+
+
+def build_term_index(corpus: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build flat term index: term -> list of occurrences across docs."""
+    term_map: Dict[str, Dict[str, Any]] = {}
+
+    for doc in corpus:
+        doc_id = doc["doc_id"]
+        print(f"[Term Extract] {doc_id}")
+        terms = extract_terms_nova(doc["full_text"], doc_id)
+
+        for t in terms:
+            term_name = t.get("term", "").strip()
+            if not term_name:
+                continue
+
+            if term_name not in term_map:
+                term_map[term_name] = {
+                    "term": term_name,
+                    "aliases": t.get("aliases", []),
+                    "category": t.get("category", "unknown"),
+                    "sources": [],
+                    "occurrence_count": 0,
+                }
+
+            term_map[term_name]["sources"].append({
+                "doc_id": doc_id,
+                "doc_type": doc["doc_type"],
+                "context_snippet": doc["full_text"][:300].replace("\n", " "),
+            })
+            term_map[term_name]["occurrence_count"] += 1
+
+    term_index = {
+        "total_terms": len(term_map),
+        "terms": list(term_map.values()),
+    }
+
+    term_path = OUTPUT_DIR / "term_index.json"
+    with open(term_path, "w", encoding="utf-8") as fh:
+        json.dump(term_index, fh, indent=2, ensure_ascii=False, default=str)
+    print(f"\n[Term Index saved] {term_path} ({len(term_map)} terms)")
+    return term_index
+
