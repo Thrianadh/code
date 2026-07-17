@@ -1,4 +1,18 @@
-Cohere Rerank - FAILED: An error occurred (AccessDeniedException) when calling the InvokeModel operation: Model access is denied due to IAM user or service role is not authorized to perform the required AWS Marketplace actions (aws-marketplace: ViewSubscriptions, aws-marketplace: Subscribe) to enable access to this model. Refer to the Amazon Bedrock documentation for further details. Your AWS Marketplace subscription for this model cannot be completed at this time. If you recently fixed this issue, try again
+import boto3
+
+textract = boto3.client("textract", region_name="us-east-1")
+
+# Test 1: Detect text from a local image/PDF bytes
+with open("your-document.pdf", "rb") as f:
+    doc_bytes = f.read()
+
+response = textract.detect_document_text(Document={"Bytes": doc_bytes})
+
+print("Blocks found:", len(response["Blocks"]))
+for block in response["Blocks"][:5]:
+    if block["BlockType"] == "LINE":
+        print(f"  {block['Text']}")
+#######
 import json
 import boto3
 import numpy as np
