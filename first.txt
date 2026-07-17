@@ -1,1468 +1,162 @@
-!pip install python-docx lxml Pillow pytesseract
-
-import os
-import sys
 import json
-import base64
-import io
-import hashlib
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Union, Tuple
-from dataclasses import dataclass, field
-from enum import Enum
-from collections import defaultdict
+import boto3
+import numpy as np
+from typing import List, Dict, Any
 
-# Core DOCX processing
-from docx import Document
-from docx.oxml.ns import qn
-from docx.table import Table
-from docx.text.paragraph import Paragraph
-from lxml import etree
+REGION = "us-east-1"
 
-# Image / OCR
-try:
-    from PIL import Image as PILImage
-    PILLOW_AVAILABLE = True
-except ImportError:
-    PILLOW_AVAILABLE = False
+# Model IDs (common Bedrock IDs — adjust if your region uses different ones)
+TITAN_EMBED_ID = "us.amazon.titan-embed-text-v2:0"
+COHERE_EMBED_ID = "us.cohere.embed-english-v3"
+COHERE_RERANK_ID = "us.cohere.rerank-v3-5:0"
 
-try:
-    import pytesseract
-    PYTESSERACT_AVAILABLE = True
-except ImportError:
-    PYTESSERACT_AVAILABLE = False
-
-try:
-    from transformers import pipeline
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
+bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
 
-class ElementType(Enum):
-    TEXT = "text"
-    HEADING = "heading"
-    LIST_ITEM = "list_item"
-    TABLE = "table"
-    IMAGE = "image"
-    COLUMN_LAYOUT = "column_layout"
-    HEADER = "header"
-    FOOTER = "footer"
+def print_banner(title: str):
+    print("\n" + "=" * 60)
+    print(title)
+    print("=" * 60)
 
 
-@dataclass
-class ExtractedElement:
-    element_type: str
-    content: Any
-    reading_order: int
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "element_type": self.element_type,
-            "content": self.content,
-            "reading_order": self.reading_order,
-            "metadata": self.metadata
-        }
+def print_result(label: str, value: Any, truncate: bool = True):
+    text = str(value)
+    if truncate and len(text) > 300:
+        text = text[:300] + f"... ({len(str(value))} chars total)"
+    print(f"  {label:<25} {text}")
 
 
-class OneNoteDocxExtractor:
-    """
-    Production-grade extractor for OneNote-sourced DOCX files.
-    Preserves reading order by iterating the document XML in sequence.
-    """
+def test_titan_embeddings() -> bool:
+    print_banner("TEST 1: Amazon Titan Embeddings")
 
-    def __init__(
-        self,
-        docx_path: Union[str, Path],
-        output_dir: Union[str, Path] = "./output",
-        use_ocr: bool = True,
-        ocr_engine: str = "pytesseract",
-        ocr_lang: str = "eng",
-        extract_images: bool = True,
-        image_format: str = "png"
-    ):
-        self.docx_path = Path(docx_path).resolve()
-        self.output_dir = Path(output_dir).resolve()
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        (self.output_dir / "images").mkdir(exist_ok=True)
+    sample_text = "How do I apply for a Title IV eligibility letter during bankruptcy?"
 
-        self.use_ocr = use_ocr
-        self.ocr_engine = ocr_engine
-        self.ocr_lang = ocr_lang
-        self.extract_images = extract_images
-        self.image_format = image_format
+    try:
+        body = json.dumps({"inputText": sample_text})
+        resp = bedrock.invoke_model(modelId=TITAN_EMBED_ID, body=body)
+        result = json.loads(resp["body"].read())
 
-        self.doc = Document(str(self.docx_path))
-        self.elements: List[ExtractedElement] = []
-        self.reading_order = 0
-        self.image_counter = 0
-        self._image_hashes = set()
+        embedding = result.get("embedding", [])
+        dim = len(embedding)
 
-        self._baidu_pipeline = None
+        print_result("Model ID", TITAN_EMBED_ID)
+        print_result("Input text", sample_text)
+        print_result("Embedding dimension", dim)
+        print_result("First 5 values", [round(x, 6) for x in embedding[:5]])
+        print_result("Norm (L2)", round(np.linalg.norm(embedding), 4))
+        print("  Titan Embeddings — WORKING")
+        return True
 
-        self._nsmap = {
-            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
-            "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
-            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-            "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
-            "ve": "http://schemas.openxmlformats.org/markup-compatibility/2006",
-            "o": "urn:schemas-microsoft-com:office:office",
-            "v": "urn:schemas-microsoft-com:vml",
-        }
-
-    def extract_all(self) -> Dict[str, Any]:
-        """Run full extraction pipeline."""
-        metadata = self._extract_metadata()
-        self._process_body()
-        self._process_headers_and_footers()
-        self.elements.sort(key=lambda e: e.reading_order)
-
-        return {
-            "source_file": str(self.docx_path),
-            "metadata": metadata,
-            "total_elements": len(self.elements),
-            "elements": [e.to_dict() for e in self.elements]
-        }
-
-    def save_json(self, data: Dict[str, Any], filename: str = "extracted_data.json") -> Path:
-        out_path = self.output_dir / filename
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-        return out_path
-
-    def _extract_metadata(self) -> Dict[str, Any]:
-        cp = self.doc.core_properties
-        return {
-            "title": cp.title or "",
-            "author": cp.author or "",
-            "subject": cp.subject or "",
-            "created": str(cp.created) if cp.created else None,
-            "modified": str(cp.modified) if cp.modified else None,
-            "paragraphs": len(self.doc.paragraphs),
-            "tables": len(self.doc.tables),
-            "sections": len(self.doc.sections),
-            "column_layout_detected": self._detect_multi_column()
-        }
-
-    def _detect_multi_column(self) -> bool:
-        for section in self.doc.sections:
-            sectPr = section._sectPr
-            cols = sectPr.find(qn("w:cols"))
-            if cols is not None:
-                num = cols.get(qn("w:num"))
-                if num and int(num) > 1:
-                    return True
+    except Exception as e:
+        print(f" Titan Embeddings — FAILED: {e}")
         return False
 
-    def _process_body(self):
-        body = self.doc.element.body
-        for child in body:
-            tag = etree.QName(child).localname
-            if tag == "p":
-                self._process_paragraph(Paragraph(child, self.doc))
-            elif tag == "tbl":
-                self._process_table(Table(child, self.doc))
 
-    def _process_paragraph(self, para: Paragraph):
-        text = para.text.strip()
-        style = para.style.name if para.style else "Normal"
-        images = self._extract_images_from_paragraph(para)
 
-        if text and images:
-            self._emit_text_element(para, text, style)
-            for img in images:
-                self._add_element(ElementType.IMAGE, img)
-        elif text:
-            self._emit_text_element(para, text, style)
-        elif images:
-            for img in images:
-                self._add_element(ElementType.IMAGE, img)
+def test_cohere_embeddings() -> bool:
+    print_banner("TEST 2: Cohere Embeddings")
 
-    def _emit_text_element(self, para: Paragraph, text: str, style: str):
-        elem_type = self._classify_text_element(para, style)
-        content = {
-            "text": text,
-            "style": style,
-            "alignment": str(para.alignment) if para.alignment else None,
-            "runs": self._extract_runs(para),
-            "is_bold": any(r.bold for r in para.runs),
-            "is_italic": any(r.italic for r in para.runs),
-            "is_underline": any(r.underline for r in para.runs),
-        }
-        self._add_element(elem_type, content)
+    sample_texts = [
+        "What is the automatic stay in bankruptcy?",
+        "How do I consolidate my defaulted student loans?"
+    ]
 
-    def _classify_text_element(self, para: Paragraph, style: str) -> ElementType:
-        style_lower = style.lower()
-        if "heading" in style_lower or style_lower.startswith("title"):
-            return ElementType.HEADING
-        if self._is_list_paragraph(para):
-            return ElementType.LIST_ITEM
-        return ElementType.TEXT
+    try:
+        body = json.dumps({
+            "texts": sample_texts,
+            "input_type": "search_document"
+        })
+        resp = bedrock.invoke_model(modelId=COHERE_EMBED_ID, body=body)
+        result = json.loads(resp["body"].read())
 
-    def _is_list_paragraph(self, para: Paragraph) -> bool:
-        pPr = para._p.find(qn("w:pPr"))
-        if pPr is None:
-            return False
-        numPr = pPr.find(qn("w:numPr"))
-        return numPr is not None
+        embeddings = result.get("embeddings", [])
 
-    def _extract_runs(self, para: Paragraph) -> List[Dict[str, Any]]:
-        runs = []
-        for run in para.runs:
-            font = run.font
-            runs.append({
-                "text": run.text,
-                "bold": bool(run.bold),
-                "italic": bool(run.italic),
-                "underline": bool(run.underline),
-                "font_name": font.name,
-                "font_size_pt": round(font.size.pt, 1) if font.size else None,
-                "color_rgb": str(font.color.rgb) if font.color and font.color.rgb else None,
-            })
-        return runs
+        print_result("Model ID", COHERE_EMBED_ID)
+        print_result("Input count", len(sample_texts))
+        print_result("Output embeddings", len(embeddings))
+        if embeddings:
+            print_result("Embedding dimension", len(embeddings[0]))
+            print_result("First 5 values (doc 1)", [round(x, 6) for x in embeddings[0][:5]])
+        print("  Cohere Embeddings — WORKING")
+        return True
 
-    def _extract_images_from_paragraph(self, para: Paragraph) -> List[Dict[str, Any]]:
-        images = []
-        for run in para.runs:
-            img = self._extract_image_from_run(run)
-            if img:
-                images.append(img)
-        return images
-
-    def _extract_image_from_run(self, run) -> Optional[Dict[str, Any]]:
-        try:
-            blip = run._element.find(".//a:blip", self._nsmap)
-            if blip is None:
-                return self._extract_vml_image(run)
-
-            embed = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
-            if not embed:
-                return None
-
-            image_part = self.doc.part.related_parts.get(embed)
-            if not image_part:
-                return None
-
-            image_bytes = image_part.blob
-            content_type = image_part.content_type
-            ext = content_type.split("/")[-1]
-            if ext in ("jpeg", "jpg"):
-                ext = "jpg"
-            elif ext not in ("png", "gif", "bmp", "tiff"):
-                ext = self.image_format
-
-            img_hash = hashlib.md5(image_bytes).hexdigest()
-            if img_hash in self._image_hashes:
-                return None
-            self._image_hashes.add(img_hash)
-
-            self.image_counter += 1
-            filename = f"img_{self.image_counter:04d}.{ext}"
-            img_path = self.output_dir / "images" / filename
-            img_path.write_bytes(image_bytes)
-
-            width, height = self._get_image_dimensions(image_bytes)
-            ocr_text = ""
-            if self.use_ocr and PILLOW_AVAILABLE:
-                ocr_text = self._perform_ocr(image_bytes)
-
-            return {
-                "filename": filename,
-                "relative_path": str(Path("images") / filename),
-                "absolute_path": str(img_path),
-                "width_px": width,
-                "height_px": height,
-                "content_type": content_type,
-                "size_bytes": len(image_bytes),
-                "md5": img_hash,
-                "ocr_text": ocr_text,
-                "base64": base64.b64encode(image_bytes).decode("utf-8")
-            }
-
-        except Exception as e:
-            return {
-                "filename": f"img_error_{self.image_counter:04d}",
-                "error": str(e),
-                "ocr_text": ""
-            }
-
-    def _extract_vml_image(self, run) -> Optional[Dict[str, Any]]:
-        shape = run._element.find(".//v:shape", self._nsmap)
-        if shape is not None:
-            return {
-                "filename": "vml_shape",
-                "note": "VML image detected but not extracted (legacy format)",
-                "ocr_text": ""
-            }
-        return None
-
-    def _get_image_dimensions(self, image_bytes: bytes) -> Tuple[Optional[int], Optional[int]]:
-        if not PILLOW_AVAILABLE:
-            return None, None
-        try:
-            img = PILImage.open(io.BytesIO(image_bytes))
-            return img.width, img.height
-        except Exception:
-            return None, None
-
-    def _perform_ocr(self, image_bytes: bytes) -> str:
-        if not PILLOW_AVAILABLE:
-            return "[Pillow not installed]"
-        try:
-            img = PILImage.open(io.BytesIO(image_bytes))
-            if self.ocr_engine == "pytesseract":
-                if not PYTESSERACT_AVAILABLE:
-                    return "[pytesseract not installed]"
-                return pytesseract.image_to_string(img, lang=self.ocr_lang).strip()
-            elif self.ocr_engine == "baidu":
-                return self._baidu_ocr(img)
-            else:
-                return f"[Unknown OCR engine: {self.ocr_engine}]"
-        except Exception as e:
-            return f"[OCR Error: {str(e)}]"
-
-    def _baidu_ocr(self, img) -> str:
-        if not TRANSFORMERS_AVAILABLE:
-            return "[transformers not installed; run: pip install transformers torch]"
-        if self._baidu_pipeline is None:
-            return "[Baidu OCR pipeline not initialized — uncomment code in _baidu_ocr()]"
-        return "[Baidu OCR placeholder]"
-
-    def _process_table(self, table: Table):
-        is_borderless = self._is_borderless_table(table)
-        is_nested = self._is_nested_table(table)
-
-        rows_data = []
-        for r_idx, row in enumerate(table.rows):
-            row_cells = []
-            for c_idx, cell in enumerate(row.cells):
-                cell_content = self._extract_cell_content(cell)
-                row_cells.append({
-                    "row_index": r_idx,
-                    "col_index": c_idx,
-                    "text": cell.text.strip(),
-                    "content_blocks": cell_content,
-                    "is_merged": self._is_merged_cell(cell)
-                })
-            rows_data.append(row_cells)
-
-        table_data = {
-            "row_count": len(table.rows),
-            "col_count": len(table.columns),
-            "is_borderless": is_borderless,
-            "is_nested": is_nested,
-            "is_likely_column_layout": is_borderless and len(table.columns) >= 2,
-            "rows": rows_data
-        }
-
-        elem_type = ElementType.COLUMN_LAYOUT if (is_borderless and len(table.columns) >= 2) else ElementType.TABLE
-        self._add_element(elem_type, table_data)
-
-    def _extract_cell_content(self, cell) -> List[Dict[str, Any]]:
-        blocks = []
-        for para in cell.paragraphs:
-            text = para.text.strip()
-            images = self._extract_images_from_paragraph(para)
-            if text:
-                blocks.append({
-                    "type": "text",
-                    "text": text,
-                    "style": para.style.name if para.style else "Normal"
-                })
-            for img in images:
-                blocks.append({"type": "image", "data": img})
-
-        for nested_table in cell.tables:
-            nested_data = {
-                "type": "nested_table",
-                "row_count": len(nested_table.rows),
-                "col_count": len(nested_table.columns),
-                "rows": []
-            }
-            for row in nested_table.rows:
-                nested_data["rows"].append([c.text.strip() for c in row.cells])
-            blocks.append(nested_data)
-
-        return blocks
-
-    def _is_borderless_table(self, table: Table) -> bool:
-        try:
-            tblPr = table._element.find(qn("w:tblPr"))
-            if tblPr is None:
-                return True
-            borders = tblPr.find(qn("w:tblBorders"))
-            if borders is None:
-                return True
-            for border in borders:
-                val = border.get(qn("w:val"))
-                if val and val != "none":
-                    return False
-            return True
-        except Exception:
-            return False
-
-    def _is_nested_table(self, table: Table) -> bool:
-        parent = table._element.getparent()
-        while parent is not None:
-            if etree.QName(parent).localname == "tbl":
-                return True
-            parent = parent.getparent()
+    except Exception as e:
+        print(f" Cohere Embeddings — FAILED: {e}")
         return False
 
-    def _is_merged_cell(self, cell) -> bool:
-        tcPr = cell._tc.find(qn("w:tcPr"))
-        if tcPr is None:
-            return False
-        return (tcPr.find(qn("w:gridSpan")) is not None or
-                tcPr.find(qn("w:vMerge")) is not None)
 
-    def _process_headers_and_footers(self):
-        for section in self.doc.sections:
-            for header in [section.header, section.first_page_header, section.even_page_header]:
-                if header and header.paragraphs:
-                    self._process_header_footer(header, ElementType.HEADER)
-            for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
-                if footer and footer.paragraphs:
-                    self._process_header_footer(footer, ElementType.FOOTER)
+def test_cohere_rerank() -> bool:
+    print_banner("TEST 3: Cohere Rerank")
 
-    def _process_header_footer(self, part, elem_type: ElementType):
-        for para in part.paragraphs:
-            self._process_paragraph(para)
-        for table in part.tables:
-            self._process_table(table)
-
-    def _add_element(self, elem_type: ElementType, content: Any):
-        self.reading_order += 1
-        self.elements.append(ExtractedElement(
-            element_type=elem_type.value,
-            content=content,
-            reading_order=self.reading_order
-        ))
-###		
-# ============================================
-# UPDATE THESE PATHS TO MATCH YOUR SYSTEM
-# ============================================
-DOCX_PATH = r"C:\Users\nagubadi175059\Documents\ED-Auto Phone Guide.docx"  # <-- CHANGE THIS
-OUTPUT_DIR = r"C:\Users\nagubadi175059\Documents\output"                   # <-- CHANGE THIS
-
-# Optional: Set Tesseract path if not in system PATH (Windows)
-# import pytesseract
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
-# ============================================
-# RUN EXTRACTION
-# ============================================
-extractor = OneNoteDocxExtractor(
-    docx_path=DOCX_PATH,
-    output_dir=OUTPUT_DIR,
-    use_ocr=True,
-    ocr_engine="pytesseract",
-    ocr_lang="eng",
-    extract_images=True
-)
-
-print("Extracting... Please wait.")
-data = extractor.extract_all()
-json_path = extractor.save_json(data, filename="extracted_data.json")
-
-print(f"\n{'='*50}")
-print("EXTRACTION COMPLETE")
-print(f"{'='*50}")
-print(f"JSON saved to: {json_path}")
-print(f"Total elements: {data['total_elements']}")
-print(f"Tables: {data['metadata']['tables']}")
-print(f"Multi-column layouts: {data['metadata']['column_layout_detected']}")
-###
-#####
-# Show first 15 elements
-print("First 15 extracted elements:\n")
-for el in data['elements'][:15]:
-    print(f"[{el['reading_order']:03d}] {el['element_type'].upper()}")
-    if el['element_type'] in ('text', 'heading', 'list_item'):
-        text_preview = el['content']['text'][:120]
-        print(f"      Text: {text_preview}{'...' if len(el['content']['text']) > 120 else ''}")
-    elif el['element_type'] == 'table':
-        print(f"      Table: {el['content']['row_count']} rows x {el['content']['col_count']} cols")
-    elif el['element_type'] == 'column_layout':
-        print(f"      >>> COLUMN LAYOUT: {el['content']['col_count']} columns (borderless)")
-        for row in el['content']['rows'][:2]:
-            for cell in row:
-                print(f"         Col {cell['col_index']}: {cell['text'][:80]}...")
-    elif el['element_type'] == 'image':
-        print(f"      Image: {el['content']['filename']}")
-        ocr = el['content'].get('ocr_text', '')
-        if ocr:
-            print(f"      OCR: {ocr[:100]}...")
-    print()
-#####
-from IPython.display import Image, display
-import os
-
-image_dir = os.path.join(OUTPUT_DIR, "images")
-if os.path.exists(image_dir):
-    image_files = sorted([f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.jpeg', '.gif'))])
-    print(f"Found {len(image_files)} images:\n")
-    for img_file in image_files[:5]:
-        img_path = os.path.join(image_dir, img_file)
-        print(f"--- {img_file} ---")
-        display(Image(filename=img_path, width=500))
-        for el in data['elements']:
-            if el['element_type'] == 'image' and el['content'].get('filename') == img_file:
-                print(f"OCR: {el['content'].get('ocr_text', 'N/A')[:200]}")
-                break
-        print()
-else:
-    print("No images directory found.")
-	
-####
-# Save a human-readable version
-pretty_path = os.path.join(OUTPUT_DIR, "extracted_data_pretty.json")
-with open(pretty_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-print(f"Pretty JSON saved to: {pretty_path}")
-
-#########
-#########
-import json
-from pathlib import Path
-from typing import Dict, Any, List
-
-
-class JsonToMarkdownConverter:
-    """
-    Converts extracted JSON data into a clean Markdown report.
-    Preserves reading order and handles all element types.
-    """
-
-    def __init__(self, data: Dict[str, Any], output_dir: str = "./output"):
-        self.data = data
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.md_lines: List[str] = []
-
-    def convert(self) -> str:
-        """Run full conversion and return markdown string."""
-        self._add_header()
-        self._add_metadata()
-        self._add_elements()
-        self._add_footer()
-        return "\n".join(self.md_lines)
-
-    def save_markdown(self, filename: str = "extracted_report.md") -> Path:
-        """Save markdown to file and return path."""
-        md_content = self.convert()
-        md_path = self.output_dir / filename
-        md_path.write_text(md_content, encoding="utf-8")
-        return md_path
-
-    def _add_header(self):
-        self.md_lines.extend([
-            "# OneNote Extraction Report",
-            "",
-            f"**Source File:** `{self.data.get('source_file', 'N/A')}`",
-            f"**Total Elements:** {self.data.get('total_elements', 0)}",
-            "",
-            "---",
-            ""
-        ])
-
-    def _add_metadata(self):
-        meta = self.data.get("metadata", {})
-        self.md_lines.extend([
-            "## Document Metadata",
-            "",
-            "| Property | Value |",
-            "|----------|-------|",
-            f"| Title | {meta.get('title', 'N/A')} |",
-            f"| Author | {meta.get('author', 'N/A')} |",
-            f"| Subject | {meta.get('subject', 'N/A')} |",
-            f"| Created | {meta.get('created', 'N/A')} |",
-            f"| Modified | {meta.get('modified', 'N/A')} |",
-            f"| Paragraphs | {meta.get('paragraphs', 'N/A')} |",
-            f"| Tables | {meta.get('tables', 'N/A')} |",
-            f"| Sections | {meta.get('sections', 'N/A')} |",
-            f"| Multi-Column Layout Detected | {meta.get('column_layout_detected', False)} |",
-            "",
-            "---",
-            ""
-        ])
-
-    def _add_elements(self):
-        self.md_lines.extend([
-            "## Extracted Content",
-            "",
-            "The following content is presented in exact **reading order**.",
-            "",
-        ])
-
-        elements = self.data.get("elements", [])
-        for el in elements:
-            elem_type = el.get("element_type", "unknown")
-            content = el.get("content", {})
-            order = el.get("reading_order", 0)
-
-            self.md_lines.append(f"\n<!-- Element #{order} | Type: {elem_type} -->\n")
-
-            if elem_type == "heading":
-                self._render_heading(content)
-            elif elem_type == "text":
-                self._render_text(content)
-            elif elem_type == "list_item":
-                self._render_list_item(content)
-            elif elem_type == "table":
-                self._render_table(content)
-            elif elem_type == "column_layout":
-                self._render_column_layout(content)
-            elif elem_type == "image":
-                self._render_image(content)
-            elif elem_type in ("header", "footer"):
-                self._render_header_footer(elem_type, content)
-            else:
-                self._render_unknown(elem_type, content)
-
-    def _add_footer(self):
-        self.md_lines.extend([
-            "",
-            "---",
-            "",
-            "*Report generated from OneNote DOCX Extraction Pipeline*",
-            ""
-        ])
-
-    def _render_heading(self, content: Dict[str, Any]):
-        text = content.get("text", "")
-        style = content.get("style", "")
-        level = self._infer_heading_level(style)
-        self.md_lines.append(f"{'#' * level} {text}")
-        self.md_lines.append("")
-
-    def _render_text(self, content: Dict[str, Any]):
-        text = content.get("text", "")
-        is_bold = content.get("is_bold", False)
-        is_italic = content.get("is_italic", False)
-        is_underline = content.get("is_underline", False)
-
-        if is_bold:
-            text = f"**{text}**"
-        if is_italic:
-            text = f"*{text}*"
-        if is_underline:
-            text = f"<u>{text}</u>"
-
-        self.md_lines.append(text)
-        self.md_lines.append("")
-
-    def _render_list_item(self, content: Dict[str, Any]):
-        text = content.get("text", "")
-        self.md_lines.append(f"- {text}")
-
-    def _render_table(self, content: Dict[str, Any]):
-        rows = content.get("rows", [])
-        if not rows:
-            return
-
-        header_row = rows[0]
-        headers = [cell.get("text", "") for cell in header_row]
-        self.md_lines.append("| " + " | ".join(headers) + " |")
-        self.md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-
-        for row in rows[1:]:
-            cells = [cell.get("text", "").replace("|", "\\|") for cell in row]
-            self.md_lines.append("| " + " | ".join(cells) + " |")
-
-        self.md_lines.append("")
-
-    def _render_column_layout(self, content: Dict[str, Any]):
-        """Render borderless multi-column layouts as a markdown table."""
-        rows = content.get("rows", [])
-        col_count = content.get("col_count", 2)
-
-        if not rows:
-            return
-
-        self.md_lines.append("> **Column Layout Detected** — Content arranged side-by-side")
-        self.md_lines.append("")
-
-        for row in rows:
-            cells = [cell.get("text", "").replace("\n", "<br>").replace("|", "\\|") for cell in row]
-            while len(cells) < col_count:
-                cells.append("")
-            self.md_lines.append("| " + " | ".join(cells) + " |")
-
-        self.md_lines.append("")
-
-    def _render_image(self, content: Dict[str, Any]):
-        filename = content.get("filename", "unknown")
-        rel_path = content.get("relative_path", "")
-        width = content.get("width_px", "?")
-        height = content.get("height_px", "?")
-        ocr_text = content.get("ocr_text", "")
-
-        self.md_lines.append(f"**Image:** `{filename}` ({width}x{height}px)")
-        if rel_path:
-            self.md_lines.append(f"\n![{filename}]({rel_path})")
-        if ocr_text:
-            self.md_lines.append("")
-            self.md_lines.append("> **OCR Text:**")
-            self.md_lines.append(f"> {ocr_text.replace(chr(10), ' > ')}")
-        self.md_lines.append("")
-
-    def _render_header_footer(self, elem_type: str, content: Dict[str, Any]):
-        text = content.get("text", "") if isinstance(content, dict) else str(content)
-        self.md_lines.append(f"*{elem_type.capitalize()}:* {text}")
-        self.md_lines.append("")
-
-    def _render_unknown(self, elem_type: str, content: Any):
-        text = str(content) if not isinstance(content, dict) else content.get("text", str(content))
-        self.md_lines.append(f"`[{elem_type}]` {text}")
-        self.md_lines.append("")
-
-    def _infer_heading_level(self, style: str) -> int:
-        style_lower = style.lower()
-        if "heading 1" in style_lower or "title" in style_lower:
-            return 1
-        elif "heading 2" in style_lower:
-            return 2
-        elif "heading 3" in style_lower:
-            return 3
-        elif "heading 4" in style_lower:
-            return 4
-        elif "heading 5" in style_lower:
-            return 5
-        elif "heading 6" in style_lower:
-            return 6
-        else:
-            return 2
-			
-#######
-# ============================================
-# CONVERT JSON TO MARKDOWN
-# ============================================
-converter = JsonToMarkdownConverter(data, output_dir=OUTPUT_DIR)
-
-# Generate and save
-md_path = converter.save_markdown("extracted_report.md")
-print(f"Markdown report saved to: {md_path}")
-
-# Preview first 3000 characters
-print(f"\n{'='*60}")
-print("PREVIEW (first 3000 chars):")
-print(f"{'='*60}\n")
-print(converter.convert()[:3000])
-
-
-#######
-# Show the complete markdown content
-from IPython.display import Markdown, display
-
-md_content = converter.convert()
-display(Markdown(md_content))
-#########
-Ch.13 Borгowers - Return to School / Title IV|What is a T4 letter?
-Ch.13 Borгowers - Return to School / Title IV|Requirements: What to send in for the review
-Ch.13 Borгowers - Return to School / Title IV|School denied my T4 letter
-Ch.13 Borгowers - Return to School / Title IV|What can I do now that my school has denied my financial aid?
-Ch.7 Borrowers -returns to school / Title IV|What is a T4 letter?
-Ch.7 Borrowers -returns to school / Title IV|Requirements: What to send in for the review
-Making Payments During Active Bankruptcy|I want to make a payment
-Making Payments During Active Bankruptcy|What is my payment amount?
-Making Payments During Active Bankruptcy|I want to payoff/negotiate balance
-Adversary/Stipulation Accounts|I am going to file an adversary case/lawsuit against ECMC, what is your address?
-Balance Dispute: POC PIF|My student loans were paid in full during bankruptcy, why do I owe a balance?
-Consolidation|I want to consolidate
-Consolidation|What is the status of my consolidation?
-Consolidation|How do I consolidate?
-Credit reporting|Default Borrower: I am in bankruptcy. Why are my student loans being reported as default on my credit report? I am in an active bankruptcy and should not be in default.
-Default Dispute|Why are my student loans being reported as in default? I don't believe they should be in default.
-How to get out of default|ACTIVE BANKRUPTCY BOROWER: I want to get out of default. What do I need to do.
-How payments are applied|I have been making payments for the past several months. How come my balance is still so high?
-What happens to my student loans after bankruptcy?|What happens to my student loans after bankruptcy?
-"Loan Forgiveness|
-TPD, Closed School Discharge, BDR, Discharge due to death, Public Service Loan Forgiveness, Teacher Loan forgiveness; any mentions of loan forgiveness"
-I want to negotiate my balance, pay my student loan in full, or settle the balance|During an active bankruptcy, ECMC cannot enter into repayment arrangements, negotiate settlements, or compromise any portion of the loan balance due to the protections of the bankruptcy automatic stay. Once the bankruptcy concludes, the loan will either return to repayment status or be referred to collections, depending on the borrower's circumstances. Agents should not discuss or speculate on f future repayment, settlement, or collection options.
-Consolidation/ Consolidate student loans: "I want to consolidate my loans"|I want to get out of default
-Consolidation/ Consolidate student loans: "I want to consolidate my loans"|I want to consolidate my student loans
-Consolidation/ Consolidate student loans: "I want to consolidate my loans"|How do I consolidate?
-################
-"I have executed the RAG model and generated the output spreadsheet for Group 11, which includes columns for the Query, Answer, Node IDs, Retrieval Reasoning, Latency (seconds), and Ground Truth (Maika).Using this output, I need to verify two things: first, evaluate the generated answers against the Ground Truth column; second, confirm that the information in the Answer column accurately reflects the retrieved source data."
-
-i pasted the file which i got the results 
-how i can to improve the results based on this program can you change this to increase the accuracy.
-
-
-
-| Issue Type | Your Program’s Issue? | Priority | How to Fix || --- | --- | --- | --- |
-| Verbosity | ✅ Yes | ⭐⭐⭐⭐⭐ | Post-process answers (post_process_answer). |
-| Group 12 References | ✅ Yes | ⭐⭐⭐⭐⭐ | Filter Group 12 nodes (filter_group_12_nodes). |
-| Missing Key Phrases | ✅ Yes | ⭐⭐⭐⭐⭐ | Improve retrieval prompt + boost keyword matching. |
-| Retrieval Failures | ✅ Yes | ⭐⭐⭐⭐⭐ | Hardcode critical queries (get_critical_answer). |
-| Inconsistent Formatting | ✅ Yes | ⭐⭐ | Clean answers (remove markdown/citations). |
-| LLM Latency | ✅ Yes | ⭐ | Optimize prompts or use caching. |
-| Node ID Mismatches | ✅ Yes | ⭐ | Standardize node ID naming. |
-| Partial Matches | ✅ Yes | ⭐⭐⭐ | Refine LLM prompts for exactness. |
-
-
-############
-"""
-Vectorless RAG — Step 1 & Step 2
-================================
-Corpus extraction + Dual Index Builder (Tree + Flat Term Index)
-
-Processes:
-  - .docx  (text, tables, images in reading order)
-  - .pdf   (text page-by-page, searchable PDFs)
-  - .txt   (raw text)
-
-Outputs:
-  - corpus.json      : normalized document content
-  - tree_index.json  : hierarchical document tree with Claude summaries
-  - term_index.json  : flat term index via Nova Lite unsupervised extraction
-
-Requirements:
-  pip install python-docx lxml pdfplumber boto3
-"""
-
-import os
-import re
-import json
-import base64
-import hashlib
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-
-import boto3
-from docx import Document
-from docx.table import Table
-from docx.text.paragraph import Paragraph
-from docx.oxml.ns import qn
-from lxml import etree
-
-# ---------------------------------------------------------------------------
-# CONFIG — edit these paths
-# ---------------------------------------------------------------------------
-DOCS_DIR = Path(r"/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/documents")
-OUTPUT_DIR = Path(r"/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output")
-BEDROCK_REGION = "us-east-1"
-CLAUDE_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
-NOVA_MODEL_ID = "us.amazon.nova-lite-v1:0"
-
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# BEDROCK CLIENT
-# ---------------------------------------------------------------------------
-bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-
-
-def bedrock_chat(model_id: str, prompt: str, image_bytes: Optional[bytes] = None, max_tokens: int = 1024) -> str:
-    """Call Bedrock Converse API. Supports text-only or text + image."""
-    content = []
-    if image_bytes:
-        # Detect format from magic bytes
-        fmt = "png"
-        if image_bytes[:3] == b"\xff\xd8\xff":
-            fmt = "jpeg"
-        elif image_bytes[:4] == b"GIF89a" or image_bytes[:4] == b"GIF87a":
-            fmt = "gif"
-        content.append({"image": {"format": fmt, "source": {"bytes": image_bytes}}})
-
-    content.append({"text": prompt})
+    query = "Can I make payments during Chapter 13 bankruptcy?"
+    documents = [
+        "Borrowers are not required to make monthly payments during bankruptcy unless the plan provides for direct pay.",
+        "To be eligible for federal financial aid, one must submit a T4 letter from their student loan servicer.",
+        "Loan rehabilitation requires nine consecutive monthly payments to remove default status.",
+        "If the Chapter 13 plan states for borrower to pay direct, it won't be considered voluntary payments anymore."
+    ]
 
     try:
-        resp = bedrock.converse(
-            modelId=model_id,
-            messages=[{"role": "user", "content": content}],
-            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
-        )
-        return resp["output"]["message"]["content"][0]["text"]
-    except Exception as e:
-        print(f"  [Bedrock Error] {e}")
-        return ""
-
-
-# ---------------------------------------------------------------------------
-# TEXT CLEANING
-# ---------------------------------------------------------------------------
-def clean_text(text: str) -> str:
-    text = re.sub(r"\*\*|__|~~", "", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-# ---------------------------------------------------------------------------
-# STEP 1A — DOCX EXTRACTION (Reading Order: paragraphs + tables + images)
-# ---------------------------------------------------------------------------
-def extract_docx(path: Path) -> Dict[str, Any]:
-    """
-    Extract text, tables, and images from a .docx in exact reading order.
-    Returns a list of ordered blocks with type markers.
-    """
-    doc = Document(str(path))
-    blocks: List[Dict[str, Any]] = []
-    image_counter = 0
-
-    # Namespace map for image lookup
-    nsmap = {
-        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    }
-
-    for child in doc.element.body:
-        tag = etree.QName(child).localname
-
-        if tag == "p":
-            para = Paragraph(child, doc)
-            text = para.text.strip() if para.text else ""
-            if text:
-                blocks.append({"type": "text", "content": text})
-
-            # Check for inline images in this paragraph
-            blips = child.findall(".//a:blip", nsmap)
-            for blip in blips:
-                embed = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
-                if embed:
-                    image_part = doc.part.related_parts.get(embed)
-                    if image_part:
-                        image_counter += 1
-                        img_bytes = image_part.blob
-                        # Describe image via Bedrock
-                        desc = describe_image(img_bytes, image_counter, path.name)
-                        blocks.append({"type": "image", "content": desc, "img_index": image_counter})
-
-        elif tag == "tbl":
-            table = Table(child, doc)
-            rows = []
-            for row in table.rows:
-                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-                if cells:
-                    rows.append(" | ".join(cells))
-            if rows:
-                blocks.append({"type": "table", "content": "\n".join(rows)})
-
-    # Build full text preserving reading order
-    full_text_parts = []
-    for b in blocks:
-        if b["type"] == "text":
-            full_text_parts.append(b["content"])
-        elif b["type"] == "table":
-            full_text_parts.append(f"\n[TABLE]\n{b[\'content\']}")
-        elif b["type"] == "image":
-            full_text_parts.append(f"\n[IMAGE: {b[\'content\']}]")
-
-    return {
-        "doc_id": path.stem,
-        "doc_type": "docx",
-        "source_path": str(path),
-        "blocks": blocks,
-        "full_text": clean_text("\n".join(full_text_parts)),
-    }
-
-
-def describe_image(image_bytes: bytes, idx: int, doc_name: str) -> str:
-    """Use Claude multimodal to describe an image from the docx."""
-    prompt = (
-        "Describe this image in 1-2 sentences. It is from an ECMC bankruptcy phone guide. "
-        "If it contains a screenshot, UI, or form, describe what is shown. Be concise."
-    )
-    desc = bedrock_chat(CLAUDE_MODEL_ID, prompt, image_bytes=image_bytes, max_tokens=200)
-    if not desc:
-        desc = f"[Image {idx} in {doc_name} — description unavailable]"
-    return desc
-
-
-# ---------------------------------------------------------------------------
-# STEP 1B — PDF EXTRACTION (Searchable text, page by page)
-# ---------------------------------------------------------------------------
-try:
-    import pdfplumber
-    HAS_PDFPLUMBER = True
-except ImportError:
-    HAS_PDFPLUMBER = False
-
-
-def extract_pdf(path: Path) -> Dict[str, Any]:
-    """Extract text page-by-page from searchable PDFs."""
-    if not HAS_PDFPLUMBER:
-        raise ImportError("pdfplumber not installed. Run: pip install pdfplumber")
-
-    pages = []
-    full_parts = []
-    with pdfplumber.open(str(path)) as pdf:
-        for i, page in enumerate(pdf.pages, 1):
-            text = page.extract_text()
-            if text and text.strip():
-                cleaned = clean_text(text.strip())
-                pages.append({"page_num": i, "text": cleaned})
-                full_parts.append(cleaned)
-
-    return {
-        "doc_id": path.stem,
-        "doc_type": "pdf",
-        "source_path": str(path),
-        "pages": pages,
-        "full_text": "\n\n".join(full_parts),
-    }
-
-
-# ---------------------------------------------------------------------------
-# STEP 1C — TXT EXTRACTION
-# ---------------------------------------------------------------------------
-def extract_txt(path: Path) -> Dict[str, Any]:
-    text = path.read_text(encoding="utf-8")
-    return {
-        "doc_id": path.stem,
-        "doc_type": "txt",
-        "source_path": str(path),
-        "full_text": clean_text(text),
-    }
-
-
-# ---------------------------------------------------------------------------
-# STEP 1D — BUILD CORPUS
-# ---------------------------------------------------------------------------
-def build_corpus(docs_dir: Path) -> List[Dict[str, Any]]:
-    """Walk docs_dir and extract all supported files."""
-    corpus = []
-    files = sorted(docs_dir.iterdir())
-
-    for f in files:
-        if f.suffix.lower() == ".docx":
-            print(f"[Extracting DOCX] {f.name}")
-            corpus.append(extract_docx(f))
-        elif f.suffix.lower() == ".pdf":
-            print(f"[Extracting PDF ] {f.name}")
-            corpus.append(extract_pdf(f))
-        elif f.suffix.lower() == ".txt":
-            print(f"[Extracting TXT ] {f.name}")
-            corpus.append(extract_txt(f))
-
-    # Save corpus
-    corpus_path = OUTPUT_DIR / "corpus.json"
-    with open(corpus_path, "w", encoding="utf-8") as fh:
-        json.dump(corpus, fh, indent=2, ensure_ascii=False, default=str)
-    print(f"\n[Corpus saved] {corpus_path} ({len(corpus)} documents)")
-    return corpus
-
-
-# ---------------------------------------------------------------------------
-# STEP 2A — SPLIT INTO GROUP SECTIONS (same logic as before, improved)
-# ---------------------------------------------------------------------------
-def split_group_sections(full_text: str, doc_id: str) -> List[Dict[str, Any]]:
-    """
-    Split document text by GROUP headers (handles hyphens, en-dashes, em-dashes).
-    Then split each group by sub-headers (ALL CAPS or ends with :).
-    """
-    pattern = r"(GROUP\s+\d+\s*[-–—]{1,2}\s*[^\n]+)(.*?)(?=GROUP\s+\d+\s*[-–—]{1,2}|\Z)"
-    matches = list(re.finditer(pattern, full_text, re.DOTALL | re.IGNORECASE))
-
-    if not matches:
-        # No GROUP headers found; treat whole doc as one section
-        if len(full_text.strip()) >= 80:
-            return [{"section_id": f"{doc_id}_S000", "title": doc_id, "text": full_text.strip()}]
-        return []
-
-    sections = []
-    for i, m in enumerate(matches):
-        group_title = clean_text(m.group(1).strip())
-        body = clean_text(m.group(2).strip())
-        lines = body.split("\n")
-        current_title = group_title
-        current_lines = []
-        sub_idx = 0
-
-        for line in lines:
-            s = line.strip()
-            if not s:
-                continue
-            letters = re.sub(r"[^a-zA-Z]", "", s)
-            is_header = (letters.isupper() and len(letters) > 10) or (s.endswith(":") and len(s) < 150)
-
-            if is_header and s != group_title:
-                if current_lines:
-                    sec_text = "\n".join(current_lines)
-                    if len(sec_text) >= 80:
-                        sections.append({
-                            "section_id": f"{doc_id}_G{i}_S{sub_idx:03d}",
-                            "title": current_title,
-                            "text": sec_text,
-                            "group": group_title,
-                        })
-                        sub_idx += 1
-                current_title = s
-                current_lines = []
-            else:
-                current_lines.append(s)
-
-        if current_lines:
-            sec_text = "\n".join(current_lines)
-            if len(sec_text) >= 80:
-                sections.append({
-                    "section_id": f"{doc_id}_G{i}_S{sub_idx:03d}",
-                    "title": current_title,
-                    "text": sec_text,
-                    "group": group_title,
-                })
-
-        if not sections and body:
-            sections.append({
-                "section_id": f"{doc_id}_G{i}_S000",
-                "title": group_title,
-                "text": body,
-                "group": group_title,
-            })
-
-    return sections
-
-
-# ---------------------------------------------------------------------------
-# STEP 2B — BUILD TREE INDEX (Claude summarizes each section)
-# ---------------------------------------------------------------------------
-def summarize_section(title: str, text: str) -> str:
-    """Ask Claude to generate a 1-2 sentence summary of a section."""
-    prompt = (
-        f"Summarize the following ECMC bankruptcy guide section in 1-2 sentences. "
-        f"Be specific about what information it contains. Do not use generic phrases.\n\n"
-        f"Title: {title}\n"
-        f"Content: {text[:2000]}\n\n"
-        f"Summary:"
-    )
-    summary = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=150)
-    return summary or f"Section about {title}"
-
-
-def build_tree_index(corpus: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Build hierarchical tree with Claude-generated summaries."""
-    tree = {"root": "ECMC Bankruptcy Corpus", "documents": {}}
-
-    for doc in corpus:
-        doc_id = doc["doc_id"]
-        print(f"[Tree Build] {doc_id}")
-
-        # For DOCX: use GROUP sections; for PDF/TXT: use pages or whole doc
-        if doc["doc_type"] == "docx":
-            sections = split_group_sections(doc["full_text"], doc_id)
-        elif doc["doc_type"] == "pdf":
-            sections = []
-            for p in doc.get("pages", []):
-                sections.append({
-                    "section_id": f"{doc_id}_P{p[\'page_num\']}",
-                    "title": f"Page {p[\'page_num\']}",
-                    "text": p["text"],
-                    "group": doc_id,
-                })
-        else:
-            sections = [{
-                "section_id": f"{doc_id}_S000",
-                "title": doc_id,
-                "text": doc["full_text"],
-                "group": doc_id,
-            }]
-
-        nodes = []
-        for i, sec in enumerate(sections):
-            if i % 5 == 0:
-                print(f"  Summarizing {i+1}/{len(sections)}")
-            summary = summarize_section(sec["title"], sec["text"])
-            nodes.append({
-                "node_id": sec["section_id"],
-                "title": sec["title"],
-                "group": sec.get("group", ""),
-                "summary": summary,
-                "full_text": sec["text"],
-            })
-
-        tree["documents"][doc_id] = nodes
-
-    tree_path = OUTPUT_DIR / "tree_index.json"
-    with open(tree_path, "w", encoding="utf-8") as fh:
-        json.dump(tree, fh, indent=2, ensure_ascii=False, default=str)
-    print(f"\n[Tree Index saved] {tree_path}")
-    return tree
-
-
-# ---------------------------------------------------------------------------
-# STEP 2C — BUILD FLAT TERM INDEX (Nova Lite unsupervised extraction)
-# ---------------------------------------------------------------------------
-def extract_terms_nova(full_text: str, doc_id: str) -> List[Dict[str, Any]]:
-    """Ask Nova Lite to extract domain-specific terms from a document."""
-    prompt = (
-        "You are analyzing an ECMC bankruptcy student loan document. "
-        "Extract all important domain-specific terms that a borrower or agent might ask about. "
-        "Include legal terms, procedures, forms, and loan statuses. "
-        "Return ONLY a JSON array of objects with this exact shape:\n"
-        '[{"term": "Exact Term", "aliases": ["alias1", "alias2"], "category": "legal|procedure|form|status"}]\n\n'
-        "Document text:\n"
-        f"{full_text[:4000]}\n\n"
-        "Terms (JSON only):"
-    )
-    resp = bedrock_chat(NOVA_MODEL_ID, prompt, max_tokens=1024)
-
-    terms = []
-    try:
-        # Clean markdown fences
-        cleaned = re.sub(r"```json\s*|\s*```", "", resp).strip()
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, list):
-            terms = parsed
-        elif isinstance(parsed, dict) and "terms" in parsed:
-            terms = parsed["terms"]
-    except Exception as e:
-        print(f"  [Term Parse Error] {e} — raw: {resp[:200]}")
-
-    return terms
-
-
-def build_term_index(corpus: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Build flat term index: term -> list of occurrences across docs."""
-    term_map: Dict[str, Dict[str, Any]] = {}
-
-    for doc in corpus:
-        doc_id = doc["doc_id"]
-        print(f"[Term Extract] {doc_id}")
-        terms = extract_terms_nova(doc["full_text"], doc_id)
-
-        for t in terms:
-            term_name = t.get("term", "").strip()
-            if not term_name:
-                continue
-
-            if term_name not in term_map:
-                term_map[term_name] = {
-                    "term": term_name,
-                    "aliases": t.get("aliases", []),
-                    "category": t.get("category", "unknown"),
-                    "sources": [],
-                    "occurrence_count": 0,
-                }
-
-            term_map[term_name]["sources"].append({
-                "doc_id": doc_id,
-                "doc_type": doc["doc_type"],
-                "context_snippet": doc["full_text"][:300].replace("\n", " "),
-            })
-            term_map[term_name]["occurrence_count"] += 1
-
-    term_index = {
-        "total_terms": len(term_map),
-        "terms": list(term_map.values()),
-    }
-
-    term_path = OUTPUT_DIR / "term_index.json"
-    with open(term_path, "w", encoding="utf-8") as fh:
-        json.dump(term_index, fh, indent=2, ensure_ascii=False, default=str)
-    print(f"\n[Term Index saved] {term_path} ({len(term_map)} terms)")
-    return term_index
-
-import json
-
-with open("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output/corpus.json", "r") as f:
-    corpus = json.load(f)
-
-print(f"Documents: {len(corpus)}")
-for doc in corpus:
-    print(f"  {doc['doc_id']} ({doc['doc_type']}) — {len(doc['full_text'])} chars")
-
-with open("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output/tree_index.json", "r") as f:
-    tree = json.load(f)
-
-for doc_id, nodes in tree["documents"].items():
-    print(f"\n{doc_id}: {len(nodes)} nodes")
-    for node in nodes[:3]:
-        print(f"  [{node['node_id']}] {node['title'][:50]}...")
-        print(f"      Summary: {node['summary'][:80]}...")
-
-with open("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output/term_index.json", "r") as f:
-    terms = json.load(f)
-
-print(f"Total terms: {terms['total_terms']}")
-for t in terms["terms"][:10]:
-    print(f"  {t['term']} ({t['category']}) — {t['occurrence_count']} docs")
-    print(f"      Aliases: {t['aliases']}")
-
-########
-import json
-import time
-from pathlib import Path
-
-OUTPUT_DIR = Path(r"/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output")
-
-# Load all three indices
-with open(OUTPUT_DIR / "corpus.json", "r", encoding="utf-8") as f:
-    corpus = json.load(f)
-
-with open(OUTPUT_DIR / "tree_index.json", "r", encoding="utf-8") as f:
-    tree = json.load(f)
-
-with open(OUTPUT_DIR / "term_index.json", "r", encoding="utf-8") as f:
-    term_index = json.load(f)
-
-print(f"Loaded: {len(corpus)} docs, {len(tree['documents'])} in tree, {term_index['total_terms']} terms")
-######
-import re
-import boto3
-
-BEDROCK_REGION = "us-east-1"
-CLAUDE_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
-NOVA_MODEL_ID = "us.amazon.nova-lite-v1:0"
-
-bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-
-def bedrock_chat(model_id, prompt, max_tokens=1024):
-    """Call Bedrock Converse API."""
-    try:
-        resp = bedrock.converse(
-            modelId=model_id,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
-        )
-        return resp["output"]["message"]["content"][0]["text"]
-    except Exception as e:
-        print(f"  [Bedrock Error] {e}")
-        return ""
-
-def retrieve_nodes(query, tree, term_index, top_k=3):
-    """
-    Phase 1: Claude reasons over tree (titles + summaries only).
-    Phase 2: Flat term index cross-check for missed references.
-    """
-    # Build compact tree for Claude
-    tree_lines = ["Document Tree:"]
-    for doc_id, nodes in tree["documents"].items():
-        tree_lines.append(f"\nDocument: {doc_id}")
-        for node in nodes:
-            tree_lines.append(f"  [{node['node_id']}] {node['title']}")
-            tree_lines.append(f"      Summary: {node['summary']}")
-    
-    tree_context = "\n".join(tree_lines)
-    
-    # Ask Claude to navigate
-    prompt = f"""You are a document navigation expert for ECMC bankruptcy phone guides.
-Given the document tree below and the user query, identify which nodes (by node_id) are most likely to contain the answer.
-
-{tree_context}
-
-Query: {query}
-
-Return ONLY a JSON object:
-{{"node_ids": ["id1", "id2", ...], "reasoning": "brief explanation"}}
-
-Valid JSON only:"""
-    
-    response = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=500)
-    
-    # Parse JSON
-    selected_ids = []
-    reasoning = ""
-    try:
-        cleaned = re.sub(r'```json\s*|\s*```', '', response).strip()
-        result = json.loads(cleaned)
-        selected_ids = result.get("node_ids", [])
-        reasoning = result.get("reasoning", "")
-    except Exception as e:
-        print(f"  [Parse Error] {e}")
-        reasoning = "parse_error"
-    
-    # Retrieve nodes from tree
-    retrieved = []
-    for doc_id, nodes in tree["documents"].items():
-        for node in nodes:
-            if node["node_id"] in selected_ids:
-                retrieved.append(node)
-    
-    # Phase 2: Flat term index cross-check
-    query_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', query.lower()))
-    extra_nodes = []
-    for term in term_index["terms"]:
-        if any(w in term["term"].lower() for w in query_words):
-            for src in term.get("sources", []):
-                doc_id = src["doc_id"]
-                # Find matching node in tree
-                if doc_id in tree["documents"]:
-                    for node in tree["documents"][doc_id]:
-                        if node["node_id"] not in selected_ids:
-                            extra_nodes.append(node)
-    
-    # Merge and deduplicate
-    seen = {n["node_id"] for n in retrieved}
-    for n in extra_nodes:
-        if n["node_id"] not in seen:
-            retrieved.append(n)
-            seen.add(n["node_id"])
-    
-    return retrieved[:top_k], reasoning
-###
-def answer_question(query, tree, term_index):
-    """Full pipeline: retrieve + synthesize."""
-    t0 = time.time()
-    
-    # Retrieve
-    nodes, reasoning = retrieve_nodes(query, tree, term_index, top_k=3)
-    if not nodes:
-        return {
+        body = json.dumps({
             "query": query,
-            "answer": "No relevant sections found.",
-            "citations": [],
-            "reasoning": reasoning,
-            "latency_seconds": time.time() - t0
-        }
-    
-    # Build context from full text
-    contexts = []
-    citation_map = {}
-    for i, node in enumerate(nodes, 1):
-        citation_map[f"S{i}"] = node["node_id"]
-        text = node["full_text"][:6000]  # cap per node
-        contexts.append(
-            f"[S{i}] {node['node_id']} | {node['title']}\n{text}"
-        )
-    
-    context_block = "\n\n".join(contexts)
-    
-    # Synthesize
-    prompt = f"""You are an ECMC call-center assistant. Answer using ONLY the sources below.
-Cite sources inline as [S1], [S2], etc. Be concise. If the answer is not in the sources, say so.
+            "documents": documents,
+            "top_n": 3
+        })
+        resp = bedrock.invoke_model(modelId=COHERE_RERANK_ID, body=body)
+        result = json.loads(resp["body"].read())
 
-Sources:
-{context_block}
+        reranked = result.get("results", [])
 
-Question: {query}
+        print_result("Model ID", COHERE_RERANK_ID)
+        print_result("Query", query)
+        print_result("Documents passed", len(documents))
+        print_result("Top-N returned", len(reranked))
+        print("  Top reranked results:")
+        for r in reranked:
+            idx = r.get("index", "?")
+            score = r.get("relevance_score", 0)
+            print(f"    [{idx}] score={score:.4f} — {documents[idx][:60]}...")
 
-Answer:"""
-    
-    answer = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=1024)
-    latency = time.time() - t0
-    
-    return {
-        "query": query,
-        "answer": answer,
-        "citations": list(citation_map.values()),
-        "reasoning": reasoning,
-        "latency_seconds": latency
+        print("  Cohere Rerank — WORKING")
+        return True
+
+    except Exception as e:
+        print(f" Cohere Rerank — FAILED: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# SUMMARY
+# ---------------------------------------------------------------------------
+def print_summary(results: Dict[str, bool]):
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    for name, ok in results.items():
+        status = "PASS" if ok else "FAIL"
+        print(f"  {name:<30} {status}")
+
+    all_ok = all(results.values())
+    if all_ok:
+        print("\n All models are accessible and working!")
+    else:
+        print("\n  Some models failed. Check:")
+        print("   1. Model access enabled in Bedrock console")
+        print("   2. Correct region and model IDs")
+        print("   3. IAM permissions for bedrock:InvokeModel")
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("Bedrock Model Access Tester")
+    print("Region:", REGION)
+
+    results = {
+        "Titan Embeddings": test_titan_embeddings(),
+        "Cohere Embeddings": test_cohere_embeddings(),
+        "Cohere Rerank": test_cohere_rerank(),
     }
-###
-questions = [
-    "What are my options to restore federal student aid eligibility?",
-    "What is loan consolidation and how does it work?",
-    "How do I start a rehabilitation process?",
-    "Can I make voluntary payments during Chapter 13 bankruptcy?",
-    "What is the automatic stay and does it stop interest from accruing?"
-]
 
-results = []
-for q in questions:
-    print(f"\n[Q] {q}")
-    result = answer_question(q, tree, term_index)
-    print(f"[Latency] {result['latency_seconds']:.3f}s")
-    print(f"[Reasoning] {result['reasoning'][:100]}...")
-    print(f"[Citations] {result['citations']}")
-    print(f"[Answer] {result['answer'][:200]}...")
-    results.append(result)
-
-# Save to CSV
-import pandas as pd
-df = pd.DataFrame(results)
-df.to_csv(OUTPUT_DIR / "query_results.csv", index=False)
-print(f"\n[Results saved] {OUTPUT_DIR / 'query_results.csv'}")
-print(f"Average latency: {df['latency_seconds'].mean():.3f}s")
+    print_summary(results)
