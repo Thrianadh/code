@@ -1255,3 +1255,214 @@ def build_term_index(corpus: List[Dict[str, Any]]) -> Dict[str, Any]:
     print(f"\n[Term Index saved] {term_path} ({len(term_map)} terms)")
     return term_index
 
+import json
+
+with open("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output/corpus.json", "r") as f:
+    corpus = json.load(f)
+
+print(f"Documents: {len(corpus)}")
+for doc in corpus:
+    print(f"  {doc['doc_id']} ({doc['doc_type']}) — {len(doc['full_text'])} chars")
+
+with open("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output/tree_index.json", "r") as f:
+    tree = json.load(f)
+
+for doc_id, nodes in tree["documents"].items():
+    print(f"\n{doc_id}: {len(nodes)} nodes")
+    for node in nodes[:3]:
+        print(f"  [{node['node_id']}] {node['title'][:50]}...")
+        print(f"      Summary: {node['summary'][:80]}...")
+
+with open("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output/term_index.json", "r") as f:
+    terms = json.load(f)
+
+print(f"Total terms: {terms['total_terms']}")
+for t in terms["terms"][:10]:
+    print(f"  {t['term']} ({t['category']}) — {t['occurrence_count']} docs")
+    print(f"      Aliases: {t['aliases']}")
+
+########
+import json
+import time
+from pathlib import Path
+
+OUTPUT_DIR = Path(r"/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/output")
+
+# Load all three indices
+with open(OUTPUT_DIR / "corpus.json", "r", encoding="utf-8") as f:
+    corpus = json.load(f)
+
+with open(OUTPUT_DIR / "tree_index.json", "r", encoding="utf-8") as f:
+    tree = json.load(f)
+
+with open(OUTPUT_DIR / "term_index.json", "r", encoding="utf-8") as f:
+    term_index = json.load(f)
+
+print(f"Loaded: {len(corpus)} docs, {len(tree['documents'])} in tree, {term_index['total_terms']} terms")
+######
+import re
+import boto3
+
+BEDROCK_REGION = "us-east-1"
+CLAUDE_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+NOVA_MODEL_ID = "us.amazon.nova-lite-v1:0"
+
+bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+
+def bedrock_chat(model_id, prompt, max_tokens=1024):
+    """Call Bedrock Converse API."""
+    try:
+        resp = bedrock.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as e:
+        print(f"  [Bedrock Error] {e}")
+        return ""
+
+def retrieve_nodes(query, tree, term_index, top_k=3):
+    """
+    Phase 1: Claude reasons over tree (titles + summaries only).
+    Phase 2: Flat term index cross-check for missed references.
+    """
+    # Build compact tree for Claude
+    tree_lines = ["Document Tree:"]
+    for doc_id, nodes in tree["documents"].items():
+        tree_lines.append(f"\nDocument: {doc_id}")
+        for node in nodes:
+            tree_lines.append(f"  [{node['node_id']}] {node['title']}")
+            tree_lines.append(f"      Summary: {node['summary']}")
+    
+    tree_context = "\n".join(tree_lines)
+    
+    # Ask Claude to navigate
+    prompt = f"""You are a document navigation expert for ECMC bankruptcy phone guides.
+Given the document tree below and the user query, identify which nodes (by node_id) are most likely to contain the answer.
+
+{tree_context}
+
+Query: {query}
+
+Return ONLY a JSON object:
+{{"node_ids": ["id1", "id2", ...], "reasoning": "brief explanation"}}
+
+Valid JSON only:"""
+    
+    response = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=500)
+    
+    # Parse JSON
+    selected_ids = []
+    reasoning = ""
+    try:
+        cleaned = re.sub(r'```json\s*|\s*```', '', response).strip()
+        result = json.loads(cleaned)
+        selected_ids = result.get("node_ids", [])
+        reasoning = result.get("reasoning", "")
+    except Exception as e:
+        print(f"  [Parse Error] {e}")
+        reasoning = "parse_error"
+    
+    # Retrieve nodes from tree
+    retrieved = []
+    for doc_id, nodes in tree["documents"].items():
+        for node in nodes:
+            if node["node_id"] in selected_ids:
+                retrieved.append(node)
+    
+    # Phase 2: Flat term index cross-check
+    query_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', query.lower()))
+    extra_nodes = []
+    for term in term_index["terms"]:
+        if any(w in term["term"].lower() for w in query_words):
+            for src in term.get("sources", []):
+                doc_id = src["doc_id"]
+                # Find matching node in tree
+                if doc_id in tree["documents"]:
+                    for node in tree["documents"][doc_id]:
+                        if node["node_id"] not in selected_ids:
+                            extra_nodes.append(node)
+    
+    # Merge and deduplicate
+    seen = {n["node_id"] for n in retrieved}
+    for n in extra_nodes:
+        if n["node_id"] not in seen:
+            retrieved.append(n)
+            seen.add(n["node_id"])
+    
+    return retrieved[:top_k], reasoning
+###
+def answer_question(query, tree, term_index):
+    """Full pipeline: retrieve + synthesize."""
+    t0 = time.time()
+    
+    # Retrieve
+    nodes, reasoning = retrieve_nodes(query, tree, term_index, top_k=3)
+    if not nodes:
+        return {
+            "query": query,
+            "answer": "No relevant sections found.",
+            "citations": [],
+            "reasoning": reasoning,
+            "latency_seconds": time.time() - t0
+        }
+    
+    # Build context from full text
+    contexts = []
+    citation_map = {}
+    for i, node in enumerate(nodes, 1):
+        citation_map[f"S{i}"] = node["node_id"]
+        text = node["full_text"][:6000]  # cap per node
+        contexts.append(
+            f"[S{i}] {node['node_id']} | {node['title']}\n{text}"
+        )
+    
+    context_block = "\n\n".join(contexts)
+    
+    # Synthesize
+    prompt = f"""You are an ECMC call-center assistant. Answer using ONLY the sources below.
+Cite sources inline as [S1], [S2], etc. Be concise. If the answer is not in the sources, say so.
+
+Sources:
+{context_block}
+
+Question: {query}
+
+Answer:"""
+    
+    answer = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=1024)
+    latency = time.time() - t0
+    
+    return {
+        "query": query,
+        "answer": answer,
+        "citations": list(citation_map.values()),
+        "reasoning": reasoning,
+        "latency_seconds": latency
+    }
+###
+questions = [
+    "What are my options to restore federal student aid eligibility?",
+    "What is loan consolidation and how does it work?",
+    "How do I start a rehabilitation process?",
+    "Can I make voluntary payments during Chapter 13 bankruptcy?",
+    "What is the automatic stay and does it stop interest from accruing?"
+]
+
+results = []
+for q in questions:
+    print(f"\n[Q] {q}")
+    result = answer_question(q, tree, term_index)
+    print(f"[Latency] {result['latency_seconds']:.3f}s")
+    print(f"[Reasoning] {result['reasoning'][:100]}...")
+    print(f"[Citations] {result['citations']}")
+    print(f"[Answer] {result['answer'][:200]}...")
+    results.append(result)
+
+# Save to CSV
+import pandas as pd
+df = pd.DataFrame(results)
+df.to_csv(OUTPUT_DIR / "query_results.csv", index=False)
+print(f"\n[Results saved] {OUTPUT_DIR / 'query_results.csv'}")
+print(f"Average latency: {df['latency_seconds'].mean():.3f}s")
