@@ -1,212 +1,875 @@
-from Scrape_data_v4 import UnifiedScraperPipeline
-pipeline = UnifiedScraperPipeline()
-for start_url in url_data:
-    # print(start_url)
-    results = pipeline.run(url=start_url,section_prefixes=["forms/",
-                                                           "/borrowers/understand-bankruptcy",
-                                                           # "/borrowers",
-                                                           "frequently-asked-questions/",
-                                                           
-                                                          ],
-        max_depth=4, max_pages=200, web_delay=0.5, scrape_pdfs=True, verbose=False, exclude_languages=["spanish"],bedrock_ocr_fallback=True, )
-    if results.get("pdf_results"):
-        from collections import Counter as _C
-        outcomes = _C(r.get("status", "unknown") for r in results["pdf_results"])
-        methods = _C(r.get("extraction_method") for r in results["pdf_results"]
-                     if r.get("extraction_method"))
-        print("\nPDF outcome breakdown:")
-        for status, count in outcomes.most_common():
-            print(f"  {status}: {count}")
-        print("Extraction methods used:")
-        for method, count in methods.most_common():
-            print(f"  {method}: {count}")
+"""Textract ingestion pipeline: Layout + Tables extraction, figure captioning
+via Bedrock vision, and timestamped output storage with a job tracking map.
 
-    print(f"\nAll outputs saved to: {results['s3_full_path']}")
-#######
+Flow per document:
+    start_analysis        -> submit to Textract (LAYOUT + TABLES), get job_id
+    wait_for_job           -> poll until SUCCEEDED/FAILED, paginate all Blocks
+    tables_to_markdown     -> TABLE/CELL blocks -> list of markdown tables
+    caption_figures        -> LAYOUT_FIGURE blocks -> crop page, ask Claude
+                               vision what's in each figure
+    save_output            -> write {source}_{timestamp}.json to S3, update
+                               the job tracking map
+
+process_document() runs the full flow for one S3 PDF and returns a summary.
+process_batch() runs it across every PDF under an S3 prefix.
+"""
+import hashlib
 import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import boto3
-import numpy as np
-from typing import List, Dict, Any
+import fitz
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-REGION = "us-east-1"
+log = logging.getLogger(__name__)
 
-# Model IDs (common Bedrock IDs — adjust if your region uses different ones)
-TITAN_EMBED_ID = "us.amazon.titan-embed-text-v2:0"
-COHERE_EMBED_ID = "us.cohere.embed-english-v3"
-COHERE_RERANK_ID = "us.cohere.rerank-v3-5:0"
-
-bedrock = boto3.client("bedrock-runtime", region_name=REGION)
-
-
-def print_banner(title: str):
-    print("\n" + "=" * 60)
-    print(title)
-    print("=" * 60)
+POLL_SECONDS = 5
+MAX_POLL_SECONDS = 1800
+FIGURE_RENDER_DPI = 200
+BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+JOB_MAP_KEY = "textract-jobs/job_map.json"
 
 
-def print_result(label: str, value: Any, truncate: bool = True):
-    text = str(value)
-    if truncate and len(text) > 300:
-        text = text[:300] + f"... ({len(str(value))} chars total)"
-    print(f"  {label:<25} {text}")
+class TextractTransientError(Exception):
+    """Retryable Textract failure (throttling, transient service errors)."""
 
 
-def test_titan_embeddings() -> bool:
-    print_banner("TEST 1: Amazon Titan Embeddings")
-
-    sample_text = "How do I apply for a Title IV eligibility letter during bankruptcy?"
-
-    try:
-        body = json.dumps({"inputText": sample_text})
-        resp = bedrock.invoke_model(modelId=TITAN_EMBED_ID, body=body)
-        result = json.loads(resp["body"].read())
-
-        embedding = result.get("embedding", [])
-        dim = len(embedding)
-
-        print_result("Model ID", TITAN_EMBED_ID)
-        print_result("Input text", sample_text)
-        print_result("Embedding dimension", dim)
-        print_result("First 5 values", [round(x, 6) for x in embedding[:5]])
-        print_result("Norm (L2)", round(np.linalg.norm(embedding), 4))
-        print("  Titan Embeddings — WORKING")
-        return True
-
-    except Exception as e:
-        print(f" Titan Embeddings — FAILED: {e}")
-        return False
+def _is_transient(exc: BaseException) -> bool:
+    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+    return code in (
+        "ProvisionedThroughputExceededException",
+        "ThrottlingException",
+        "InternalServerError",
+        "LimitExceededException",
+    )
 
 
-
-def test_cohere_embeddings() -> bool:
-    print_banner("TEST 2: Cohere Embeddings")
-
-    sample_texts = [
-        "What is the automatic stay in bankruptcy?",
-        "How do I consolidate my defaulted student loans?"
-    ]
-
-    try:
-        body = json.dumps({
-            "texts": sample_texts,
-            "input_type": "search_document"
-        })
-        resp = bedrock.invoke_model(modelId=COHERE_EMBED_ID, body=body)
-        result = json.loads(resp["body"].read())
-
-        embeddings = result.get("embeddings", [])
-
-        print_result("Model ID", COHERE_EMBED_ID)
-        print_result("Input count", len(sample_texts))
-        print_result("Output embeddings", len(embeddings))
-        if embeddings:
-            print_result("Embedding dimension", len(embeddings[0]))
-            print_result("First 5 values (doc 1)", [round(x, 6) for x in embeddings[0][:5]])
-        print("  Cohere Embeddings — WORKING")
-        return True
-
-    except Exception as e:
-        print(f" Cohere Embeddings — FAILED: {e}")
-        return False
-
-
-def test_cohere_rerank() -> bool:
-    print_banner("TEST 3: Cohere Rerank")
-
-    query = "Can I make payments during Chapter 13 bankruptcy?"
-    documents = [
-        "Borrowers are not required to make monthly payments during bankruptcy unless the plan provides for direct pay.",
-        "To be eligible for federal financial aid, one must submit a T4 letter from their student loan servicer.",
-        "Loan rehabilitation requires nine consecutive monthly payments to remove default status.",
-        "If the Chapter 13 plan states for borrower to pay direct, it won't be considered voluntary payments anymore."
-    ]
-
-    try:
-        body = json.dumps({
-            "query": query,
-            "documents": documents,
-            "top_n": 3
-        })
-        resp = bedrock.invoke_model(modelId=COHERE_RERANK_ID, body=body)
-        result = json.loads(resp["body"].read())
-
-        reranked = result.get("results", [])
-
-        print_result("Model ID", COHERE_RERANK_ID)
-        print_result("Query", query)
-        print_result("Documents passed", len(documents))
-        print_result("Top-N returned", len(reranked))
-        print("  Top reranked results:")
-        for r in reranked:
-            idx = r.get("index", "?")
-            score = r.get("relevance_score", 0)
-            print(f"    [{idx}] score={score:.4f} — {documents[idx][:60]}...")
-
-        print("  Cohere Rerank — WORKING")
-        return True
-
-    except Exception as e:
-        print(f" Cohere Rerank — FAILED: {e}")
-        return False
+@dataclass
+class DocumentResult:
+    source_bucket: str
+    source_key: str
+    job_id: str
+    status: str
+    output_key: Optional[str] = None
+    tables: List[Dict[str, Any]] = field(default_factory=list)
+    figures: List[Dict[str, Any]] = field(default_factory=list)
+    line_count: int = 0
+    error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
-# SUMMARY
+# Textract job lifecycle
 # ---------------------------------------------------------------------------
-def print_summary(results: Dict[str, bool]):
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    for name, ok in results.items():
-        status = "PASS" if ok else "FAIL"
-        print(f"  {name:<30} {status}")
-
-    all_ok = all(results.values())
-    if all_ok:
-        print("\n All models are accessible and working!")
-    else:
-        print("\n  Some models failed. Check:")
-        print("   1. Model access enabled in Bedrock console")
-        print("   2. Correct region and model IDs")
-        print("   3. IAM permissions for bedrock:InvokeModel")
+def _request_token(bucket: str, key: str) -> str:
+    # Deterministic per (bucket, key) so re-running a batch doesn't start
+    # duplicate (billable) jobs for files already submitted.
+    digest = hashlib.sha256(f"{bucket}/{key}".encode()).hexdigest()
+    return digest[:64]
 
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    print("Bedrock Model Access Tester")
-    print("Region:", REGION)
-
-    results = {
-        "Titan Embeddings": test_titan_embeddings(),
-        "Cohere Embeddings": test_cohere_embeddings(),
-        "Cohere Rerank": test_cohere_rerank(),
-    }
-
-    print_summary(results)
-#########
-import json
-import boto3
-
-bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
-NOVA_MODEL_ID = "us.amazon.nova-lite-v1:0"
-
-def ask_nova(prompt: str, max_tokens: int = 1024, temperature: float = 0.0) -> str:
-    """Call Amazon Nova Lite via Bedrock Converse API."""
+@retry(
+    retry=retry_if_exception_type(TextractTransientError),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
+    stop=stop_after_attempt(5),
+    reraise=True,
+)
+def start_analysis(textract, bucket: str, key: str) -> str:
     try:
-        resp = bedrock.converse(
-            modelId=NOVA_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature}
+        resp = textract.start_document_analysis(
+            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
+            FeatureTypes=["LAYOUT", "TABLES"],
+            ClientRequestToken=_request_token(bucket, key),
         )
-        return resp["output"]["message"]["content"][0]["text"]
-    except Exception as e:
-        print(f"[Nova Error] {e}")
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TextractTransientError(str(exc)) from exc
+        raise
+    return resp["JobId"]
+
+
+def wait_for_job(textract, job_id: str) -> Dict[str, Any]:
+    started = time.time()
+    while True:
+        resp = textract.get_document_analysis(JobId=job_id)
+        status = resp["JobStatus"]
+        if status in ("SUCCEEDED", "FAILED"):
+            break
+        if time.time() - started > MAX_POLL_SECONDS:
+            return {"JobStatus": "TIMEOUT", "Blocks": [], "StatusMessage": "Polling timed out"}
+        time.sleep(POLL_SECONDS)
+
+    if status != "SUCCEEDED":
+        return resp
+
+    blocks = list(resp.get("Blocks", []))
+    next_token = resp.get("NextToken")
+    while next_token:
+        page = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
+        blocks.extend(page.get("Blocks", []))
+        next_token = page.get("NextToken")
+
+    resp["Blocks"] = blocks
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Table reconstruction — TABLE/CELL blocks -> markdown grid
+# ---------------------------------------------------------------------------
+def tables_to_markdown(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_id = {b["Id"]: b for b in blocks}
+    tables_out: List[Dict[str, Any]] = []
+
+    for block in blocks:
+        if block["BlockType"] != "TABLE":
+            continue
+
+        cell_ids = [
+            cid
+            for rel in block.get("Relationships", [])
+            if rel["Type"] == "CHILD"
+            for cid in rel["Ids"]
+        ]
+        cells = [by_id[cid] for cid in cell_ids if by_id.get(cid, {}).get("BlockType") == "CELL"]
+        if not cells:
+            continue
+
+        max_row = max(c["RowIndex"] for c in cells)
+        max_col = max(c["ColumnIndex"] for c in cells)
+        grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+
+        for cell in cells:
+            text = _cell_text(cell, by_id)
+            r, c = cell["RowIndex"] - 1, cell["ColumnIndex"] - 1
+            grid[r][c] = text
+
+        tables_out.append({
+            "table_id": block["Id"],
+            "page": block.get("Page", 1),
+            "rows": max_row,
+            "cols": max_col,
+            "markdown": _grid_to_markdown(grid),
+        })
+
+    return tables_out
+
+
+def _cell_text(cell: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
+    word_ids = [
+        wid
+        for rel in cell.get("Relationships", [])
+        if rel["Type"] == "CHILD"
+        for wid in rel["Ids"]
+    ]
+    words = []
+    for wid in word_ids:
+        child = by_id.get(wid)
+        if not child:
+            continue
+        if child["BlockType"] == "WORD":
+            words.append(child.get("Text", ""))
+        elif child["BlockType"] == "SELECTION_ELEMENT":
+            words.append("[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(words).strip()
+
+
+def _grid_to_markdown(grid: List[List[str]]) -> str:
+    if not grid:
         return ""
+    lines = ["| " + " | ".join(grid[0]) + " |"]
+    lines.append("|" + "|".join(["---"] * len(grid[0])) + "|")
+    for row in grid[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
 
 
-# Example usage
-if __name__ == "__main__":
-    answer = ask_nova("What is the automatic stay in bankruptcy?")
-    print(answer)
+# ---------------------------------------------------------------------------
+# Figures — crop from the source PDF page, caption via Claude vision
+# ---------------------------------------------------------------------------
+def find_figures(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    figures = []
+    for block in blocks:
+        if block["BlockType"] == "LAYOUT_FIGURE":
+            box = block["Geometry"]["BoundingBox"]
+            figures.append({
+                "figure_id": block["Id"],
+                "page": block.get("Page", 1),
+                "bbox": box,
+            })
+    return figures
+
+
+def crop_figure(pdf_bytes: bytes, page_no: int, bbox: Dict[str, float]) -> bytes:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page = doc[page_no - 1]
+        # bbox values are fractions of page size (Textract convention).
+        # fitz clip rects are in PDF point space (page.rect), NOT the pixel
+        # space of a rendered pixmap — scaling to pixels happens via dpi=.
+        page_w, page_h = page.rect.width, page.rect.height
+
+        x0 = bbox["Left"] * page_w
+        y0 = bbox["Top"] * page_h
+        x1 = x0 + bbox["Width"] * page_w
+        y1 = y0 + bbox["Height"] * page_h
+
+        clip = fitz.Rect(x0, y0, x1, y1)
+        crop_pix = page.get_pixmap(dpi=FIGURE_RENDER_DPI, clip=clip)
+        return crop_pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+@retry(
+    retry=retry_if_exception_type(TextractTransientError),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    stop=stop_after_attempt(4),
+    reraise=True,
+)
+def describe_figure(bedrock_runtime, image_bytes: bytes) -> str:
+    prompt = (
+        "Describe what this image shows. If it is a flowchart or decision "
+        "tree, transcribe the full decision logic step by step (conditions, "
+        "branches, outcomes). If it is a screenshot of an application, "
+        "describe the visible fields and any text. If it is a plain "
+        "photo or icon with no informational content, say so briefly."
+    )
+    try:
+        resp = bedrock_runtime.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"image": {"format": "png", "source": {"bytes": image_bytes}}},
+                    {"text": prompt},
+                ],
+            }],
+            inferenceConfig={"maxTokens": 600, "temperature": 0.0},
+        )
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TextractTransientError(str(exc)) from exc
+        raise
+    blocks = resp["output"]["message"]["content"]
+    return "".join(b.get("text", "") for b in blocks).strip()
+
+
+def caption_figures(
+    bedrock_runtime, pdf_bytes: bytes, figures: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    captioned = []
+    for fig in figures:
+        try:
+            crop_bytes = crop_figure(pdf_bytes, fig["page"], fig["bbox"])
+            caption = describe_figure(bedrock_runtime, crop_bytes)
+            captioned.append({**fig, "caption": caption})
+        except Exception as exc:  # noqa: BLE001 — one bad figure shouldn't kill the batch
+            log.warning("figure caption failed (page %s, id %s): %s",
+                       fig["page"], fig["figure_id"], exc)
+            captioned.append({**fig, "caption": None, "error": str(exc)})
+    return captioned
+
+
+# ---------------------------------------------------------------------------
+# Output naming + job tracking
+# ---------------------------------------------------------------------------
+def output_key_for(source_key: str, output_prefix: str) -> str:
+    stem = Path(source_key).stem
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)
+    return f"{output_prefix.rstrip('/')}/{safe_stem}_{timestamp}.json"
+
+
+def load_job_map(s3, bucket: str, key: str = JOB_MAP_KEY) -> Dict[str, Any]:
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return {}
+    except s3.exceptions.ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return {}
+        raise
+
+
+def save_job_map(s3, bucket: str, job_map: Dict[str, Any], key: str = JOB_MAP_KEY) -> None:
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(job_map, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+def process_document(
+    source_bucket: str,
+    source_key: str,
+    output_bucket: str,
+    output_prefix: str,
+    region: str = "us-east-1",
+) -> DocumentResult:
+    textract = boto3.client("textract", region_name=region)
+    bedrock_runtime = boto3.client("bedrock-runtime", region_name=region)
+    s3 = boto3.client("s3", region_name=region)
+
+    job_map = load_job_map(s3, output_bucket)
+    request_token = _request_token(source_bucket, source_key)
+
+    job_id = start_analysis(textract, source_bucket, source_key)
+    log.info("started job %s for %s", job_id, source_key)
+
+    result_raw = wait_for_job(textract, job_id)
+    status = result_raw["JobStatus"]
+
+    if status != "SUCCEEDED":
+        error = result_raw.get("StatusMessage", f"job ended with status {status}")
+        job_map[request_token] = {
+            "source_key": source_key, "job_id": job_id, "status": status,
+            "error": error, "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_job_map(s3, output_bucket, job_map)
+        return DocumentResult(source_bucket, source_key, job_id, status, error=error)
+
+    blocks = result_raw["Blocks"]
+    line_count = sum(1 for b in blocks if b["BlockType"] == "LINE")
+    tables = tables_to_markdown(blocks)
+    figures = find_figures(blocks)
+
+    if figures:
+        pdf_obj = s3.get_object(Bucket=source_bucket, Key=source_key)
+        pdf_bytes = pdf_obj["Body"].read()
+        figures = caption_figures(bedrock_runtime, pdf_bytes, figures)
+
+    output_key = output_key_for(source_key, output_prefix)
+    output_body = {
+        "source_bucket": source_bucket,
+        "source_key": source_key,
+        "job_id": job_id,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "line_count": line_count,
+        "tables": tables,
+        "figures": figures,
+        "raw_block_count": len(blocks),
+    }
+    s3.put_object(
+        Bucket=output_bucket, Key=output_key,
+        Body=json.dumps(output_body, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+
+    job_map[request_token] = {
+        "source_key": source_key, "job_id": job_id, "status": "SUCCEEDED",
+        "output_key": output_key, "table_count": len(tables), "figure_count": len(figures),
+        "processed_at": output_body["processed_at"],
+    }
+    save_job_map(s3, output_bucket, job_map)
+
+    log.info("done: %s -> %s (%d tables, %d figures)",
+             source_key, output_key, len(tables), len(figures))
+
+    return DocumentResult(
+        source_bucket, source_key, job_id, "SUCCEEDED",
+        output_key=output_key, tables=tables, figures=figures, line_count=line_count,
+    )
+
+
+def process_batch(
+    source_bucket: str,
+    source_prefix: str,
+    output_bucket: str,
+    output_prefix: str,
+    region: str = "us-east-1",
+    skip_existing: bool = True,
+) -> List[DocumentResult]:
+    s3 = boto3.client("s3", region_name=region)
+    job_map = load_job_map(s3, output_bucket) if skip_existing else {}
+
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = [
+        obj["Key"]
+        for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix)
+        for obj in page.get("Contents", [])
+        if obj["Key"].lower().endswith(".pdf")
+    ]
+
+    results = []
+    for key in keys:
+        token = _request_token(source_bucket, key)
+        if skip_existing and job_map.get(token, {}).get("status") == "SUCCEEDED":
+            log.info("skip (already processed): %s", key)
+            continue
+        try:
+            results.append(process_document(source_bucket, key, output_bucket, output_prefix, region))
+        except Exception as exc:  # noqa: BLE001 — one bad file shouldn't kill the batch
+            log.exception("failed: %s", key)
+            results.append(DocumentResult(source_bucket, key, "", "ERROR", error=str(exc)))
+
+    return results
+#
+import logging
+logging.basicConfig(level=logging.INFO)
+
+from textract_pipeline import process_document
+
+result = process_document(
+    source_bucket="bankrupcy-data-bkt",
+    source_key="Ecmc_scrape_understand_bankruptcy/research_and_development/Phone Guide.pdf",
+    output_bucket="bankrupcy-data-bkt",
+    output_prefix="textract-output",
+    region="us-east-1",
+)
+
+print(result.status)
+print(result.output_key)
+print(f"{len(result.tables)} tables, {len(result.figures)} figures, {result.line_count} lines")
+
+#
+import boto3, json
+
+s3 = boto3.client("s3", region_name="us-east-1")
+obj = s3.get_object(Bucket="bankrupcy-data-bkt", Key=result.output_key)
+output = json.loads(obj["Body"].read())
+
+print(json.dumps(output["tables"], indent=2)[:1000])
+print(json.dumps(output["figures"], indent=2)[:1000])
+#
+from textract_pipeline import load_job_map
+s3 = boto3.client("s3", region_name="us-east-1")
+job_map = load_job_map(s3, "bankrupcy-data-bkt")
+print(json.dumps(job_map, indent=2))
+#
+from textract_pipeline import process_batch
+
+results = process_batch(
+    source_bucket="bankrupcy-data-bkt",
+    source_prefix="Ecmc_scrape_understand_bankruptcy/research_and_development/small_test_batch/",
+    output_bucket="bankrupcy-data-bkt",
+    output_prefix="textract-output",
+    region="us-east-1",
+)
+
+for r in results:
+    print(r.source_key, r.status, r.output_key or r.error)
+
+##############
+
+######################
+"""Textract ingestion pipeline: Layout + Tables extraction, figure captioning
+via Bedrock vision, and timestamped output storage with a job tracking map.
+
+Flow per document:
+    start_analysis        -> submit to Textract (LAYOUT + TABLES), get job_id
+    wait_for_job           -> poll until SUCCEEDED/FAILED, paginate all Blocks
+    tables_to_markdown     -> TABLE/CELL blocks -> list of markdown tables
+    caption_figures        -> LAYOUT_FIGURE blocks -> crop page, ask Claude
+                               vision what's in each figure
+    save_output            -> write {source}_{timestamp}.json to S3, update
+                               the job tracking map
+
+process_document() runs the full flow for one S3 PDF and returns a summary.
+process_batch() runs it across every PDF under an S3 prefix.
+"""
+import hashlib
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import boto3
+import fitz
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+log = logging.getLogger(__name__)
+
+POLL_SECONDS = 5
+MAX_POLL_SECONDS = 1800
+FIGURE_RENDER_DPI = 200
+BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+JOB_MAP_KEY = "textract-jobs/job_map.json"
+
+
+class TextractTransientError(Exception):
+    """Retryable Textract failure (throttling, transient service errors)."""
+
+
+def _is_transient(exc: BaseException) -> bool:
+    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+    return code in (
+        "ProvisionedThroughputExceededException",
+        "ThrottlingException",
+        "InternalServerError",
+        "LimitExceededException",
+    )
+
+
+@dataclass
+class DocumentResult:
+    source_bucket: str
+    source_key: str
+    job_id: str
+    status: str
+    output_key: Optional[str] = None
+    tables: List[Dict[str, Any]] = field(default_factory=list)
+    figures: List[Dict[str, Any]] = field(default_factory=list)
+    line_count: int = 0
+    error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Textract job lifecycle
+# ---------------------------------------------------------------------------
+def _request_token(bucket: str, key: str) -> str:
+    # Deterministic per (bucket, key) so re-running a batch doesn't start
+    # duplicate (billable) jobs for files already submitted.
+    digest = hashlib.sha256(f"{bucket}/{key}".encode()).hexdigest()
+    return digest[:64]
+
+
+@retry(
+    retry=retry_if_exception_type(TextractTransientError),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
+    stop=stop_after_attempt(5),
+    reraise=True,
+)
+def start_analysis(textract, bucket: str, key: str) -> str:
+    try:
+        resp = textract.start_document_analysis(
+            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
+            FeatureTypes=["LAYOUT", "TABLES"],
+            ClientRequestToken=_request_token(bucket, key),
+        )
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TextractTransientError(str(exc)) from exc
+        raise
+    return resp["JobId"]
+
+
+def wait_for_job(textract, job_id: str) -> Dict[str, Any]:
+    started = time.time()
+    while True:
+        resp = textract.get_document_analysis(JobId=job_id)
+        status = resp["JobStatus"]
+        if status in ("SUCCEEDED", "FAILED"):
+            break
+        if time.time() - started > MAX_POLL_SECONDS:
+            return {"JobStatus": "TIMEOUT", "Blocks": [], "StatusMessage": "Polling timed out"}
+        time.sleep(POLL_SECONDS)
+
+    if status != "SUCCEEDED":
+        return resp
+
+    blocks = list(resp.get("Blocks", []))
+    next_token = resp.get("NextToken")
+    while next_token:
+        page = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
+        blocks.extend(page.get("Blocks", []))
+        next_token = page.get("NextToken")
+
+    resp["Blocks"] = blocks
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Table reconstruction — TABLE/CELL blocks -> markdown grid
+# ---------------------------------------------------------------------------
+def tables_to_markdown(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_id = {b["Id"]: b for b in blocks}
+    tables_out: List[Dict[str, Any]] = []
+
+    for block in blocks:
+        if block["BlockType"] != "TABLE":
+            continue
+
+        cell_ids = [
+            cid
+            for rel in block.get("Relationships", [])
+            if rel["Type"] == "CHILD"
+            for cid in rel["Ids"]
+        ]
+        cells = [by_id[cid] for cid in cell_ids if by_id.get(cid, {}).get("BlockType") == "CELL"]
+        if not cells:
+            continue
+
+        max_row = max(c["RowIndex"] for c in cells)
+        max_col = max(c["ColumnIndex"] for c in cells)
+        grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+
+        for cell in cells:
+            text = _cell_text(cell, by_id)
+            r, c = cell["RowIndex"] - 1, cell["ColumnIndex"] - 1
+            grid[r][c] = text
+
+        tables_out.append({
+            "table_id": block["Id"],
+            "page": block.get("Page", 1),
+            "rows": max_row,
+            "cols": max_col,
+            "markdown": _grid_to_markdown(grid),
+        })
+
+    return tables_out
+
+
+def _cell_text(cell: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
+    word_ids = [
+        wid
+        for rel in cell.get("Relationships", [])
+        if rel["Type"] == "CHILD"
+        for wid in rel["Ids"]
+    ]
+    words = []
+    for wid in word_ids:
+        child = by_id.get(wid)
+        if not child:
+            continue
+        if child["BlockType"] == "WORD":
+            words.append(child.get("Text", ""))
+        elif child["BlockType"] == "SELECTION_ELEMENT":
+            words.append("[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(words).strip()
+
+
+def _grid_to_markdown(grid: List[List[str]]) -> str:
+    if not grid:
+        return ""
+    lines = ["| " + " | ".join(grid[0]) + " |"]
+    lines.append("|" + "|".join(["---"] * len(grid[0])) + "|")
+    for row in grid[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Figures — crop from the source PDF page, caption via Claude vision
+# ---------------------------------------------------------------------------
+def find_figures(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    figures = []
+    for block in blocks:
+        if block["BlockType"] == "LAYOUT_FIGURE":
+            box = block["Geometry"]["BoundingBox"]
+            figures.append({
+                "figure_id": block["Id"],
+                "page": block.get("Page", 1),
+                "bbox": box,
+            })
+    return figures
+
+
+def crop_figure(pdf_bytes: bytes, page_no: int, bbox: Dict[str, float]) -> bytes:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page = doc[page_no - 1]
+        # bbox values are fractions of page size (Textract convention).
+        # fitz clip rects are in PDF point space (page.rect), NOT the pixel
+        # space of a rendered pixmap — scaling to pixels happens via dpi=.
+        page_w, page_h = page.rect.width, page.rect.height
+
+        x0 = bbox["Left"] * page_w
+        y0 = bbox["Top"] * page_h
+        x1 = x0 + bbox["Width"] * page_w
+        y1 = y0 + bbox["Height"] * page_h
+
+        clip = fitz.Rect(x0, y0, x1, y1)
+        crop_pix = page.get_pixmap(dpi=FIGURE_RENDER_DPI, clip=clip)
+        return crop_pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+@retry(
+    retry=retry_if_exception_type(TextractTransientError),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    stop=stop_after_attempt(4),
+    reraise=True,
+)
+def describe_figure(bedrock_runtime, image_bytes: bytes) -> str:
+    prompt = (
+        "Describe what this image shows. If it is a flowchart or decision "
+        "tree, transcribe the full decision logic step by step (conditions, "
+        "branches, outcomes). If it is a screenshot of an application, "
+        "describe the visible fields and any text. If it is a plain "
+        "photo or icon with no informational content, say so briefly."
+    )
+    try:
+        resp = bedrock_runtime.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"image": {"format": "png", "source": {"bytes": image_bytes}}},
+                    {"text": prompt},
+                ],
+            }],
+            inferenceConfig={"maxTokens": 600, "temperature": 0.0},
+        )
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TextractTransientError(str(exc)) from exc
+        raise
+    blocks = resp["output"]["message"]["content"]
+    return "".join(b.get("text", "") for b in blocks).strip()
+
+
+def caption_figures(
+    bedrock_runtime, pdf_bytes: bytes, figures: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    captioned = []
+    for fig in figures:
+        try:
+            crop_bytes = crop_figure(pdf_bytes, fig["page"], fig["bbox"])
+            caption = describe_figure(bedrock_runtime, crop_bytes)
+            captioned.append({**fig, "caption": caption})
+        except Exception as exc:  # noqa: BLE001 — one bad figure shouldn't kill the batch
+            log.warning("figure caption failed (page %s, id %s): %s",
+                       fig["page"], fig["figure_id"], exc)
+            captioned.append({**fig, "caption": None, "error": str(exc)})
+    return captioned
+
+
+# ---------------------------------------------------------------------------
+# Output naming + job tracking
+# ---------------------------------------------------------------------------
+def output_key_for(source_key: str, output_prefix: str) -> str:
+    stem = Path(source_key).stem
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)
+    return f"{output_prefix.rstrip('/')}/{safe_stem}_{timestamp}.json"
+
+
+def load_job_map(s3, bucket: str, key: str = JOB_MAP_KEY) -> Dict[str, Any]:
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return {}
+    except s3.exceptions.ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return {}
+        raise
+
+
+def save_job_map(s3, bucket: str, job_map: Dict[str, Any], key: str = JOB_MAP_KEY) -> None:
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(job_map, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+def process_document(
+    source_bucket: str,
+    source_key: str,
+    output_bucket: str,
+    output_prefix: str,
+    region: str = "us-east-1",
+) -> DocumentResult:
+    textract = boto3.client("textract", region_name=region)
+    bedrock_runtime = boto3.client("bedrock-runtime", region_name=region)
+    s3 = boto3.client("s3", region_name=region)
+
+    job_map = load_job_map(s3, output_bucket)
+    request_token = _request_token(source_bucket, source_key)
+
+    job_id = start_analysis(textract, source_bucket, source_key)
+    log.info("started job %s for %s", job_id, source_key)
+
+    result_raw = wait_for_job(textract, job_id)
+    status = result_raw["JobStatus"]
+
+    if status != "SUCCEEDED":
+        error = result_raw.get("StatusMessage", f"job ended with status {status}")
+        job_map[request_token] = {
+            "source_key": source_key, "job_id": job_id, "status": status,
+            "error": error, "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_job_map(s3, output_bucket, job_map)
+        return DocumentResult(source_bucket, source_key, job_id, status, error=error)
+
+    blocks = result_raw["Blocks"]
+    line_count = sum(1 for b in blocks if b["BlockType"] == "LINE")
+    tables = tables_to_markdown(blocks)
+    figures = find_figures(blocks)
+
+    if figures:
+        pdf_obj = s3.get_object(Bucket=source_bucket, Key=source_key)
+        pdf_bytes = pdf_obj["Body"].read()
+        figures = caption_figures(bedrock_runtime, pdf_bytes, figures)
+
+    output_key = output_key_for(source_key, output_prefix)
+    output_body = {
+        "source_bucket": source_bucket,
+        "source_key": source_key,
+        "job_id": job_id,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "line_count": line_count,
+        "tables": tables,
+        "figures": figures,
+        "raw_block_count": len(blocks),
+    }
+    s3.put_object(
+        Bucket=output_bucket, Key=output_key,
+        Body=json.dumps(output_body, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+
+    job_map[request_token] = {
+        "source_key": source_key, "job_id": job_id, "status": "SUCCEEDED",
+        "output_key": output_key, "table_count": len(tables), "figure_count": len(figures),
+        "processed_at": output_body["processed_at"],
+    }
+    save_job_map(s3, output_bucket, job_map)
+
+    log.info("done: %s -> %s (%d tables, %d figures)",
+             source_key, output_key, len(tables), len(figures))
+
+    return DocumentResult(
+        source_bucket, source_key, job_id, "SUCCEEDED",
+        output_key=output_key, tables=tables, figures=figures, line_count=line_count,
+    )
+
+
+def process_batch(
+    source_bucket: str,
+    source_prefix: str,
+    output_bucket: str,
+    output_prefix: str,
+    region: str = "us-east-1",
+    skip_existing: bool = True,
+) -> List[DocumentResult]:
+    s3 = boto3.client("s3", region_name=region)
+    job_map = load_job_map(s3, output_bucket) if skip_existing else {}
+
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = [
+        obj["Key"]
+        for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix)
+        for obj in page.get("Contents", [])
+        if obj["Key"].lower().endswith(".pdf")
+    ]
+
+    results = []
+    for key in keys:
+        token = _request_token(source_bucket, key)
+        if skip_existing and job_map.get(token, {}).get("status") == "SUCCEEDED":
+            log.info("skip (already processed): %s", key)
+            continue
+        try:
+            results.append(process_document(source_bucket, key, output_bucket, output_prefix, region))
+        except Exception as exc:  # noqa: BLE001 — one bad file shouldn't kill the batch
+            log.exception("failed: %s", key)
+            results.append(DocumentResult(source_bucket, key, "", "ERROR", error=str(exc)))
+
+    return results
