@@ -1,3 +1,624 @@
+"""Textract-only ingestion pipeline: Layout + Tables extraction, ordered by
+physical page position, written as three timestamped output files per
+document (.json/.md/.txt). No Bedrock, Claude, or Nova model of any kind —
+text, tables, and figure locations come exclusively from Amazon Textract.
+
+Flow per document:
+    start_analysis          -> submit to Textract (LAYOUT + TABLES), get job_id
+    wait_for_job             -> poll until SUCCEEDED/FAILED, paginate all Blocks
+    tables_to_markdown       -> TABLE/CELL blocks -> list of markdown tables
+    find_figures             -> LAYOUT_FIGURE blocks -> page + location only,
+                                 no captioning (Textract does not read images)
+    build_sequential_content -> orders text/tables/figures by (Page, Top) —
+                                 physical position on the page, not by an
+                                 assumed block relationship
+    process_document         -> writes {source}_{timestamp}.json/.md/.txt,
+                                 all three sharing one timestamp, and updates
+                                 the job tracking map
+
+process_document() runs the full flow for one S3 PDF and returns a summary.
+process_batch() runs it across every PDF under an S3 prefix.
+"""
+import hashlib
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import boto3
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+log = logging.getLogger(__name__)
+
+POLL_SECONDS = 5
+MAX_POLL_SECONDS = 1800
+FIGURE_RENDER_DPI = 200
+JOB_MAP_KEY = "textract-jobs/job_map.json"
+
+
+class TextractTransientError(Exception):
+    """Retryable Textract failure (throttling, transient service errors)."""
+
+
+def _is_transient(exc: BaseException) -> bool:
+    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+    return code in (
+        "ProvisionedThroughputExceededException",
+        "ThrottlingException",
+        "InternalServerError",
+        "LimitExceededException",
+    )
+
+
+@dataclass
+class DocumentResult:
+    source_bucket: str
+    source_key: str
+    job_id: str
+    status: str
+    output_key: Optional[str] = None
+    markdown_key: Optional[str] = None
+    text_key: Optional[str] = None
+    tables: List[Dict[str, Any]] = field(default_factory=list)
+    figures: List[Dict[str, Any]] = field(default_factory=list)
+    line_count: int = 0
+    error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Textract job lifecycle
+# ---------------------------------------------------------------------------
+def _request_token(bucket: str, key: str) -> str:
+    # Deterministic per (bucket, key) so re-running a batch doesn't start
+    # duplicate (billable) jobs for files already submitted.
+    digest = hashlib.sha256(f"{bucket}/{key}".encode()).hexdigest()
+    return digest[:64]
+
+
+@retry(
+    retry=retry_if_exception_type(TextractTransientError),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
+    stop=stop_after_attempt(5),
+    reraise=True,
+)
+def start_analysis(textract, bucket: str, key: str) -> str:
+    try:
+        resp = textract.start_document_analysis(
+            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
+            FeatureTypes=["LAYOUT", "TABLES"],
+            ClientRequestToken=_request_token(bucket, key),
+        )
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TextractTransientError(str(exc)) from exc
+        raise
+    return resp["JobId"]
+
+
+def wait_for_job(textract, job_id: str) -> Dict[str, Any]:
+    started = time.time()
+    while True:
+        resp = textract.get_document_analysis(JobId=job_id)
+        status = resp["JobStatus"]
+        if status in ("SUCCEEDED", "FAILED"):
+            break
+        if time.time() - started > MAX_POLL_SECONDS:
+            return {"JobStatus": "TIMEOUT", "Blocks": [], "StatusMessage": "Polling timed out"}
+        time.sleep(POLL_SECONDS)
+
+    if status != "SUCCEEDED":
+        return resp
+
+    blocks = list(resp.get("Blocks", []))
+    next_token = resp.get("NextToken")
+    while next_token:
+        page = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
+        blocks.extend(page.get("Blocks", []))
+        next_token = page.get("NextToken")
+
+    resp["Blocks"] = blocks
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Table reconstruction — TABLE/CELL blocks -> markdown grid
+# ---------------------------------------------------------------------------
+def tables_to_markdown(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_id = {b["Id"]: b for b in blocks}
+    tables_out: List[Dict[str, Any]] = []
+
+    for block in blocks:
+        if block["BlockType"] != "TABLE":
+            continue
+
+        cell_ids = [
+            cid
+            for rel in block.get("Relationships", [])
+            if rel["Type"] == "CHILD"
+            for cid in rel["Ids"]
+        ]
+        cells = [by_id[cid] for cid in cell_ids if by_id.get(cid, {}).get("BlockType") == "CELL"]
+        if not cells:
+            continue
+
+        max_row = max(c["RowIndex"] for c in cells)
+        max_col = max(c["ColumnIndex"] for c in cells)
+        grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+
+        for cell in cells:
+            text = _cell_text(cell, by_id)
+            r, c = cell["RowIndex"] - 1, cell["ColumnIndex"] - 1
+            grid[r][c] = text
+
+        tables_out.append({
+            "table_id": block["Id"],
+            "page": block.get("Page", 1),
+            "rows": max_row,
+            "cols": max_col,
+            "markdown": _grid_to_markdown(grid),
+        })
+
+    return tables_out
+
+
+def _cell_text(cell: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
+    word_ids = [
+        wid
+        for rel in cell.get("Relationships", [])
+        if rel["Type"] == "CHILD"
+        for wid in rel["Ids"]
+    ]
+    words = []
+    for wid in word_ids:
+        child = by_id.get(wid)
+        if not child:
+            continue
+        if child["BlockType"] == "WORD":
+            words.append(child.get("Text", ""))
+        elif child["BlockType"] == "SELECTION_ELEMENT":
+            words.append("[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(words).strip()
+
+
+def _grid_to_markdown(grid: List[List[str]]) -> str:
+    if not grid:
+        return ""
+    lines = ["| " + " | ".join(grid[0]) + " |"]
+    lines.append("|" + "|".join(["---"] * len(grid[0])) + "|")
+    for row in grid[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Plain text — titles, headers, paragraphs, lists, in reading order
+# ---------------------------------------------------------------------------
+_TEXT_LAYOUT_TYPES = {
+    "LAYOUT_TITLE",
+    "LAYOUT_HEADER",
+    "LAYOUT_SECTION_HEADER",
+    "LAYOUT_TEXT",
+    "LAYOUT_LIST",
+    "LAYOUT_FOOTER",
+    "LAYOUT_PAGE_NUMBER",
+}
+
+
+def extract_text(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Reconstruct titles/headers/paragraphs/lists in reading order, per page.
+
+    Textract's Layout feature already returns these blocks in the correct
+    reading order (left-to-right, top-to-bottom, column-aware) — we just
+    walk them in the order they appear and resolve each one's child LINE
+    text. TABLE and LAYOUT_FIGURE content is intentionally excluded here;
+    those are handled by tables_to_markdown() and caption_figures().
+    """
+    by_id = {b["Id"]: b for b in blocks}
+    pages: Dict[int, List[Dict[str, str]]] = {}
+
+    for block in blocks:
+        if block["BlockType"] not in _TEXT_LAYOUT_TYPES:
+            continue
+
+        line_ids = [
+            lid
+            for rel in block.get("Relationships", [])
+            if rel["Type"] == "CHILD"
+            for lid in rel["Ids"]
+        ]
+        lines = [by_id[lid]["Text"] for lid in line_ids
+                if by_id.get(lid, {}).get("BlockType") == "LINE"]
+        if not lines:
+            continue
+
+        page_no = block.get("Page", 1)
+        if block["BlockType"] == "LAYOUT_LIST":
+            # Each LINE under a LAYOUT_LIST is one list item — keep them
+            # separate instead of joining into a run-on sentence.
+            for line_text in lines:
+                if line_text.strip():
+                    pages.setdefault(page_no, []).append({
+                        "type": "LAYOUT_LIST", "text": line_text.strip(),
+                    })
+            continue
+
+        text = " ".join(lines).strip()
+        if not text:
+            continue
+        pages.setdefault(page_no, []).append({
+            "type": block["BlockType"],
+            "text": text,
+        })
+
+    return [
+        {"page": page_no, "elements": elements}
+        for page_no, elements in sorted(pages.items())
+    ]
+
+
+def text_to_markdown(pages: List[Dict[str, Any]]) -> str:
+    """Flatten extract_text() output into one markdown string for the whole doc."""
+    heading_types = {"LAYOUT_TITLE": "# ", "LAYOUT_HEADER": "## ",
+                     "LAYOUT_SECTION_HEADER": "### "}
+    lines = []
+    for page in pages:
+        for el in page["elements"]:
+            prefix = heading_types.get(el["type"], "")
+            if el["type"] == "LAYOUT_LIST":
+                lines.append(f"- {el['text']}")
+            else:
+                lines.append(f"{prefix}{el['text']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
+# Sequential ordering — merge text, tables, figures into ONE reading-order
+# stream, ordered by physical position on the page (Page, then vertical Top
+# coordinate). This does NOT depend on any LAYOUT_TABLE -> TABLE relationship
+# (unverified against a real Textract response) — it only relies on Page and
+# Geometry.BoundingBox.Top, which every block type carries directly.
+# Textract-only: no Bedrock/vision captioning anywhere in this pipeline.
+# ---------------------------------------------------------------------------
+_SEQUENCE_TEXT_KIND = {
+    "LAYOUT_TITLE": "title",
+    "LAYOUT_SECTION_HEADER": "section_header",
+    "LAYOUT_TEXT": "paragraph",
+}
+
+
+def _block_top(block: Dict[str, Any]) -> float:
+    try:
+        return block["Geometry"]["BoundingBox"]["Top"]
+    except KeyError:
+        return 0.0
+
+
+def build_sequential_content(
+    blocks: List[Dict[str, Any]], tables: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Order text, tables, and figures by where they physically sit on the
+    page (Page, then Top), not by an assumed block relationship. A table
+    positioned below four lines of text will sort after them, because
+    that's where Textract says it actually is.
+    """
+    by_id = {b["Id"]: b for b in blocks}
+    tables_by_id = {t["table_id"]: t for t in tables}
+    positioned: List[tuple] = []  # (page, top, item_dict)
+
+    for block in blocks:
+        block_type = block["BlockType"]
+        page = block.get("Page", 1)
+        top = _block_top(block)
+
+        if block_type in _SEQUENCE_TEXT_KIND:
+            text = _resolve_line_text(block, by_id)
+            if text:
+                positioned.append((page, top,
+                    {"type": _SEQUENCE_TEXT_KIND[block_type], "page": page, "text": text}))
+
+        elif block_type == "LAYOUT_LIST":
+            for i, line_id in enumerate(_child_ids(block)):
+                child = by_id.get(line_id)
+                if child and child["BlockType"] == "LINE" and child.get("Text", "").strip():
+                    # tiny offset preserves original item order among lines
+                    # that share the LAYOUT_LIST's own top coordinate
+                    positioned.append((page, top + i * 1e-6,
+                        {"type": "list_item", "page": page, "text": child["Text"].strip()}))
+
+        elif block_type == "TABLE":
+            # Use the raw TABLE block directly — same Id tables_to_markdown()
+            # already keys its output by — instead of routing through LAYOUT_TABLE.
+            table = tables_by_id.get(block["Id"])
+            if table:
+                positioned.append((page, top,
+                    {"type": "table", "page": page, "table_id": block["Id"],
+                     "markdown": table["markdown"], "rows": table["rows"], "cols": table["cols"]}))
+
+        elif block_type == "LAYOUT_FIGURE":
+            # Location only — no captioning. Textract detects that a figure
+            # exists and where; it does not describe what's inside.
+            positioned.append((page, top,
+                {"type": "figure", "page": page, "figure_id": block["Id"]}))
+
+    positioned.sort(key=lambda entry: (entry[0], entry[1]))
+    return [item for _, _, item in positioned]
+
+
+def _child_ids(block: Dict[str, Any]) -> List[str]:
+    return [
+        cid
+        for rel in block.get("Relationships", [])
+        if rel["Type"] == "CHILD"
+        for cid in rel["Ids"]
+    ]
+
+
+def _resolve_line_text(block: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
+    lines = [
+        by_id[cid]["Text"]
+        for cid in _child_ids(block)
+        if by_id.get(cid, {}).get("BlockType") == "LINE"
+    ]
+    return " ".join(lines).strip()
+
+
+def sequence_to_markdown(sequence: List[Dict[str, Any]]) -> str:
+    """Flatten build_sequential_content() output into one markdown document,
+    with tables and figure captions embedded at their correct reading-order
+    position — not appended at the end.
+    """
+    heading_prefix = {"title": "# ", "section_header": "## "}
+    lines: List[str] = []
+
+    for item in sequence:
+        kind = item["type"]
+        if kind == "list_item":
+            lines.append(f"- {item['text']}")
+        elif kind in ("title", "section_header", "paragraph"):
+            lines.append(f"{heading_prefix.get(kind, '')}{item['text']}")
+        elif kind == "table":
+            lines.append(item["markdown"])
+        elif kind == "figure":
+            lines.append(f"**[Figure — page {item['page']}, content not extracted; "
+                        f"Textract detects location only, does not read image content]**")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def sequence_to_plain_text(sequence: List[Dict[str, Any]]) -> str:
+    """Same ordering as sequence_to_markdown(), but with no markdown syntax
+    (#, -, |). Tables render as simple space-padded columns; figures render
+    as 'Figure: <caption>' with no bracket/bold decoration.
+    """
+    lines: List[str] = []
+
+    for item in sequence:
+        kind = item["type"]
+        if kind == "list_item":
+            lines.append(f"  - {item['text']}")
+        elif kind in ("title", "section_header", "paragraph"):
+            lines.append(item["text"])
+        elif kind == "table":
+            lines.append(_markdown_table_to_plain(item["markdown"]))
+        elif kind == "figure":
+            lines.append(f"Figure (page {item['page']}) - content not extracted; "
+                        f"Textract detects location only.")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _markdown_table_to_plain(markdown_table: str) -> str:
+    rows = [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in markdown_table.splitlines()
+        if line.strip() and not set(line.replace("|", "").strip()) <= {"-"}
+    ]
+    if not rows:
+        return ""
+    col_widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    return "\n".join(
+        "  ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row))
+        for row in rows
+    )
+
+
+# ---------------------------------------------------------------------------
+# Figures — Textract detects location only; it does not read image content.
+# No captioning/vision model of any kind is used in this pipeline.
+# ---------------------------------------------------------------------------
+def find_figures(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    figures = []
+    for block in blocks:
+        if block["BlockType"] == "LAYOUT_FIGURE":
+            box = block["Geometry"]["BoundingBox"]
+            figures.append({
+                "figure_id": block["Id"],
+                "page": block.get("Page", 1),
+                "bbox": box,
+            })
+    return figures
+
+
+# ---------------------------------------------------------------------------
+# Output naming + job tracking
+# ---------------------------------------------------------------------------
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def _safe_stem(source_key: str) -> str:
+    stem = Path(source_key).stem
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)
+
+
+def output_key_for(
+    source_key: str, output_prefix: str, ext: str = ".json", timestamp: Optional[str] = None
+) -> str:
+    """Build an output S3 key: {prefix}/{source_stem}_{timestamp}{ext}.
+
+    Pass the SAME `timestamp` value across json/md/txt calls for one
+    document so all three output files share one identical timestamp,
+    making them an obviously-matched set.
+    """
+    ts = timestamp or _utc_timestamp()
+    return f"{output_prefix.rstrip('/')}/{_safe_stem(source_key)}_{ts}{ext}"
+
+
+def load_job_map(s3, bucket: str, key: str = JOB_MAP_KEY) -> Dict[str, Any]:
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return {}
+    except s3.exceptions.ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return {}
+        raise
+
+
+def save_job_map(s3, bucket: str, job_map: Dict[str, Any], key: str = JOB_MAP_KEY) -> None:
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(job_map, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+def process_document(
+    source_bucket: str,
+    source_key: str,
+    output_bucket: str,
+    output_prefix: str,
+    region: str = "us-east-1",
+) -> DocumentResult:
+    textract = boto3.client("textract", region_name=region)
+    s3 = boto3.client("s3", region_name=region)
+
+    job_map = load_job_map(s3, output_bucket)
+    request_token = _request_token(source_bucket, source_key)
+
+    job_id = start_analysis(textract, source_bucket, source_key)
+    log.info("started job %s for %s", job_id, source_key)
+
+    result_raw = wait_for_job(textract, job_id)
+    status = result_raw["JobStatus"]
+
+    if status != "SUCCEEDED":
+        error = result_raw.get("StatusMessage", f"job ended with status {status}")
+        job_map[request_token] = {
+            "source_key": source_key, "job_id": job_id, "status": status,
+            "error": error, "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_job_map(s3, output_bucket, job_map)
+        return DocumentResult(source_bucket, source_key, job_id, status, error=error)
+
+    blocks = result_raw["Blocks"]
+    line_count = sum(1 for b in blocks if b["BlockType"] == "LINE")
+    text_pages = extract_text(blocks)
+    tables = tables_to_markdown(blocks)
+    figures = find_figures(blocks)  # location only — no captioning, Textract-only
+
+    sequence = build_sequential_content(blocks, tables)
+    document_markdown = sequence_to_markdown(sequence)
+    document_plain_text = sequence_to_plain_text(sequence)
+
+    # One shared timestamp -> json/md/txt for this document are an obvious
+    # matched set, e.g. Phone_Guide_20260719_143012.{json,md,txt}
+    timestamp = _utc_timestamp()
+    json_key = output_key_for(source_key, output_prefix, ".json", timestamp)
+    markdown_key = output_key_for(source_key, output_prefix, ".md", timestamp)
+    text_key = output_key_for(source_key, output_prefix, ".txt", timestamp)
+
+    output_body = {
+        "source_bucket": source_bucket,
+        "source_key": source_key,
+        "job_id": job_id,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "line_count": line_count,
+        "text": text_pages,
+        "text_markdown": text_to_markdown(text_pages),
+        "tables": tables,
+        "figures": figures,
+        "content_sequence": sequence,
+        "document_markdown": document_markdown,
+        "raw_block_count": len(blocks),
+    }
+    s3.put_object(
+        Bucket=output_bucket, Key=json_key,
+        Body=json.dumps(output_body, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+    s3.put_object(
+        Bucket=output_bucket, Key=markdown_key,
+        Body=document_markdown.encode("utf-8"),
+        ContentType="text/markdown",
+    )
+    s3.put_object(
+        Bucket=output_bucket, Key=text_key,
+        Body=document_plain_text.encode("utf-8"),
+        ContentType="text/plain",
+    )
+
+    job_map[request_token] = {
+        "source_key": source_key, "job_id": job_id, "status": "SUCCEEDED",
+        "output_key": json_key, "markdown_key": markdown_key, "text_key": text_key,
+        "table_count": len(tables), "figure_count": len(figures),
+        "processed_at": output_body["processed_at"],
+    }
+    save_job_map(s3, output_bucket, job_map)
+
+    log.info("done: %s -> %s / %s / %s (%d tables, %d figures)",
+             source_key, json_key, markdown_key, text_key, len(tables), len(figures))
+
+    return DocumentResult(
+        source_bucket, source_key, job_id, "SUCCEEDED",
+        output_key=json_key, markdown_key=markdown_key, text_key=text_key,
+        tables=tables, figures=figures, line_count=line_count,
+    )
+
+
+def process_batch(
+    source_bucket: str,
+    source_prefix: str,
+    output_bucket: str,
+    output_prefix: str,
+    region: str = "us-east-1",
+    skip_existing: bool = True,
+) -> List[DocumentResult]:
+    s3 = boto3.client("s3", region_name=region)
+    job_map = load_job_map(s3, output_bucket) if skip_existing else {}
+
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = [
+        obj["Key"]
+        for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix)
+        for obj in page.get("Contents", [])
+        if obj["Key"].lower().endswith(".pdf")
+    ]
+
+    results = []
+    for key in keys:
+        token = _request_token(source_bucket, key)
+        if skip_existing and job_map.get(token, {}).get("status") == "SUCCEEDED":
+            log.info("skip (already processed): %s", key)
+            continue
+        try:
+            results.append(process_document(source_bucket, key, output_bucket, output_prefix, region))
+        except Exception as exc:  # noqa: BLE001 — one bad file shouldn't kill the batch
+            log.exception("failed: %s", key)
+            results.append(DocumentResult(source_bucket, key, "", "ERROR", error=str(exc)))
+
+    return results
+#################
 """Textract ingestion pipeline: Layout + Tables extraction, figure captioning
 via Bedrock vision, and timestamped output storage with a job tracking map.
 
