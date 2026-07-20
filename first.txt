@@ -1,3 +1,62 @@
+"""Add ONE already-Textract-processed document to the term index.
+
+The document must already have gone through process_document() from
+textract_pipeline.py (i.e. it shows up in job_map.json) — this script
+only runs the Nova/Titan indexing pass on top of that, it does not run
+Textract itself.
+
+Edit OUTPUT_KEY below (the .json path from your earlier Textract run),
+then run:
+    python run_single_document_index.py
+"""
+import json
+import logging
+import sys
+
+from index_builder import index_single_document, validate_index
+
+# ---------------------------------------------------------------------------
+# CONFIG — edit these
+# ---------------------------------------------------------------------------
+BUCKET = "bankrupcy-data-bkt"
+OUTPUT_KEY = "textract-output/Phone_Guide_20260720_120000.json"
+REGION = "us-east-1"
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger("run_single_document_index")
+
+    log.info("Indexing: s3://%s/%s", BUCKET, OUTPUT_KEY)
+    index = index_single_document(bucket=BUCKET, output_key=OUTPUT_KEY, region=REGION)
+
+    summary = index.get("_last_document", {})
+    log.info("This document: %d candidates -> %d new, %d merged",
+             summary.get("candidates", 0), summary.get("new_entries", 0),
+             summary.get("merged", 0))
+    log.info("Total terms in index so far: %d", len(index.get("terms", {})))
+
+    warnings = validate_index(index)
+    if warnings:
+        log.warning("Validation found %d issue(s):", len(warnings))
+        for w in warnings:
+            log.warning("  - %s", w)
+    else:
+        log.info("Validation: no issues found.")
+
+    print(json.dumps(index["terms"], indent=2, ensure_ascii=False)[:1500])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+####
 """Unsupervised Labeling Utility — the Index (flat term -> sources map).
 
 Implements the pipeline from Section 3 of the design doc:
