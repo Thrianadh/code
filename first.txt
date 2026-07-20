@@ -1,763 +1,82 @@
-"""Textract-only ingestion pipeline: Layout + Tables extraction, ordered by
-physical page position, written as three timestamped output files per
-document (.json/.md/.txt). No Bedrock, Claude, or Nova model of any kind —
-text, tables, and figure locations come exclusively from Amazon Textract.
+"""Unsupervised Labeling Utility — the Index (flat term -> sources map).
 
-Flow per document:
-    start_analysis          -> submit to Textract (LAYOUT + TABLES), get job_id
-    wait_for_job             -> poll until SUCCEEDED/FAILED, paginate all Blocks
-    tables_to_markdown       -> TABLE/CELL blocks -> list of markdown tables
-    find_figures             -> LAYOUT_FIGURE blocks -> page + location only,
-                                 no captioning (Textract does not read images)
-    build_sequential_content -> orders text/tables/figures by (Page, Top) —
-                                 physical position on the page, not by an
-                                 assumed block relationship
-    process_document         -> writes {source}_{timestamp}.json/.md/.txt,
-                                 all three sharing one timestamp, and updates
-                                 the job tracking map
+Implements the pipeline from Section 3 of the design doc:
+    EXTRACT candidate terms (Nova, per document)
+    EMBED candidate terms + short context (Titan v2)
+    MATCH against existing index entries (cosine similarity)
+        high similarity  -> auto-merge as alias
+        low similarity   -> create new entry
+        borderline       -> Nova judge decides merge vs new entry
 
-process_document() runs the full flow for one S3 PDF and returns a summary.
-process_batch() runs it across every PDF under an S3 prefix.
+This is the complement to tree_builder.py's Tree (Section 2's rationale):
+the Tree is free/deterministic navigation; the Index is the LLM-assisted
+layer that resolves a term mentioned in multiple, unrelated branches of
+the Tree back to every source that discusses it.
+
+Usage:
+    from index_builder import build_index_from_job_map, save_index, validate_index
+
+    index = build_index_from_job_map(bucket="bankrupcy-data-bkt", region="us-east-1")
+    warnings = validate_index(index)
+    save_index("bankrupcy-data-bkt", index)
 """
-import hashlib
 import json
 import logging
 import re
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
-import fitz
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from textract_pipeline import TextractTransientError, load_job_map
 
 log = logging.getLogger(__name__)
 
-POLL_SECONDS = 5
-MAX_POLL_SECONDS = 1800
-FIGURE_RENDER_DPI = 200
-JOB_MAP_KEY = "textract-jobs/job_map.json"
+INDEX_KEY = "textract-jobs/index.json"
+NOVA_MODEL_ID = "amazon.nova-2-lite-v1:0"
+TITAN_EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
+EMBED_DIM = 1024
+
+# Cosine similarity thresholds — starting points, not proven. Calibrate
+# against real extracted terms once available; these are not tuned yet.
+SIM_AUTO_MERGE = 0.92
+SIM_NO_MATCH = 0.75
+
+MAX_DOC_CHARS_FOR_EXTRACTION = 30_000  # size-based fallback threshold
+CONTEXT_SNIPPET_CHARS = 200
 
 
-class TextractTransientError(Exception):
-    """Retryable Textract failure (throttling, transient service errors)."""
+# ---------------------------------------------------------------------------
+# Nova extraction — per document, using the already-assembled document text
+# ---------------------------------------------------------------------------
+_EXTRACTION_SYSTEM_PROMPT = (
+    "You extract domain-specific terminology from student loan servicing "
+    "and bankruptcy documents. Respond with valid JSON only, no prose, "
+    "no code fences."
+)
+
+_EXTRACTION_INSTRUCTIONS = """\
+Extract the domain-specific terms, form names, and defined concepts from
+the document below — the kind of vocabulary a call-center agent would
+need a glossary entry for (e.g. "Automatic Stay", "Loan Rehabilitation",
+"Chapter 13 Plan"). Do not extract generic words or common phrases.
+
+Respond with a JSON array. Each item:
+{
+  "term": "canonical term name",
+  "context": "the sentence or phrase where it appears, verbatim, max 200 chars"
+}
+
+Extract at most 30 terms. If the document has none, return [].
+
+Document:
+"""
 
 
 def _is_transient(exc: BaseException) -> bool:
-    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
-    return code in (
-        "ProvisionedThroughputExceededException",
-        "ThrottlingException",
-        "InternalServerError",
-        "LimitExceededException",
-    )
-
-
-@dataclass
-class DocumentResult:
-    source_bucket: str
-    source_key: str
-    job_id: str
-    status: str
-    output_key: Optional[str] = None
-    markdown_key: Optional[str] = None
-    text_key: Optional[str] = None
-    tables: List[Dict[str, Any]] = field(default_factory=list)
-    figures: List[Dict[str, Any]] = field(default_factory=list)
-    line_count: int = 0
-    error: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Textract job lifecycle
-# ---------------------------------------------------------------------------
-def _request_token(bucket: str, key: str, feature_types: List[str]) -> str:
-    # Deterministic per (bucket, key, feature_types) so re-running a batch
-    # with the SAME request doesn't start duplicate (billable) jobs — but a
-    # genuinely different request (e.g. FeatureTypes changed) gets a new
-    # token instead of colliding with an old one and raising
-    # IdempotentParameterMismatchException.
-    features_part = ",".join(sorted(feature_types))
-    digest = hashlib.sha256(f"{bucket}/{key}/{features_part}".encode()).hexdigest()
-    return digest[:64]
-
-
-DEFAULT_FEATURE_TYPES = ["LAYOUT", "TABLES", "FORMS"]
-
-
-@retry(
-    retry=retry_if_exception_type(TextractTransientError),
-    wait=wait_exponential(multiplier=2, min=2, max=60),
-    stop=stop_after_attempt(5),
-    reraise=True,
-)
-def start_analysis(textract, bucket: str, key: str) -> str:
-    try:
-        resp = textract.start_document_analysis(
-            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
-            FeatureTypes=DEFAULT_FEATURE_TYPES,
-            ClientRequestToken=_request_token(bucket, key, DEFAULT_FEATURE_TYPES),
-        )
-    except Exception as exc:
-        if _is_transient(exc):
-            raise TextractTransientError(str(exc)) from exc
-        raise
-    return resp["JobId"]
-
-
-def wait_for_job(textract, job_id: str) -> Dict[str, Any]:
-    started = time.time()
-    while True:
-        resp = textract.get_document_analysis(JobId=job_id)
-        status = resp["JobStatus"]
-        if status in ("SUCCEEDED", "FAILED"):
-            break
-        if time.time() - started > MAX_POLL_SECONDS:
-            return {"JobStatus": "TIMEOUT", "Blocks": [], "StatusMessage": "Polling timed out"}
-        time.sleep(POLL_SECONDS)
-
-    if status != "SUCCEEDED":
-        return resp
-
-    blocks = list(resp.get("Blocks", []))
-    next_token = resp.get("NextToken")
-    while next_token:
-        page = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
-        blocks.extend(page.get("Blocks", []))
-        next_token = page.get("NextToken")
-
-    resp["Blocks"] = blocks
-    return resp
-
-
-# ---------------------------------------------------------------------------
-# Table reconstruction — TABLE/CELL blocks -> markdown grid
-# ---------------------------------------------------------------------------
-def tables_to_markdown(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_id = {b["Id"]: b for b in blocks}
-    tables_out: List[Dict[str, Any]] = []
-
-    for block in blocks:
-        if block["BlockType"] != "TABLE":
-            continue
-
-        cell_ids = [
-            cid
-            for rel in block.get("Relationships", [])
-            if rel["Type"] == "CHILD"
-            for cid in rel["Ids"]
-        ]
-        cells = [by_id[cid] for cid in cell_ids if by_id.get(cid, {}).get("BlockType") == "CELL"]
-        if not cells:
-            continue
-
-        max_row = max(c["RowIndex"] for c in cells)
-        max_col = max(c["ColumnIndex"] for c in cells)
-        grid = [["" for _ in range(max_col)] for _ in range(max_row)]
-
-        for cell in cells:
-            text = _cell_text(cell, by_id)
-            r, c = cell["RowIndex"] - 1, cell["ColumnIndex"] - 1
-            grid[r][c] = text
-
-        tables_out.append({
-            "table_id": block["Id"],
-            "page": block.get("Page", 1),
-            "rows": max_row,
-            "cols": max_col,
-            "markdown": _grid_to_markdown(grid),
-        })
-
-    return tables_out
-
-
-def _cell_text(cell: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
-    word_ids = [
-        wid
-        for rel in cell.get("Relationships", [])
-        if rel["Type"] == "CHILD"
-        for wid in rel["Ids"]
-    ]
-    words = []
-    for wid in word_ids:
-        child = by_id.get(wid)
-        if not child:
-            continue
-        if child["BlockType"] == "WORD":
-            words.append(child.get("Text", ""))
-        elif child["BlockType"] == "SELECTION_ELEMENT":
-            words.append("[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
-    return " ".join(words).strip()
-
-
-def _grid_to_markdown(grid: List[List[str]]) -> str:
-    if not grid:
-        return ""
-    lines = ["| " + " | ".join(grid[0]) + " |"]
-    lines.append("|" + "|".join(["---"] * len(grid[0])) + "|")
-    for row in grid[1:]:
-        lines.append("| " + " | ".join(row) + " |")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Forms — KEY_VALUE_SET blocks. AWS's documented schema: a KEY block has
-# EntityTypes=["KEY"], a CHILD relationship to its own WORD blocks (the
-# label text), and a VALUE relationship pointing at the paired VALUE
-# block's Id. The VALUE block then has its own CHILD relationship to the
-# WORD/SELECTION_ELEMENT blocks making up the actual value text.
-# ---------------------------------------------------------------------------
-def _clean_kv_key(key_text: str) -> str:
-    """Strip a trailing colon Textract may have already included in the key
-    text (e.g. source label was literally "Talking Points:") so rendering
-    doesn't produce a double colon like "Talking Points::".
-    """
-    return key_text.rstrip(":").rstrip()
-
-
-# A real form field's value is normally short — "$5.03", "M00351053". If
-# FORMS groups a bold label with a long multi-sentence block of prose that
-# follows it (e.g. "Talking Points:" + two bullet points merged into one
-# run-on VALUE string), that's FORMS mis-triggering on prose, not a genuine
-# label:value pair. We can't recover the ORIGINAL bullet boundaries — that
-# structure is gone once Textract merges it into one VALUE block, before we
-# ever see the response — but we can stop rendering it as an awkward
-# "**Key:** <giant paragraph>" line and fall back to plain paragraph text,
-# which at least reads naturally.
-_KV_VALUE_MAX_LEN_FOR_FORM_FIELD = 150
-
-# The mirror image of the above: a "key" this long, standing alone with NO
-# matched value at all, is not really a label either — it's a full sentence
-# Textract misread as a form field name (e.g. "Only the Chapter 13
-# Trustee's Office may request a refund of PY T payments." as a "key" with
-# an empty value). Left unhandled, this renders as a broken half-line:
-# "**<the whole sentence>:**" with nothing after the colon.
-_KV_KEY_MIN_LEN_FOR_STANDALONE_SENTENCE = 40
-
-
-def _build_kv_sequence_item(page: int, key_text: str, value_text: str) -> Dict[str, Any]:
-    clean_key = _clean_kv_key(key_text)
-    if len(value_text) > _KV_VALUE_MAX_LEN_FOR_FORM_FIELD:
-        return {"type": "paragraph", "page": page, "text": f"{clean_key}: {value_text}"}
-    if not value_text.strip() and len(clean_key) > _KV_KEY_MIN_LEN_FOR_STANDALONE_SENTENCE:
-        return {"type": "paragraph", "page": page, "text": clean_key}
-    return {"type": "key_value", "page": page, "key": clean_key, "value": value_text}
-
-
-def forms_to_keyvalues(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_id = {b["Id"]: b for b in blocks}
-    pairs: List[Dict[str, Any]] = []
-
-    for block in blocks:
-        if block["BlockType"] != "KEY_VALUE_SET":
-            continue
-        if "KEY" not in (block.get("EntityTypes") or []):
-            continue
-
-        key_text = _cell_text(block, by_id)
-        value_id = next(
-            (rel["Ids"][0] for rel in block.get("Relationships", [])
-             if rel["Type"] == "VALUE" and rel.get("Ids")),
-            None,
-        )
-        value_block = by_id.get(value_id) if value_id else None
-        value_text = _cell_text(value_block, by_id) if value_block else ""
-
-        if key_text:
-            pairs.append({
-                "key_id": block["Id"],
-                "page": block.get("Page", 1),
-                "key": key_text,
-                "value": value_text,
-            })
-
-    return pairs
-
-
-# ---------------------------------------------------------------------------
-# Plain text — titles, headers, paragraphs, lists, in reading order
-# ---------------------------------------------------------------------------
-_TEXT_LAYOUT_TYPES = {
-    "LAYOUT_TITLE",
-    "LAYOUT_HEADER",
-    "LAYOUT_SECTION_HEADER",
-    "LAYOUT_TEXT",
-    "LAYOUT_LIST",
-    "LAYOUT_FOOTER",
-    "LAYOUT_PAGE_NUMBER",
-}
-
-
-def extract_text(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Reconstruct titles/headers/paragraphs/lists in reading order, per page.
-
-    Textract's Layout feature already returns these blocks in the correct
-    reading order (left-to-right, top-to-bottom, column-aware) — we just
-    walk them in the order they appear and resolve each one's child LINE
-    text. TABLE and LAYOUT_FIGURE content is intentionally excluded here;
-    those are handled by tables_to_markdown() and caption_figures().
-    """
-    by_id = {b["Id"]: b for b in blocks}
-    pages: Dict[int, List[Dict[str, str]]] = {}
-
-    for block in blocks:
-        if block["BlockType"] not in _TEXT_LAYOUT_TYPES:
-            continue
-
-        line_ids = [
-            lid
-            for rel in block.get("Relationships", [])
-            if rel["Type"] == "CHILD"
-            for lid in rel["Ids"]
-        ]
-        lines = [by_id[lid]["Text"] for lid in line_ids
-                if by_id.get(lid, {}).get("BlockType") == "LINE"]
-        if not lines:
-            continue
-
-        page_no = block.get("Page", 1)
-        if block["BlockType"] == "LAYOUT_LIST":
-            # Each LINE under a LAYOUT_LIST is one list item — keep them
-            # separate instead of joining into a run-on sentence.
-            for line_text in lines:
-                if line_text.strip():
-                    pages.setdefault(page_no, []).append({
-                        "type": "LAYOUT_LIST", "text": line_text.strip(),
-                    })
-            continue
-
-        text = " ".join(lines).strip()
-        if not text:
-            continue
-        pages.setdefault(page_no, []).append({
-            "type": block["BlockType"],
-            "text": text,
-        })
-
-    return [
-        {"page": page_no, "elements": elements}
-        for page_no, elements in sorted(pages.items())
-    ]
-
-
-def text_to_markdown(pages: List[Dict[str, Any]]) -> str:
-    """Flatten extract_text() output into one markdown string for the whole doc."""
-    heading_types = {"LAYOUT_TITLE": "# ", "LAYOUT_HEADER": "## ",
-                     "LAYOUT_SECTION_HEADER": "### "}
-    lines = []
-    for page in pages:
-        for el in page["elements"]:
-            prefix = heading_types.get(el["type"], "")
-            if el["type"] == "LAYOUT_LIST":
-                lines.append(f"- {el['text']}")
-            else:
-                lines.append(f"{prefix}{el['text']}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-# ---------------------------------------------------------------------------
-# Sequential ordering.
-#
-# AWS's own documentation states LAYOUT_* blocks are returned "in the implied
-# reading order of the document... top to bottom, left to right" — meaning
-# Textract ALREADY resolves multi-column ordering correctly at the LAYOUT
-# block level. A previous version of this function re-sorted everything by
-# (Page, Top) globally, which THREW THAT AWAY: Top-only sorting interleaves
-# two side-by-side columns by vertical position instead of finishing column
-# 1 before starting column 2 — a regression for genuine multi-column pages.
-#
-# Fix: trust Textract's native block order for LAYOUT_TITLE/SECTION_HEADER/
-# TEXT/LIST/TABLE/FIGURE — walk `blocks` as given, don't re-sort.
-#
-# Remaining risk: some tables appear as a raw TABLE block with NO LAYOUT_TABLE
-# wrapper at all (confirmed happens — see the test for this file). Native
-# order alone would silently drop those, same bug as before. Fallback: after
-# the native-order walk, find any TABLE block never matched to a LAYOUT_TABLE
-# and insert it via (Page, Top) position instead of dropping it. This case is
-# logged so we can tell how often it happens on real documents.
-# ---------------------------------------------------------------------------
-_SEQUENCE_TEXT_KIND = {
-    "LAYOUT_TITLE": "title",
-    "LAYOUT_SECTION_HEADER": "section_header",
-    "LAYOUT_TEXT": "paragraph",
-}
-
-
-def _block_top(block: Dict[str, Any]) -> float:
-    try:
-        return block["Geometry"]["BoundingBox"]["Top"]
-    except KeyError:
-        return 0.0
-
-
-def _bbox_overlap(box_a: Dict[str, float], box_b: Dict[str, float]) -> float:
-    """Intersection-over-union of two Textract fractional bounding boxes."""
-    ax0, ay0 = box_a["Left"], box_a["Top"]
-    ax1, ay1 = ax0 + box_a["Width"], ay0 + box_a["Height"]
-    bx0, by0 = box_b["Left"], box_b["Top"]
-    bx1, by1 = bx0 + box_b["Width"], by0 + box_b["Height"]
-
-    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
-    iy = max(0.0, min(ay1, by1) - max(ay0, by0))
-    intersection = ix * iy
-    union = box_a["Width"] * box_a["Height"] + box_b["Width"] * box_b["Height"] - intersection
-    return intersection / union if union > 0 else 0.0
-
-
-def _match_layout_block(
-    layout_block: Dict[str, Any], candidate_blocks: List[Dict[str, Any]]
-) -> Optional[str]:
-    """Find the raw block (TABLE or KEY_VALUE_SET) that best overlaps a
-    LAYOUT_* wrapper's bounding box on the same page — geometry-based,
-    doesn't assume any specific relationship schema.
-    """
-    page = layout_block.get("Page", 1)
-    box = layout_block["Geometry"]["BoundingBox"]
-    candidates = [c for c in candidate_blocks if c.get("Page", 1) == page]
-    if not candidates:
-        return None
-    best = max(candidates, key=lambda c: _bbox_overlap(box, c["Geometry"]["BoundingBox"]))
-    return best["Id"] if _bbox_overlap(box, best["Geometry"]["BoundingBox"]) > 0 else None
-
-
-def build_sequential_content(
-    blocks: List[Dict[str, Any]],
-    tables: List[Dict[str, Any]],
-    form_fields: Optional[List[Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
-    """Order text, tables, form key/value fields, and figures using
-    Textract's own native block order (correct per AWS docs, including
-    multi-column) rather than re-deriving a global position sort. Tables
-    and form fields lacking a LAYOUT_TABLE/LAYOUT_KEY_VALUE wrapper are
-    still recovered via a position-based fallback so nothing silently
-    disappears.
-    """
-    form_fields = form_fields or []
-    by_id = {b["Id"]: b for b in blocks}
-    tables_by_id = {t["table_id"]: t for t in tables}
-    kv_by_id = {f["key_id"]: f for f in form_fields}
-    table_blocks = [b for b in blocks if b["BlockType"] == "TABLE"]
-    kv_blocks = [
-        b for b in blocks
-        if b["BlockType"] == "KEY_VALUE_SET" and "KEY" in (b.get("EntityTypes") or [])
-    ]
-
-    sequence: List[Dict[str, Any]] = []
-    matched_table_ids: set = set()
-    matched_kv_ids: set = set()
-
-    for block in blocks:
-        block_type = block["BlockType"]
-        page = block.get("Page", 1)
-
-        if block_type in _SEQUENCE_TEXT_KIND:
-            text = _resolve_line_text(block, by_id)
-            if text:
-                sequence.append({"type": _SEQUENCE_TEXT_KIND[block_type],
-                                 "page": page, "text": text})
-
-        elif block_type == "LAYOUT_LIST":
-            for line_id in _child_ids(block):
-                child = by_id.get(line_id)
-                if child and child["BlockType"] == "LINE" and child.get("Text", "").strip():
-                    sequence.append({"type": "list_item", "page": page,
-                                     "text": child["Text"].strip()})
-
-        elif block_type == "LAYOUT_TABLE":
-            table_id = _match_layout_block(block, table_blocks)
-            table = tables_by_id.get(table_id)
-            if table:
-                matched_table_ids.add(table_id)
-                sequence.append({"type": "table", "page": page, "table_id": table_id,
-                                 "markdown": table["markdown"], "rows": table["rows"],
-                                 "cols": table["cols"]})
-
-        elif block_type == "LAYOUT_KEY_VALUE":
-            key_id = _match_layout_block(block, kv_blocks)
-            kv_field = kv_by_id.get(key_id)
-            if kv_field:
-                matched_kv_ids.add(key_id)
-                sequence.append(_build_kv_sequence_item(page, kv_field["key"], kv_field["value"]))
-
-        elif block_type == "LAYOUT_FIGURE":
-            sequence.append({"type": "figure", "page": page, "figure_id": block["Id"]})
-
-    # Fallback: any TABLE/KEY_VALUE_SET block never matched to a LAYOUT
-    # wrapper would otherwise vanish entirely. Recover by (Page, Top)
-    # position — best effort, not native-order-perfect, but never dropped.
-    unmatched_tables = [t for t in table_blocks if t["Id"] not in matched_table_ids]
-    unmatched_kv = [k for k in kv_blocks if k["Id"] not in matched_kv_ids]
-    if unmatched_tables:
-        log.warning("%d table(s) had no LAYOUT_TABLE wrapper; recovered by "
-                   "position instead of native order.", len(unmatched_tables))
-    if unmatched_kv:
-        log.warning("%d form field(s) had no LAYOUT_KEY_VALUE wrapper; "
-                   "recovered by position instead of native order.", len(unmatched_kv))
-
-    for table_block in unmatched_tables:
-        table = tables_by_id.get(table_block["Id"])
-        if not table:
-            continue
-        fallback_item = {"type": "table", "page": table_block.get("Page", 1),
-                         "table_id": table_block["Id"], "markdown": table["markdown"],
-                         "rows": table["rows"], "cols": table["cols"]}
-        insert_at = _fallback_insert_index(sequence, table_block.get("Page", 1))
-        sequence.insert(insert_at, fallback_item)
-
-    for kv_block in unmatched_kv:
-        kv_field = kv_by_id.get(kv_block["Id"])
-        if not kv_field:
-            continue
-        fallback_item = _build_kv_sequence_item(
-            kv_block.get("Page", 1), kv_field["key"], kv_field["value"])
-        insert_at = _fallback_insert_index(sequence, kv_block.get("Page", 1))
-        sequence.insert(insert_at, fallback_item)
-
-    return sequence
-
-
-def _fallback_insert_index(sequence: List[Dict[str, Any]], page: int) -> int:
-    """Best-effort position for an unmatched table: insert right after the
-    last sequence item on the same page or earlier. Appends at the end if
-    no such item exists (e.g. table is on the very first page/position).
-    """
-    last_qualifying = -1
-    for i, item in enumerate(sequence):
-        if item.get("page", 1) <= page:
-            last_qualifying = i
-    return last_qualifying + 1 if last_qualifying >= 0 else len(sequence)
-
-
-
-def _child_ids(block: Dict[str, Any]) -> List[str]:
-    return [
-        cid
-        for rel in block.get("Relationships", [])
-        if rel["Type"] == "CHILD"
-        for cid in rel["Ids"]
-    ]
-
-
-def _resolve_line_text(block: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
-    lines = [
-        by_id[cid]["Text"]
-        for cid in _child_ids(block)
-        if by_id.get(cid, {}).get("BlockType") == "LINE"
-    ]
-    return " ".join(lines).strip()
-
-
-def _render_figure_markdown(item: Dict[str, Any]) -> str:
-    ocr_text = item.get("ocr_text")
-    key_values = item.get("key_values") or []
-    tables = item.get("tables") or []
-
-    if not ocr_text and not key_values and not tables:
-        return (f"**[Figure — page {item['page']}, no text detected by OCR; "
-               f"may be a diagram, photo, or icon]**")
-
-    parts = [f"**[Figure — page {item['page']}]**"]
-    if item.get("needs_vision_review"):
-        parts.append("*(short/fragmented OCR text — may be a diagram; "
-                     "consider manual or vision review)*")
-    for kv_field in key_values:
-        parts.append(f"**{_clean_kv_key(kv_field['key'])}:** {kv_field['value']}")
-    for table in tables:
-        parts.append(table["markdown"])
-    if not key_values and not tables and ocr_text:
-        parts.append(ocr_text)
-    return "\n".join(parts)
-
-
-def _render_figure_plain(item: Dict[str, Any]) -> str:
-    ocr_text = item.get("ocr_text")
-    key_values = item.get("key_values") or []
-    tables = item.get("tables") or []
-
-    if not ocr_text and not key_values and not tables:
-        return f"Figure (page {item['page']}) - no text detected by OCR."
-
-    parts = [f"Figure (page {item['page']})"]
-    if item.get("needs_vision_review"):
-        parts.append("(short/fragmented OCR text - may be a diagram; consider review)")
-    for kv_field in key_values:
-        parts.append(f"{_clean_kv_key(kv_field['key'])}: {kv_field['value']}")
-    for table in tables:
-        parts.append(_markdown_table_to_plain(table["markdown"]))
-    if not key_values and not tables and ocr_text:
-        parts.append(ocr_text)
-    return "\n".join(parts)
-
-
-def _slugify(text: str, seen_slugs: Dict[str, int]) -> str:
-    """GitHub-Flavored-Markdown style anchor slug: lowercase, spaces to
-    hyphens, strip punctuation, de-duplicate with -1/-2/... suffixes so
-    repeated heading text still gets unique, working anchor links.
-    """
-    slug = text.strip().lower()
-    slug = re.sub(r"[^\w\s-]", "", slug)
-    slug = re.sub(r"[\s]+", "-", slug).strip("-")
-    if slug in seen_slugs:
-        seen_slugs[slug] += 1
-        return f"{slug}-{seen_slugs[slug]}"
-    seen_slugs[slug] = 0
-    return slug
-
-
-def extract_toc_entries(sequence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Pull just the title/section_header items out of a sequence, in
-    order, as structured data (not rendered markdown). This is the shared
-    heading data both build_table_of_contents() (per-document markdown ToC)
-    and the corpus-level tree builder consume — extracted once here so
-    both stay consistent.
-    """
-    return [
-        {"type": item["type"], "text": item["text"], "page": item.get("page", 1)}
-        for item in sequence
-        if item["type"] in ("title", "section_header")
-    ]
-
-
-def build_table_of_contents(sequence: List[Dict[str, Any]]) -> str:
-    """Build a markdown Table of Contents from a document's title/section
-    header items, with GFM-compatible anchor links (# renders correctly on
-    GitHub and most markdown viewers that auto-generate heading anchors).
-    Titles are top-level bullets; section headers are indented one level.
-    """
-    entries = extract_toc_entries(sequence)
-    if not entries:
-        return ""
-
-    seen_slugs: Dict[str, int] = {}
-    lines: List[str] = ["## Table of Contents", ""]
-
-    for entry in entries:
-        slug = _slugify(entry["text"], seen_slugs)
-        indent = "" if entry["type"] == "title" else "  "
-        lines.append(f"{indent}- [{entry['text']}](#{slug})")
-
-    return "\n".join(lines)
-
-
-def build_table_of_contents_plain(sequence: List[Dict[str, Any]]) -> str:
-    """Same heading outline as build_table_of_contents(), no markdown links
-    — for the plain-text output, where anchors don't apply.
-    """
-    lines: List[str] = ["Table of Contents", ""]
-    for item in sequence:
-        if item["type"] not in ("title", "section_header"):
-            continue
-        indent = "" if item["type"] == "title" else "  "
-        lines.append(f"{indent}- {item['text']}")
-
-    if len(lines) == 2:
-        return ""
-
-    return "\n".join(lines)
-
-
-def sequence_to_markdown(sequence: List[Dict[str, Any]]) -> str:
-    """Flatten build_sequential_content() output into one markdown document,
-    with tables and figure captions embedded at their correct reading-order
-    position — not appended at the end.
-    """
-    heading_prefix = {"title": "# ", "section_header": "## "}
-    lines: List[str] = []
-
-    for item in sequence:
-        kind = item["type"]
-        if kind == "list_item":
-            lines.append(f"- {item['text']}")
-        elif kind in ("title", "section_header", "paragraph"):
-            lines.append(f"{heading_prefix.get(kind, '')}{item['text']}")
-        elif kind == "table":
-            lines.append(item["markdown"])
-        elif kind == "key_value":
-            lines.append(f"**{_clean_kv_key(item['key'])}:** {item['value']}")
-        elif kind == "figure":
-            lines.append(_render_figure_markdown(item))
-        lines.append("")
-
-    return "\n".join(lines).strip()
-
-
-def sequence_to_plain_text(sequence: List[Dict[str, Any]]) -> str:
-    """Same ordering as sequence_to_markdown(), but with no markdown syntax
-    (#, -, |). Tables render as simple space-padded columns; figures render
-    as 'Figure: <caption>' with no bracket/bold decoration.
-    """
-    lines: List[str] = []
-
-    for item in sequence:
-        kind = item["type"]
-        if kind == "list_item":
-            lines.append(f"  - {item['text']}")
-        elif kind in ("title", "section_header", "paragraph"):
-            lines.append(item["text"])
-        elif kind == "table":
-            lines.append(_markdown_table_to_plain(item["markdown"]))
-        elif kind == "key_value":
-            lines.append(f"{_clean_kv_key(item['key'])}: {item['value']}")
-        elif kind == "figure":
-            lines.append(_render_figure_plain(item))
-        lines.append("")
-
-    return "\n".join(lines).strip()
-
-
-def _markdown_table_to_plain(markdown_table: str) -> str:
-    rows = [
-        [cell.strip() for cell in line.strip("|").split("|")]
-        for line in markdown_table.splitlines()
-        if line.strip() and not set(line.replace("|", "").strip()) <= {"-"}
-    ]
-    if not rows:
-        return ""
-    col_widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
-    return "\n".join(
-        "  ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row))
-        for row in rows
-    )
-
-
-# ---------------------------------------------------------------------------
-# Figures — Textract detects location only; it does not read image content.
-# No captioning/vision model of any kind is used in this pipeline.
-# ---------------------------------------------------------------------------
-def find_figures(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    figures = []
-    for block in blocks:
-        if block["BlockType"] == "LAYOUT_FIGURE":
-            box = block["Geometry"]["BoundingBox"]
-            figures.append({
-                "figure_id": block["Id"],
-                "page": block.get("Page", 1),
-                "bbox": box,
-            })
-    return figures
-
-
-def crop_figure(pdf_bytes: bytes, page_no: int, bbox: Dict[str, float]) -> bytes:
-    """Crop one figure region out of the source PDF page as a PNG image."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        page = doc[page_no - 1]
-        # bbox values are fractions of page size (Textract convention).
-        # fitz clip rects are in PDF point space (page.rect), NOT the pixel
-        # space of a rendered pixmap — scaling to pixels happens via dpi=.
-        page_w, page_h = page.rect.width, page.rect.height
-        x0 = bbox["Left"] * page_w
-        y0 = bbox["Top"] * page_h
-        x1 = x0 + bbox["Width"] * page_w
-        y1 = y0 + bbox["Height"] * page_h
-        clip = fitz.Rect(x0, y0, x1, y1)
-        crop_pix = page.get_pixmap(dpi=FIGURE_RENDER_DPI, clip=clip)
-        return crop_pix.tobytes("png")
-    finally:
-        doc.close()
+    msg = str(exc).lower()
+    return any(m in msg for m in ("throttl", "429", "500", "502", "503", "504", "timeout"))
 
 
 @retry(
@@ -766,302 +85,363 @@ def crop_figure(pdf_bytes: bytes, page_no: int, bbox: Dict[str, float]) -> bytes
     stop=stop_after_attempt(4),
     reraise=True,
 )
-def ocr_figure_region(textract, image_bytes: bytes) -> Dict[str, Any]:
-    """Run Textract AnalyzeDocument (synchronous, FORMS+TABLES) against one
-    cropped figure image. Still pure Textract, no vision/LLM model — this
-    covers figures that turn out to be embedded screenshots of forms or
-    tables (e.g. a pasted account-detail screen), not just plain text.
-    Falls back gracefully to plain line text when no forms/tables are found.
-    """
+def _call_nova(bedrock_runtime, system_prompt: str, user_prompt: str,
+               max_tokens: int = 2048, temperature: float = 0.0) -> str:
     try:
-        response = textract.analyze_document(
-            Document={"Bytes": image_bytes}, FeatureTypes=["FORMS", "TABLES"],
+        response = bedrock_runtime.converse(
+            modelId=NOVA_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": user_prompt}]}],
+            system=[{"text": system_prompt}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
         )
     except Exception as exc:
         if _is_transient(exc):
             raise TextractTransientError(str(exc)) from exc
         raise
-
-    crop_blocks = response.get("Blocks", [])
-    lines = [b["Text"] for b in crop_blocks if b["BlockType"] == "LINE"]
-    word_count = sum(1 for b in crop_blocks if b["BlockType"] == "WORD")
-    key_values = forms_to_keyvalues(crop_blocks)
-    tables = tables_to_markdown(crop_blocks)
-
-    return {
-        "text": "\n".join(lines).strip(),
-        "line_count": len(lines),
-        "word_count": word_count,
-        "key_values": key_values,
-        "tables": tables,
-    }
+    blocks = response["output"]["message"]["content"]
+    return "".join(b.get("text", "") for b in blocks).strip()
 
 
-# Heuristic only — approximate signal for "this figure is probably a
-# flowchart/diagram, not a text-heavy screenshot." OCR on a diagram tends to
-# return few, short, scattered words (box labels, arrows) rather than
-# coherent lines of prose. A figure with recovered key/value pairs or
-# tables is treated as clearly NOT a diagram — forms/tables imply real
-# structured content was found, not a plain graphic. Not precise; meant to
-# flag candidates for manual or vision-model review, not to decide alone.
-_DIAGRAM_MIN_WORD_COUNT = 8
-_DIAGRAM_MAX_AVG_WORDS_PER_LINE = 2.0
-
-
-def _looks_like_diagram(ocr_result: Dict[str, Any]) -> bool:
-    if ocr_result.get("key_values") or ocr_result.get("tables"):
-        return False
-    word_count = ocr_result["word_count"]
-    if word_count == 0:
-        return True
-    if word_count < _DIAGRAM_MIN_WORD_COUNT:
-        return True
-    avg_words_per_line = word_count / max(ocr_result["line_count"], 1)
-    return avg_words_per_line < _DIAGRAM_MAX_AVG_WORDS_PER_LINE
-
-
-def ocr_figures(
-    textract, pdf_bytes: bytes, figures: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Crop and analyze every detected figure (FORMS+TABLES+plain text).
-    Adds ocr_text, recovered key_values/tables, and a needs_vision_review
-    flag (heuristic — see _looks_like_diagram) to each. A figure whose
-    crop/analysis fails is marked needs_vision_review=True rather than
-    silently losing the flag for review.
+def _parse_json_array(raw: str) -> List[Dict[str, Any]]:
+    """Extract a JSON array from a model response, tolerating code fences
+    and stray prose around it.
     """
-    enriched = []
-    for fig in figures:
-        try:
-            crop_bytes = crop_figure(pdf_bytes, fig["page"], fig["bbox"])
-            ocr_result = ocr_figure_region(textract, crop_bytes)
-            enriched.append({
-                **fig,
-                "ocr_text": ocr_result["text"] or None,
-                "ocr_word_count": ocr_result["word_count"],
-                "key_values": ocr_result["key_values"],
-                "tables": ocr_result["tables"],
-                "needs_vision_review": _looks_like_diagram(ocr_result),
-            })
-        except Exception as exc:  # noqa: BLE001 — one bad figure shouldn't kill the batch
-            log.warning("figure analysis failed (page %s, id %s): %s",
-                       fig["page"], fig["figure_id"], exc)
-            enriched.append({**fig, "ocr_text": None, "key_values": [], "tables": [],
-                             "error": str(exc), "needs_vision_review": True})
-    return enriched
-
-
-
-def merge_figure_ocr(sequence: List[Dict[str, Any]], ocr_figures_list: List[Dict[str, Any]]) -> None:
-    """Attach ocr_text/key_values/tables/needs_vision_review onto the figure
-    items already in a built sequence, matched by figure_id. Mutates
-    sequence in place. Kept as a separate step so build_sequential_content()
-    stays independent of whether OCR enrichment happened at all.
-    """
-    ocr_by_id = {f["figure_id"]: f for f in ocr_figures_list}
-    for item in sequence:
-        if item["type"] != "figure":
-            continue
-        info = ocr_by_id.get(item["figure_id"])
-        if info:
-            item["ocr_text"] = info.get("ocr_text")
-            item["key_values"] = info.get("key_values", [])
-            item["tables"] = info.get("tables", [])
-            item["needs_vision_review"] = info.get("needs_vision_review", True)
-
-
-# ---------------------------------------------------------------------------
-# Output naming + job tracking
-# ---------------------------------------------------------------------------
-def _utc_timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-
-def _safe_stem(source_key: str) -> str:
-    stem = Path(source_key).stem
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)
-
-
-def output_key_for(
-    source_key: str, output_prefix: str, ext: str = ".json", timestamp: Optional[str] = None
-) -> str:
-    """Build an output S3 key: {prefix}/{source_stem}_{timestamp}{ext}.
-
-    Pass the SAME `timestamp` value across json/md/txt calls for one
-    document so all three output files share one identical timestamp,
-    making them an obviously-matched set.
-    """
-    ts = timestamp or _utc_timestamp()
-    return f"{output_prefix.rstrip('/')}/{_safe_stem(source_key)}_{ts}{ext}"
-
-
-def load_job_map(s3, bucket: str, key: str = JOB_MAP_KEY) -> Dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"```\s*$", "", text)
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return []
     try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        return json.loads(obj["Body"].read())
-    except s3.exceptions.NoSuchKey:
-        return {}
-    except s3.exceptions.ClientError as exc:
-        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            return {}
+        parsed = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def extract_candidate_terms(
+    bedrock_runtime, document_text: str,
+) -> List[Dict[str, str]]:
+    """Extract {term, context} pairs from one document's assembled text.
+    Falls back to truncating oversized documents rather than failing —
+    see MAX_DOC_CHARS_FOR_EXTRACTION.
+    """
+    text = document_text
+    if len(text) > MAX_DOC_CHARS_FOR_EXTRACTION:
+        log.warning("document is %d chars, truncating to %d for extraction",
+                   len(text), MAX_DOC_CHARS_FOR_EXTRACTION)
+        text = text[:MAX_DOC_CHARS_FOR_EXTRACTION]
+
+    raw = _call_nova(bedrock_runtime, _EXTRACTION_SYSTEM_PROMPT,
+                     _EXTRACTION_INSTRUCTIONS + text)
+    items = _parse_json_array(raw)
+
+    terms = []
+    for item in items:
+        term = (item.get("term") or "").strip()
+        context = (item.get("context") or "").strip()[:CONTEXT_SNIPPET_CHARS]
+        if term:
+            terms.append({"term": term, "context": context})
+    return terms
+
+
+# ---------------------------------------------------------------------------
+# Titan embedding
+# ---------------------------------------------------------------------------
+@retry(
+    retry=retry_if_exception_type(TextractTransientError),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    stop=stop_after_attempt(4),
+    reraise=True,
+)
+def embed_term(bedrock_runtime, term: str, context: str) -> List[float]:
+    """Embed a term together with its short context — matches the doc's
+    Section 3 step ("EMBED candidate terms + short context").
+    """
+    text = f"{term}: {context}" if context else term
+    payload = {"inputText": text or " ", "dimensions": EMBED_DIM, "normalize": True}
+    try:
+        response = bedrock_runtime.invoke_model(
+            modelId=TITAN_EMBED_MODEL_ID,
+            body=json.dumps(payload),
+            contentType="application/json",
+            accept="application/json",
+        )
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TextractTransientError(str(exc)) from exc
         raise
+    body = json.loads(response["body"].read())
+    vector = body.get("embedding")
+    if not vector:
+        raise RuntimeError(f"Titan returned no embedding: {body}")
+    return vector
 
 
-def save_job_map(s3, bucket: str, job_map: Dict[str, Any], key: str = JOB_MAP_KEY) -> None:
+def _cosine(vec_a: List[float], vec_b: List[float]) -> float:
+    # Titan v2 vectors are L2-normalized, so cosine similarity == dot product.
+    return sum(a * b for a, b in zip(vec_a, vec_b))
+
+
+# ---------------------------------------------------------------------------
+# Matching — auto-merge / no-match / judge
+# ---------------------------------------------------------------------------
+@dataclass
+class MatchResult:
+    decision: str          # "auto_merge" | "new_entry" | "judged_merge" | "judged_new"
+    matched_term_id: Optional[str]
+    similarity: Optional[float]
+
+
+def find_best_match(
+    term_vector: List[float], index_entries: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[str], float]:
+    """Return (best_matching_term_id, similarity) against existing index
+    entries' stored vectors, or (None, 0.0) if the index is empty.
+    """
+    best_id, best_sim = None, 0.0
+    for term_id, entry in index_entries.items():
+        sim = _cosine(term_vector, entry["embedding"])
+        if sim > best_sim:
+            best_id, best_sim = term_id, sim
+    return best_id, best_sim
+
+
+_JUDGE_SYSTEM_PROMPT = (
+    "You decide whether two terms from student loan/bankruptcy documents "
+    "refer to the same underlying concept. Respond with JSON only."
+)
+
+_JUDGE_INSTRUCTIONS = """\
+Term A: "{term_a}" (context: {context_a})
+Term B: "{term_b}" (context: {context_b})
+
+Do these refer to the SAME concept (e.g. "Auto Stay" and "Automatic Stay"
+are the same; "Chapter 13 Plan" and "Chapter 7 Bankruptcy" are NOT the
+same, despite being semantically close)?
+
+Respond with: {{"same_concept": true}} or {{"same_concept": false}}
+"""
+
+
+def judge_same_concept(
+    bedrock_runtime, term_a: str, context_a: str, term_b: str, context_b: str,
+) -> bool:
+    prompt = _JUDGE_INSTRUCTIONS.format(
+        term_a=term_a, context_a=context_a or "(none)",
+        term_b=term_b, context_b=context_b or "(none)",
+    )
+    raw = _call_nova(bedrock_runtime, _JUDGE_SYSTEM_PROMPT, prompt,
+                     max_tokens=64, temperature=0.0)
+    parsed = _parse_json_object(raw)
+    return bool(parsed.get("same_concept", False))
+
+
+def _parse_json_object(raw: str) -> Dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"```\s*$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return {}
+
+
+def match_term_against_index(
+    bedrock_runtime, term_vector: List[float], term: str, context: str,
+    index_entries: Dict[str, Dict[str, Any]],
+) -> MatchResult:
+    """Full matching decision for one candidate term against the existing
+    index — the auto_merge / no_match / judge branch from Section 3.
+    """
+    best_id, best_sim = find_best_match(term_vector, index_entries)
+
+    if best_id is None or best_sim <= SIM_NO_MATCH:
+        return MatchResult("new_entry", None, best_sim)
+
+    if best_sim >= SIM_AUTO_MERGE:
+        return MatchResult("auto_merge", best_id, best_sim)
+
+    # Borderline — ask Nova to decide, rather than guess from similarity alone.
+    existing = index_entries[best_id]
+    same = judge_same_concept(
+        bedrock_runtime, term, context,
+        existing["term"], existing.get("sample_context", ""),
+    )
+    if same:
+        return MatchResult("judged_merge", best_id, best_sim)
+    return MatchResult("judged_new", None, best_sim)
+
+
+# ---------------------------------------------------------------------------
+# Page-location recovery — no LLM call, just string search against the
+# document's already page-tagged content_sequence.
+# ---------------------------------------------------------------------------
+def find_term_pages(term: str, content_sequence: List[Dict[str, Any]]) -> List[int]:
+    pages: List[int] = []
+    needle = term.lower()
+    for item in content_sequence:
+        # Concatenate every text-bearing field rather than picking the
+        # first that exists — a key_value item's match might be in its
+        # VALUE even though it also has a (non-matching) KEY.
+        haystack = " ".join(
+            str(item.get(field, "")) for field in ("text", "key", "value")
+        ).lower()
+        if needle in haystack:
+            page = item.get("page")
+            if page is not None and page not in pages:
+                pages.append(page)
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# Per-document processing + top-level orchestration
+# ---------------------------------------------------------------------------
+def process_document_for_index(
+    bedrock_runtime, source_key: str, document_text: str,
+    content_sequence: List[Dict[str, Any]], index_entries: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Extract terms from one document and merge them into index_entries
+    (mutated in place). Returns a small per-document summary.
+    """
+    candidates = extract_candidate_terms(bedrock_runtime, document_text)
+    new_count, merged_count = 0, 0
+
+    for candidate in candidates:
+        term, context = candidate["term"], candidate["context"]
+        vector = embed_term(bedrock_runtime, term, context)
+        result = match_term_against_index(
+            bedrock_runtime, vector, term, context, index_entries,
+        )
+        pages = find_term_pages(term, content_sequence)
+        source = {"document": source_key, "pages": pages}
+
+        if result.decision in ("auto_merge", "judged_merge"):
+            entry = index_entries[result.matched_term_id]
+            if term not in entry["aliases"] and term != entry["term"]:
+                entry["aliases"].append(term)
+            entry["sources"].append(source)
+            entry["occurrence_count"] += 1
+            merged_count += 1
+        else:
+            term_id = re.sub(r"[^a-z0-9]+", "_", term.lower()).strip("_")
+            index_entries[term_id] = {
+                "term": term,
+                "aliases": [],
+                "sources": [source],
+                "occurrence_count": 1,
+                "embedding": vector,
+                "sample_context": context,
+            }
+            new_count += 1
+
+    log.info("%s: %d candidates -> %d new, %d merged",
+             source_key, len(candidates), new_count, merged_count)
+    return {"source_key": source_key, "candidates": len(candidates),
+            "new_entries": new_count, "merged": merged_count}
+
+
+def build_index_from_job_map(
+    bucket: str, region: str = "us-east-1",
+) -> Dict[str, Any]:
+    """Walk every successfully-processed document (via job_map.json, same
+    registry tree_builder.py uses) and build the term index across all of
+    them.
+    """
+    s3 = boto3.client("s3", region_name=region)
+    bedrock_runtime = boto3.client("bedrock-runtime", region_name=region)
+    job_map = load_job_map(s3, bucket)
+
+    index_entries: Dict[str, Dict[str, Any]] = {}
+    summaries: List[Dict[str, Any]] = []
+
+    for entry in job_map.values():
+        if entry.get("status") != "SUCCEEDED":
+            continue
+        output_key = entry.get("output_key")
+        if not output_key:
+            continue
+        obj = s3.get_object(Bucket=bucket, Key=output_key)
+        doc_output = json.loads(obj["Body"].read())
+
+        source_key = doc_output.get("source_key", output_key)
+        document_text = doc_output.get("document_markdown", "")
+        content_sequence = doc_output.get("content_sequence", [])
+
+        summary = process_document_for_index(
+            bedrock_runtime, source_key, document_text, content_sequence, index_entries,
+        )
+        summaries.append(summary)
+
+    # Strip the embedding vectors before returning the public index —
+    # they're only needed internally for matching, not useful to a reader.
+    public_index = {
+        term_id: {k: v for k, v in entry.items() if k not in ("embedding", "sample_context")}
+        for term_id, entry in index_entries.items()
+    }
+    return {"terms": public_index, "_document_summaries": summaries}
+
+
+def save_index(bucket: str, index: Dict[str, Any], region: str = "us-east-1",
+              key: str = INDEX_KEY) -> str:
+    s3 = boto3.client("s3", region_name=region)
     s3.put_object(
         Bucket=bucket, Key=key,
-        Body=json.dumps(job_map, indent=2, ensure_ascii=False).encode(),
+        Body=json.dumps(index, indent=2, ensure_ascii=False).encode("utf-8"),
         ContentType="application/json",
     )
+    return f"s3://{bucket}/{key}"
+
+
+def load_index(bucket: str, region: str = "us-east-1", key: str = INDEX_KEY) -> Dict[str, Any]:
+    s3 = boto3.client("s3", region_name=region)
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return json.loads(obj["Body"].read())
 
 
 # ---------------------------------------------------------------------------
-# Orchestration
+# Validation — the deterministic checks. Precision/recall against ground
+# truth needs a human-reviewed sample; this only catches structural issues.
 # ---------------------------------------------------------------------------
-def process_document(
-    source_bucket: str,
-    source_key: str,
-    output_bucket: str,
-    output_prefix: str,
-    region: str = "us-east-1",
-) -> DocumentResult:
-    textract = boto3.client("textract", region_name=region)
-    s3 = boto3.client("s3", region_name=region)
+def validate_index(index: Dict[str, Any]) -> List[str]:
+    warnings: List[str] = []
+    terms = index.get("terms", {})
 
-    job_map = load_job_map(s3, output_bucket)
-    request_token = _request_token(source_bucket, source_key, DEFAULT_FEATURE_TYPES)
+    if not terms:
+        warnings.append("Index has zero terms — extraction may have failed for every document.")
+        return warnings
 
-    job_id = start_analysis(textract, source_bucket, source_key)
-    log.info("started job %s for %s", job_id, source_key)
-
-    result_raw = wait_for_job(textract, job_id)
-    status = result_raw["JobStatus"]
-
-    if status != "SUCCEEDED":
-        error = result_raw.get("StatusMessage", f"job ended with status {status}")
-        job_map[request_token] = {
-            "source_key": source_key, "job_id": job_id, "status": status,
-            "error": error, "processed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        save_job_map(s3, output_bucket, job_map)
-        return DocumentResult(source_bucket, source_key, job_id, status, error=error)
-
-    blocks = result_raw["Blocks"]
-    line_count = sum(1 for b in blocks if b["BlockType"] == "LINE")
-    text_pages = extract_text(blocks)
-    tables = tables_to_markdown(blocks)
-    form_fields = forms_to_keyvalues(blocks)
-    figures = find_figures(blocks)  # location only, before OCR enrichment
-
-    sequence = build_sequential_content(blocks, tables, form_fields)
-
-    if figures:
-        pdf_obj = s3.get_object(Bucket=source_bucket, Key=source_key)
-        pdf_bytes = pdf_obj["Body"].read()
-        figures = ocr_figures(textract, pdf_bytes, figures)  # Textract OCR only
-        merge_figure_ocr(sequence, figures)
-        needing_review = sum(1 for f in figures if f.get("needs_vision_review"))
-        if needing_review:
-            log.info("%d/%d figures flagged as likely diagrams (short/"
-                     "fragmented OCR) — may need manual or vision review.",
-                     needing_review, len(figures))
-
-    toc_markdown = build_table_of_contents(sequence)
-    toc_plain = build_table_of_contents_plain(sequence)
-    body_markdown = sequence_to_markdown(sequence)
-    body_plain_text = sequence_to_plain_text(sequence)
-
-    document_markdown = f"{toc_markdown}\n\n---\n\n{body_markdown}" if toc_markdown else body_markdown
-    document_plain_text = f"{toc_plain}\n\n---\n\n{body_plain_text}" if toc_plain else body_plain_text
-
-    # One shared timestamp -> json/md/txt for this document are an obvious
-    # matched set, e.g. Phone_Guide_20260719_143012.{json,md,txt}
-    timestamp = _utc_timestamp()
-    json_key = output_key_for(source_key, output_prefix, ".json", timestamp)
-    markdown_key = output_key_for(source_key, output_prefix, ".md", timestamp)
-    text_key = output_key_for(source_key, output_prefix, ".txt", timestamp)
-
-    output_body = {
-        "source_bucket": source_bucket,
-        "source_key": source_key,
-        "job_id": job_id,
-        "processed_at": datetime.now(timezone.utc).isoformat(),
-        "line_count": line_count,
-        "text": text_pages,
-        "text_markdown": text_to_markdown(text_pages),
-        "tables": tables,
-        "form_fields": form_fields,
-        "figures": figures,
-        "content_sequence": sequence,
-        "table_of_contents": toc_markdown,
-        "document_markdown": document_markdown,
-        "raw_block_count": len(blocks),
-    }
-    s3.put_object(
-        Bucket=output_bucket, Key=json_key,
-        Body=json.dumps(output_body, indent=2, ensure_ascii=False).encode(),
-        ContentType="application/json",
-    )
-    s3.put_object(
-        Bucket=output_bucket, Key=markdown_key,
-        Body=document_markdown.encode("utf-8"),
-        ContentType="text/markdown",
-    )
-    s3.put_object(
-        Bucket=output_bucket, Key=text_key,
-        Body=document_plain_text.encode("utf-8"),
-        ContentType="text/plain",
-    )
-
-    job_map[request_token] = {
-        "source_key": source_key, "job_id": job_id, "status": "SUCCEEDED",
-        "output_key": json_key, "markdown_key": markdown_key, "text_key": text_key,
-        "table_count": len(tables), "figure_count": len(figures),
-        "processed_at": output_body["processed_at"],
-    }
-    save_job_map(s3, output_bucket, job_map)
-
-    log.info("done: %s -> %s / %s / %s (%d tables, %d figures)",
-             source_key, json_key, markdown_key, text_key, len(tables), len(figures))
-
-    return DocumentResult(
-        source_bucket, source_key, job_id, "SUCCEEDED",
-        output_key=json_key, markdown_key=markdown_key, text_key=text_key,
-        tables=tables, figures=figures, line_count=line_count,
-    )
-
-
-def process_batch(
-    source_bucket: str,
-    source_prefix: str,
-    output_bucket: str,
-    output_prefix: str,
-    region: str = "us-east-1",
-    skip_existing: bool = True,
-) -> List[DocumentResult]:
-    s3 = boto3.client("s3", region_name=region)
-    job_map = load_job_map(s3, output_bucket) if skip_existing else {}
-
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = [
-        obj["Key"]
-        for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix)
-        for obj in page.get("Contents", [])
-        if obj["Key"].lower().endswith(".pdf")
-    ]
-
-    results = []
-    for key in keys:
-        token = _request_token(source_bucket, key, DEFAULT_FEATURE_TYPES)
-        if skip_existing and job_map.get(token, {}).get("status") == "SUCCEEDED":
-            log.info("skip (already processed): %s", key)
+    seen_term_names: Dict[str, str] = {}
+    for term_id, entry in terms.items():
+        term_text = entry.get("term", "").strip()
+        if not term_text:
+            warnings.append(f"{term_id}: empty term text.")
             continue
-        try:
-            results.append(process_document(source_bucket, key, output_bucket, output_prefix, region))
-        except Exception as exc:  # noqa: BLE001 — one bad file shouldn't kill the batch
-            log.exception("failed: %s", key)
-            results.append(DocumentResult(source_bucket, key, "", "ERROR", error=str(exc)))
+        if len(term_text) <= 2:
+            warnings.append(f"{term_id}: suspiciously short term '{term_text}' — "
+                           f"possible extraction noise.")
 
-    return results
+        lower = term_text.lower()
+        if lower in seen_term_names:
+            warnings.append(f"Possible duplicate entries: '{term_text}' and "
+                           f"'{seen_term_names[lower]}' — matching may have missed this pair.")
+        seen_term_names[lower] = term_text
+
+        if not entry.get("sources"):
+            warnings.append(f"{term_id} ('{term_text}'): no sources recorded.")
+
+        if entry.get("occurrence_count", 0) != len(entry.get("sources", [])):
+            warnings.append(f"{term_id} ('{term_text}'): occurrence_count does not match "
+                           f"the number of recorded sources.")
+
+    return warnings
 ###
 """Textract-only ingestion pipeline: Layout + Tables extraction, ordered by
 physical page position, written as three timestamped output files per
