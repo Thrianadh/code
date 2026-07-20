@@ -1,78 +1,169 @@
-"""Process one document through Textract, then build and validate the
-corpus tree from it.
+"""Corpus-level Tree: aggregates per-document structure (already extracted
+by textract_pipeline.py) into one navigable Root -> Document -> Section
+tree, per the Unsupervised Labeling Utility doc's Section 4d.
 
-Edit the four values in CONFIG below, then run:
-    python run_single_document.py
+No LLM calls anywhere in this module — the tree is fully derived from
+Textract's own detected LAYOUT_TITLE/LAYOUT_SECTION_HEADER blocks, already
+extracted and tested in textract_pipeline.py. This is the "primary
+navigation layer" the doc's Section 2 describes; the Index (separate,
+LLM-based) is its complement, closing the cross-branch blind spot.
+
+Usage:
+    from tree_builder import build_corpus_tree_from_job_map, validate_tree
+
+    tree = build_corpus_tree_from_job_map(
+        bucket="bankrupcy-data-bkt", region="us-east-1",
+    )
+    warnings = validate_tree(tree)
+    for w in warnings:
+        print("WARNING:", w)
 """
 import json
 import logging
-import sys
+from pathlib import Path
+from typing import Any, Dict, List
 
-from textract_pipeline import process_document
-from tree_builder import build_corpus_tree_from_job_map, save_tree, validate_tree
+import boto3
 
-# ---------------------------------------------------------------------------
-# CONFIG — edit these four values for your file
-# ---------------------------------------------------------------------------
-SOURCE_BUCKET = "bankrupcy-data-bkt"
-SOURCE_KEY = "Ecmc_scrape_understand_bankruptcy/Phone Guide.pdf"
-OUTPUT_BUCKET = "bankrupcy-data-bkt"
-OUTPUT_PREFIX = "textract-output"
-REGION = "us-east-1"
-# ---------------------------------------------------------------------------
+from textract_pipeline import extract_toc_entries, load_job_map
+
+log = logging.getLogger(__name__)
+
+TREE_KEY = "textract-jobs/corpus_tree.json"
 
 
-def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+def _document_display_title(source_key: str, toc_entries: List[Dict[str, Any]]) -> str:
+    """Prefer the document's own detected title; fall back to the filename
+    if no LAYOUT_TITLE was found (some documents may only have section
+    headers, no top-level title).
+    """
+    for entry in toc_entries:
+        if entry["type"] == "title":
+            return entry["text"]
+    return Path(source_key).stem
+
+
+def build_document_tree_node(source_key: str, sequence: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """One document's node: its display title plus an ordered list of its
+    section headers (page-tagged).
+    """
+    toc_entries = extract_toc_entries(sequence)
+    sections = [
+        {"heading": e["text"], "page": e["page"]}
+        for e in toc_entries if e["type"] == "section_header"
+    ]
+    return {
+        "document": source_key,
+        "title": _document_display_title(source_key, toc_entries),
+        "sections": sections,
+    }
+
+
+def build_corpus_tree(document_nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Wrap per-document nodes into the corpus-level root structure."""
+    return {"root": document_nodes}
+
+
+def build_corpus_tree_from_job_map(
+    bucket: str, region: str = "us-east-1", job_map_key: str = None,
+) -> Dict[str, Any]:
+    """Read every successfully-processed document's JSON output (via the
+    existing job_map.json) and build one combined corpus tree. No new
+    Textract or LLM calls — this only reads outputs already produced by
+    process_document()/process_batch().
+    """
+    s3 = boto3.client("s3", region_name=region)
+    job_map = load_job_map(s3, bucket, job_map_key) if job_map_key else load_job_map(s3, bucket)
+
+    document_nodes: List[Dict[str, Any]] = []
+    skipped = 0
+    for token, entry in job_map.items():
+        if entry.get("status") != "SUCCEEDED":
+            skipped += 1
+            continue
+        output_key = entry.get("output_key")
+        if not output_key:
+            skipped += 1
+            continue
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=output_key)
+            doc_output = json.loads(obj["Body"].read())
+        except Exception as exc:  # noqa: BLE001 — one bad doc shouldn't kill the batch
+            log.warning("could not load output for token %s (%s): %s", token, output_key, exc)
+            skipped += 1
+            continue
+
+        sequence = doc_output.get("content_sequence", [])
+        document_nodes.append(
+            build_document_tree_node(doc_output.get("source_key", output_key), sequence)
+        )
+
+    if skipped:
+        log.info("skipped %d job_map entries (not succeeded or output missing)", skipped)
+    log.info("built tree from %d documents", len(document_nodes))
+
+    return build_corpus_tree(document_nodes)
+
+
+def save_tree(bucket: str, tree: Dict[str, Any], region: str = "us-east-1",
+             key: str = TREE_KEY) -> str:
+    s3 = boto3.client("s3", region_name=region)
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(tree, indent=2, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json",
     )
-    log = logging.getLogger("run_single_document")
-
-    log.info("Processing: s3://%s/%s", SOURCE_BUCKET, SOURCE_KEY)
-    result = process_document(
-        source_bucket=SOURCE_BUCKET,
-        source_key=SOURCE_KEY,
-        output_bucket=OUTPUT_BUCKET,
-        output_prefix=OUTPUT_PREFIX,
-        region=REGION,
-    )
-
-    if result.status != "SUCCEEDED":
-        log.error("Textract job did not succeed. status=%s error=%s",
-                 result.status, result.error)
-        return 1
-
-    log.info("Done: %d tables, %d figures, %d lines",
-             len(result.tables), len(result.figures), result.line_count)
-    log.info("  json:     s3://%s/%s", OUTPUT_BUCKET, result.output_key)
-    log.info("  markdown: s3://%s/%s", OUTPUT_BUCKET, result.markdown_key)
-    log.info("  text:     s3://%s/%s", OUTPUT_BUCKET, result.text_key)
-
-    log.info("Building corpus tree from job map...")
-    tree = build_corpus_tree_from_job_map(bucket=OUTPUT_BUCKET, region=REGION)
-
-    warnings = validate_tree(tree)
-    if warnings:
-        log.warning("Tree validation found %d issue(s):", len(warnings))
-        for w in warnings:
-            log.warning("  - %s", w)
-    else:
-        log.info("Tree validation: no issues found.")
-
-    tree_uri = save_tree(OUTPUT_BUCKET, tree, region=REGION)
-    log.info("Tree saved: %s", tree_uri)
-
-    log.info("Documents in tree so far: %d", len(tree["root"]))
-    print(json.dumps(tree, indent=2, ensure_ascii=False)[:1000])
-
-    return 0
+    return f"s3://{bucket}/{key}"
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def load_tree(bucket: str, region: str = "us-east-1", key: str = TREE_KEY) -> Dict[str, Any]:
+    s3 = boto3.client("s3", region_name=region)
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return json.loads(obj["Body"].read())
+
+
+# ---------------------------------------------------------------------------
+# Validation — fully automated, no LLM needed since the tree is deterministic
+# ---------------------------------------------------------------------------
+def validate_tree(tree: Dict[str, Any]) -> List[str]:
+    """Sanity-check the tree structure. Returns a list of human-readable
+    warning strings; an empty list means no issues found. Does not raise —
+    callers decide whether warnings are acceptable for their use case.
+    """
+    warnings: List[str] = []
+    documents = tree.get("root", [])
+
+    if not documents:
+        warnings.append("Tree has zero documents — job_map may be empty or all failed.")
+        return warnings
+
+    seen_document_keys: set = set()
+    for doc in documents:
+        doc_key = doc.get("document", "<unknown>")
+
+        if doc_key in seen_document_keys:
+            warnings.append(f"Duplicate document entry in tree: {doc_key}")
+        seen_document_keys.add(doc_key)
+
+        sections = doc.get("sections", [])
+        if not sections:
+            warnings.append(f"{doc_key}: no sections detected at all (title-only or "
+                           f"heading detection may have failed for this document).")
+            continue
+
+        seen_headings_this_doc: set = set()
+        for section in sections:
+            heading = section.get("heading", "").strip()
+            if not heading:
+                warnings.append(f"{doc_key}: section with empty/missing heading text "
+                               f"(page {section.get('page', '?')}).")
+                continue
+            if heading in seen_headings_this_doc:
+                warnings.append(f"{doc_key}: duplicate section heading '{heading}' "
+                               f"appears more than once — possible mis-parse.")
+            seen_headings_this_doc.add(heading)
+
+    return warnings
 ###
 """Textract-only ingestion pipeline: Layout + Tables extraction, ordered by
 physical page position, written as three timestamped output files per
