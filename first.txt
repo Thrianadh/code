@@ -1,3 +1,23 @@
+# claude 
+Claude Sonnet 4						No access
+us.anthropic.claude-sonnet-4-6				No access
+us.anthropic.claude-haiku-4-5-20251001-v1:0		No access
+us.anthropic.claude-opus-4-6-v1				Access
+us.anthropic.claude-opus-4-8				No access
+us.anthropic.claude-opus-4-7				Access
+us.anthropic.claude-sonnet-4-5-20250929-v1:0		Access
+us.anthropic.claude-sonnet-5				No access
+
+# Amazon model
+us.amazon.nova-2-lite-v1:0				Access
+us.amazon.nova-pro-v1:0					Access
+
+## mistral 
+us.mistral.magistral-small-2509				Access
+us.mistral.ministral-3-3b-instruct			Access
+us.mistral.mistral-7b-instruct-v0:2			No access
+us.mistral.mixtral-8x7b-instruct-v0:1			No access
+us.mistral.mistral-large-2402-v1:0			No access
 """
 ECMC unified scraper — dynamic crawler with configurable scope.
 
