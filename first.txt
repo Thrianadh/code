@@ -1,3 +1,940 @@
+"""
+ECMC unified scraper — dynamic crawler with configurable scope.
+
+Scope modes:
+  1. Multiple section prefixes  -> section_prefixes=["/borrowers/understand-bankruptcy",
+                                                     "/borrowers/repayment-options"]
+  2. Full domain                -> allow_full_domain=True  (ignores section_prefixes)
+  3. Single section (default)   -> auto-derived from the start URL
+
+Language filtering:
+  exclude_languages=["spanish"]  -> PDFs detected as Spanish are NOT uploaded to S3
+                                    or summarised; they're recorded only as audit
+                                    entries with status="skipped_excluded_language".
+
+OCR fallback:
+  bedrock_ocr_fallback=True      -> when PyPDF2 cannot extract text (scanned / image
+                                    PDFs), retry via Bedrock Claude multimodal so the
+                                    document still gets text, language detection,
+                                    summarisation, and language-filter coverage.
+
+Bounded by max_depth (BFS hops) and/or max_pages.
+"""
+
+import os
+import re
+import json
+import time
+import hashlib
+import boto3
+import requests
+from collections import deque, Counter
+from datetime import datetime
+from io import BytesIO
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Set, Iterable
+from warnings import filterwarnings
+
+filterwarnings("ignore", category=UserWarning, module="bs4")
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+S3_BUCKET = "ecmc-dev-bucket"
+# S3_BASE_PREFIX = "ecmc_scrape_data"
+S3_BASE_PREFIX = "Ecmc_scrape_understand_bankruptcy"
+
+BEDROCK_REGION = "us-east-1"
+BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+
+# Bedrock document-input size cap is ~4.5 MB per file. Larger PDFs need to be
+# split — out of scope for this iteration. Bypass OCR for anything bigger and
+# flag it in the record.
+BEDROCK_DOC_SIZE_LIMIT_BYTES = 4_500_000
+
+SKIP_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico",
+    ".css", ".js", ".zip", ".doc", ".docx", ".xls", ".xlsx",
+    ".mp3", ".mp4", ".avi", ".mov", ".xml", ".json", ".rss", ".atom",
+)
+
+# Language alias table — Bedrock can return any of these forms for a given
+# language. We canonicalise so the exclude filter doesn't miss obvious cases.
+_LANG_ALIASES: Dict[str, Set[str]] = {
+    "spanish":     {"spanish", "español", "espanol", "castellano",
+                    "es", "es-es", "es-mx", "es-la", "es-419", "sp", "esp"},
+    "english":     {"english", "en", "en-us", "en-gb", "eng"},
+    "french":      {"french", "français", "francais", "fr", "fr-fr", "fr-ca"},
+    "portuguese":  {"portuguese", "português", "portugues",
+                    "pt", "pt-br", "pt-pt"},
+    "german":      {"german", "deutsch", "de", "de-de"},
+    "italian":     {"italian", "italiano", "it", "it-it"},
+    "chinese":     {"chinese", "mandarin", "zh", "zh-cn", "zh-tw"},
+}
+
+# ----------------------------------------------------------------------------
+# AWS clients
+# ----------------------------------------------------------------------------
+s3_client = boto3.client("s3", region_name="us-east-1")
+bedrock_client = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+def generate_folder_name(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.strip("/")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if path:
+        last_segment = path.split("/")[-1] if "/" in path else path
+        last_segment = re.sub(
+            r"\.(html|htm|php|asp|aspx|jsp)$", "", last_segment, flags=re.IGNORECASE
+        )
+        clean_name = re.sub(r"[^a-zA-Z0-9]+", "_", last_segment).strip("_")[:80]
+        if not clean_name:
+            clean_name = re.sub(r"[^a-zA-Z0-9]+", "_", parsed.netloc).strip("_")
+    else:
+        clean_name = re.sub(r"[^a-zA-Z0-9]+", "_", parsed.netloc).strip("_")
+
+    return f"{clean_name}_{timestamp}"
+
+
+def derive_section_prefix(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    if "." in path.split("/")[-1]:
+        path = "/".join(path.split("/")[:-1])
+    return path or "/"
+
+
+def normalize_url(url: str) -> str:
+    return url.split("#")[0].rstrip("/")
+
+
+def normalize_prefix(prefix: str) -> str:
+    p = prefix.strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return p.rstrip("/") or "/"
+
+
+def canon_language(s: str) -> str:
+    """Reduce a Bedrock-returned language label to a canonical form."""
+    if not s:
+        return ""
+    cleaned = re.sub(r"[^\w\-]", "", s.strip().lower())
+    for canon, aliases in _LANG_ALIASES.items():
+        if cleaned in aliases:
+            return canon
+    return cleaned
+
+
+def is_excluded_language(detected: str, exclude_list: Iterable[str]) -> bool:
+    if not exclude_list:
+        return False
+    detected_canon = canon_language(detected)
+    if not detected_canon:
+        return False
+    excluded_canon = {canon_language(x) for x in exclude_list}
+    return detected_canon in excluded_canon
+
+
+def sanitize_doc_name(name: str) -> str:
+    """Bedrock document name spec: alphanumeric, whitespace, hyphens, parens, brackets."""
+    cleaned = re.sub(r"[^a-zA-Z0-9\s\-\(\)\[\]]", " ", name or "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned[:50] or "document"
+
+
+def s3_put_object(key: str, body, content_type: str = "text/plain") -> str:
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    s3_client.put_object(
+        Bucket=S3_BUCKET, Key=key, Body=body, ContentType=content_type
+    )
+    return f"s3://{S3_BUCKET}/{key}"
+
+
+# ----------------------------------------------------------------------------
+# Bedrock wrappers
+# ----------------------------------------------------------------------------
+def bedrock_call(prompt: str, max_tokens: int = 500) -> str:
+    try:
+        resp = bedrock_client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.3},
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as e:
+        return f"[ERROR: {e}]"
+
+
+def bedrock_pdf_ocr(pdf_bytes: bytes, title_hint: str = "document",
+                    max_tokens: int = 4096) -> str:
+    """
+    OCR / text extraction via Bedrock Claude multimodal.
+
+    Uses the converse() API's document content block — accepts raw PDF bytes,
+    no rasterisation needed. Handles scanned PDFs, form fields, and mixed
+    text+image documents that PyPDF2 cannot.
+
+    Returns the extracted text, or "[OCR ERROR: ...]" on failure.
+    """
+    if not pdf_bytes:
+        return "[OCR ERROR: empty bytes]"
+    if len(pdf_bytes) > BEDROCK_DOC_SIZE_LIMIT_BYTES:
+        return (f"[OCR ERROR: PDF size {len(pdf_bytes)/1024/1024:.1f} MB exceeds "
+                f"Bedrock document limit ({BEDROCK_DOC_SIZE_LIMIT_BYTES/1024/1024:.1f} MB)]")
+
+    prompt = (
+        "Extract all visible text from this PDF exactly as it appears. "
+        "Preserve structure: paragraphs, headings, form labels, table cells, "
+        "checkbox options, signature lines. If the document is not in English, "
+        "transcribe it in its original language without translating. "
+        "Return only the extracted text — no commentary, no markdown wrappers."
+    )
+
+    try:
+        resp = bedrock_client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"document": {
+                        "format": "pdf",
+                        "name": sanitize_doc_name(title_hint),
+                        "source": {"bytes": pdf_bytes},
+                    }},
+                    {"text": prompt},
+                ],
+            }],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0},
+        )
+        text = resp["output"]["message"]["content"][0]["text"]
+        return text.strip() if text and text.strip() else "[OCR ERROR: empty response]"
+    except Exception as e:
+        return f"[OCR ERROR: {e}]"
+
+
+def detect_language(text: str) -> str:
+    if not text or len(text.strip()) < 10:
+        return "unknown"
+    prompt = (
+        "What language is the following text? Respond with ONLY the language name.\n\n"
+        f"Text sample: {text[:500]}\n\nLanguage:"
+    )
+    return bedrock_call(prompt, max_tokens=20).strip().lower().replace(".", "")
+
+
+def summarize_pdf(text: str, title: str) -> str:
+    prompt = (
+        f"Summarize the following document in 3-4 sentences.\n\n"
+        f"Title: {title}\nContent: {text[:8000]}\n\n"
+        f"Highlight: main topic, key advice, and target audience."
+    )
+    return bedrock_call(prompt, max_tokens=500)
+
+
+# ----------------------------------------------------------------------------
+# Crawler
+# ----------------------------------------------------------------------------
+class SectionCrawler:
+    """Walks HTML pages within scope and harvests every PDF link along the way."""
+
+    def __init__(
+        self,
+        s3_prefix: str,
+        base_domain: str,
+        section_prefixes: Optional[List[str]] = None,
+        allow_full_domain: bool = False,
+        delay: float = 0.5,
+        max_pages: Optional[int] = None,
+        max_depth: Optional[int] = None,
+        request_timeout: int = 20,
+        verbose: bool = False,
+    ):
+        self.s3_prefix = s3_prefix
+        self.base_domain = base_domain.replace("www.", "")
+        self.allow_full_domain = allow_full_domain
+        self.section_prefixes = [normalize_prefix(p) for p in (section_prefixes or [])]
+        self.delay = delay
+        self.max_pages = max_pages
+        self.max_depth = max_depth
+        self.request_timeout = request_timeout
+        self.verbose = verbose
+
+        self.visited: Set[str] = set()
+        self.queued: Set[str] = set()
+        self.pdf_catalog: Dict[str, Dict] = {}
+        self.reject_stats: Counter = Counter()
+        self._to_visit: deque = deque()
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        })
+
+    def _same_site(self, url: str) -> bool:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.netloc.replace("www.", "")
+        return host == self.base_domain or host.endswith("." + self.base_domain)
+
+    def _in_scope(self, url: str) -> bool:
+        if self.allow_full_domain:
+            return True
+        if not self.section_prefixes:
+            return True
+        path = urlparse(url).path.rstrip("/") or "/"
+        for prefix in self.section_prefixes:
+            if path == prefix or path.startswith(prefix + "/"):
+                return True
+        return False
+
+    def _classify_link(self, url: str) -> Tuple[str, str]:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return "reject", "bad_scheme"
+        if not self._same_site(url):
+            return "reject", "off_site"
+
+        path_lower = parsed.path.lower()
+        if path_lower.endswith(".pdf"):
+            return "pdf", "pdf"
+        if path_lower.endswith(SKIP_EXTENSIONS):
+            return "reject", "binary_extension"
+        if not self._in_scope(url):
+            return "reject", "out_of_scope"
+
+        return "crawl", "in_scope"
+
+    def _html_filename(self, url: str) -> str:
+        parsed = urlparse(url)
+        path = parsed.path.strip("/")
+        if path:
+            safe_path = re.sub(r"[^a-zA-Z0-9._-]+", "_", path.replace("/", "_"))
+            base = safe_path[:100]
+        else:
+            base = "index"
+        domain = parsed.netloc.replace("www.", "")
+        full = f"{domain}_{base}"
+        if len(full) > 150:
+            full = f"{domain}_{hashlib.md5(url.encode()).hexdigest()[:8]}"
+        return f"{full}.txt"
+
+    def _record_pdf(self, anchor_tag, full_url: str, source_page: str) -> None:
+        if full_url in self.pdf_catalog:
+            self.pdf_catalog[full_url]["referrers"].add(source_page)
+            return
+
+        title = anchor_tag.get_text(strip=True)
+        if not title:
+            parent = anchor_tag.find_parent(["h1", "h2", "h3", "h4", "li"])
+            if parent:
+                title = parent.get_text(strip=True)
+        if not title:
+            title = Path(urlparse(full_url).path).stem.replace("-", " ").title()
+
+        self.pdf_catalog[full_url] = {
+            "title": title[:150],
+            "url": full_url,
+            "filename": Path(urlparse(full_url).path).name,
+            "first_seen_on": source_page,
+            "referrers": {source_page},
+        }
+
+    def _scrape_page(self, url: str, depth: int) -> Tuple[bool, str]:
+        self.visited.add(url)
+        link_counts: Counter = Counter()
+
+        try:
+            print(f"  [HTML d={depth}] {url}")
+            resp = self.session.get(url, timeout=self.request_timeout, allow_redirects=True)
+            resp.raise_for_status()
+
+            ctype = resp.headers.get("content-type", "").lower()
+            if "text/html" not in ctype and "application/xhtml" not in ctype:
+                return False, f"Non-HTML: {ctype}"
+
+            final_url = normalize_url(resp.url)
+            if not self._same_site(final_url):
+                return False, f"Redirected off-site: {final_url}"
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                    link_counts["non_http"] += 1
+                    continue
+                full = normalize_url(urljoin(url, href))
+                category, reason = self._classify_link(full)
+                link_counts[reason] += 1
+
+                if category == "pdf":
+                    self._record_pdf(a, full, source_page=url)
+                elif category == "crawl":
+                    if full not in self.visited and full not in self.queued:
+                        if self.max_depth is None or depth + 1 <= self.max_depth:
+                            self.queued.add(full)
+                            self._to_visit.append((full, depth + 1))
+                        else:
+                            link_counts["depth_capped"] += 1
+                            self.reject_stats["depth_capped"] += 1
+                else:
+                    self.reject_stats[reason] += 1
+                    if self.verbose:
+                        print(f"        rejected ({reason}): {full}")
+
+            for el in soup(["script", "style", "noscript", "meta", "link"]):
+                el.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            clean_text = "\n".join(lines)
+
+            key = f"{self.s3_prefix}/web_text/{self._html_filename(url)}"
+            content = f"Source URL: {url}\n{'=' * 80}\n\n{clean_text}"
+            s3_path = s3_put_object(key, content, "text/plain")
+
+            print(
+                f"        links: {sum(link_counts.values())} total | "
+                f"in_scope={link_counts.get('in_scope', 0)} | "
+                f"pdf={link_counts.get('pdf', 0)} | "
+                f"out_of_scope={link_counts.get('out_of_scope', 0)} | "
+                f"off_site={link_counts.get('off_site', 0)}"
+            )
+            return True, s3_path
+
+        except Exception as e:
+            return False, f"Error: {e}"
+
+    def crawl(self, seed_urls: List[str]) -> Dict:
+        scope_desc = (
+            "FULL DOMAIN" if self.allow_full_domain
+            else f"prefixes={self.section_prefixes}"
+        )
+        print(
+            f"\n{'=' * 60}\n"
+            f"Crawling {self.base_domain}\n"
+            f"  scope:     {scope_desc}\n"
+            f"  max_depth: {self.max_depth if self.max_depth is not None else 'unlimited'}\n"
+            f"  max_pages: {self.max_pages if self.max_pages else 'unlimited'}\n"
+            f"  seeds:     {seed_urls}\n"
+            f"{'=' * 60}"
+        )
+
+        for seed in seed_urls:
+            seed = normalize_url(seed)
+            if seed not in self.queued:
+                self.queued.add(seed)
+                self._to_visit.append((seed, 0))
+
+        result = {"scraped": 0, "failed": 0, "s3_files": [], "max_depth_seen": 0}
+
+        while self._to_visit:
+            if self.max_pages and result["scraped"] >= self.max_pages:
+                print(f"  Reached max_pages={self.max_pages}; stopping.")
+                break
+
+            url, depth = self._to_visit.popleft()
+            if url in self.visited:
+                continue
+
+            ok, msg = self._scrape_page(url, depth)
+            result["max_depth_seen"] = max(result["max_depth_seen"], depth)
+
+            if ok:
+                result["scraped"] += 1
+                result["s3_files"].append(msg)
+            else:
+                result["failed"] += 1
+                print(f"      skipped: {msg}")
+
+            if self._to_visit and self.delay > 0:
+                time.sleep(self.delay)
+
+        result["pdf_count"] = len(self.pdf_catalog)
+        result["reject_stats"] = dict(self.reject_stats)
+
+        print(
+            f"\n  HTML pages scraped: {result['scraped']}"
+            f" | failed: {result['failed']}"
+            f" | unique PDFs: {result['pdf_count']}"
+            f" | deepest reached: d={result['max_depth_seen']}"
+        )
+        if self.reject_stats:
+            print(f"  Rejected-link tally: {dict(self.reject_stats)}")
+        return result
+
+
+# ----------------------------------------------------------------------------
+# PDF processor — PyPDF2 first, optional Bedrock OCR fallback for image PDFs.
+# ----------------------------------------------------------------------------
+class PDFProcessor:
+    """
+    Download PDFs, extract text, language-detect, optionally filter, summarise.
+
+    Extraction strategy:
+        1. PyPDF2 (fast, free, handles text-based PDFs).
+        2. If PyPDF2 fails AND bedrock_ocr_fallback=True, retry via
+           Bedrock Claude multimodal (handles scanned / image-only PDFs).
+        3. If both fail, record status="processed_no_text" and move on.
+
+    Language filtering, when enabled, applies AFTER extraction and works
+    identically regardless of which path produced the text — so a scanned
+    Spanish PDF is now caught.
+    """
+
+    def __init__(
+        self,
+        s3_prefix: str,
+        exclude_languages: Optional[List[str]] = None,
+        bedrock_ocr_fallback: bool = False,
+        request_timeout: int = 60,
+    ):
+        self.s3_prefix = s3_prefix
+        self.exclude_languages = [canon_language(x) for x in (exclude_languages or [])]
+        self.bedrock_ocr_fallback = bedrock_ocr_fallback
+        self.request_timeout = request_timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        })
+
+    @staticmethod
+    def _clean_pdf_filename(name: str) -> str:
+        clean = "".join(c for c in name if c.isalnum() or c in (".", "-", "_")).strip()
+        if not clean.endswith(".pdf"):
+            clean += ".pdf"
+        return clean or "document.pdf"
+
+    def _extract_text_pypdf2(self, pdf_bytes: bytes, max_chars: int = 5000) -> str:
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(BytesIO(pdf_bytes))
+            text = ""
+            for page in reader.pages:
+                t = page.extract_text() or ""
+                text += t + "\n"
+                if len(text) > max_chars:
+                    break
+            return text[:max_chars] if text.strip() else "[No text extractable]"
+        except Exception as e:
+            return f"[Error: {e}]"
+
+    def _extract_text(
+        self, pdf_bytes: bytes, title_hint: str
+    ) -> Tuple[str, str]:
+        """
+        Returns (text, extraction_method).
+
+        extraction_method is one of: "pypdf2", "bedrock_ocr", "failed".
+        """
+        # First pass: PyPDF2
+        text = self._extract_text_pypdf2(pdf_bytes)
+        if text and not text.startswith("["):
+            return text, "pypdf2"
+
+        # Second pass: Bedrock OCR (if enabled)
+        if self.bedrock_ocr_fallback:
+            print(f"    PyPDF2 failed ({text!r:.60}...) — trying Bedrock OCR...")
+            ocr_text = bedrock_pdf_ocr(pdf_bytes, title_hint=title_hint)
+            if ocr_text and not ocr_text.startswith("["):
+                print(f"    OCR succeeded — {len(ocr_text)} chars extracted.")
+                # Match the PyPDF2 char cap for downstream consistency.
+                return ocr_text[:5000], "bedrock_ocr"
+            else:
+                print(f"    OCR also failed: {ocr_text[:120]}")
+                return ocr_text, "failed"
+
+        return text, "failed"
+
+    def process(self, pdf_catalog: Dict[str, Dict]) -> List[Dict]:
+        if not pdf_catalog:
+            print("  No PDFs to process.")
+            return []
+
+        if self.exclude_languages:
+            print(f"  Language exclude filter active: {self.exclude_languages}")
+        if self.bedrock_ocr_fallback:
+            print("  Bedrock OCR fallback: ENABLED for image / scanned PDFs.")
+
+        results: List[Dict] = []
+        total = len(pdf_catalog)
+        skipped_by_language = 0
+        ocr_used = 0
+        seen_filenames: Dict[str, str] = {}
+
+        for i, (pdf_url, meta) in enumerate(pdf_catalog.items(), 1):
+            print(f"\n  [PDF {i}/{total}] {meta['title']}")
+            print(f"    url: {pdf_url}")
+            print(f"    discovered on: {meta['first_seen_on']}")
+
+            try:
+                resp = self.session.get(pdf_url, timeout=self.request_timeout)
+                resp.raise_for_status()
+                pdf_bytes = resp.content
+                size_mb = len(pdf_bytes) / (1024 * 1024)
+
+                # --- Extract text (PyPDF2, then OCR if enabled) ---
+                text, extraction_method = self._extract_text(
+                    pdf_bytes, title_hint=meta["title"]
+                )
+                text_ok = bool(text) and not text.startswith("[")
+                if extraction_method == "bedrock_ocr":
+                    ocr_used += 1
+
+                # --- Language detection ---
+                if text_ok:
+                    language = detect_language(text)
+                else:
+                    language = "unknown_or_image_pdf"
+                print(f"    language: {language}  (via {extraction_method})")
+
+                # --- Language exclusion filter ---
+                if is_excluded_language(language, self.exclude_languages):
+                    canon = canon_language(language)
+                    print(
+                        f"    SKIPPED — '{language}' (canonical: '{canon}') "
+                        f"is in exclude list. Not uploaded to S3."
+                    )
+                    results.append({
+                        "title": meta["title"],
+                        "url": pdf_url,
+                        "first_seen_on": meta["first_seen_on"],
+                        "referrers": sorted(meta["referrers"]),
+                        "language": language,
+                        "language_canonical": canon,
+                        "extraction_method": extraction_method,
+                        "status": "skipped_excluded_language",
+                        "size_mb": round(size_mb, 3),
+                    })
+                    skipped_by_language += 1
+                    continue
+
+                # --- Upload PDF bytes to S3 ---
+                clean_name = self._clean_pdf_filename(meta["filename"])
+                if clean_name in seen_filenames and seen_filenames[clean_name] != pdf_url:
+                    suffix = hashlib.md5(pdf_url.encode()).hexdigest()[:6]
+                    clean_name = clean_name.replace(".pdf", f"_{suffix}.pdf")
+                seen_filenames[clean_name] = pdf_url
+
+                pdf_key = f"{self.s3_prefix}/pdfs/{clean_name}"
+                s3_client.put_object(
+                    Bucket=S3_BUCKET, Key=pdf_key, Body=pdf_bytes,
+                    ContentType="application/pdf",
+                )
+                pdf_s3 = f"s3://{S3_BUCKET}/{pdf_key}"
+                print(f"    saved: {pdf_s3} ({size_mb:.2f} MB)")
+
+                record = {
+                    "title": meta["title"],
+                    "pdf_s3_path": pdf_s3,
+                    "url": pdf_url,
+                    "first_seen_on": meta["first_seen_on"],
+                    "referrers": sorted(meta["referrers"]),
+                    "language": language,
+                    "language_canonical": canon_language(language),
+                    "extraction_method": extraction_method,
+                    "size_mb": round(size_mb, 3),
+                }
+
+                if text_ok:
+                    summary = summarize_pdf(text, meta["title"])
+                    print(f"    summary: {summary[:120]}...")
+                    text_key = (
+                        f"{self.s3_prefix}/pdfs/"
+                        f"{clean_name.replace('.pdf', '_extracted.txt')}"
+                    )
+                    s3_put_object(text_key, text, "text/plain")
+                    record.update({
+                        "text_s3_path": f"s3://{S3_BUCKET}/{text_key}",
+                        "summary": summary,
+                        "text_preview": text[:500],
+                        "status": "processed",
+                    })
+                else:
+                    print(f"    note: no text after PyPDF2 + OCR. Stored as bytes only.")
+                    record["status"] = "processed_no_text"
+                    record["error"] = text
+
+                results.append(record)
+
+            except Exception as e:
+                print(f"    failed: {e}")
+                results.append({
+                    "title": meta["title"],
+                    "url": pdf_url,
+                    "first_seen_on": meta["first_seen_on"],
+                    "status": "error",
+                    "error": str(e),
+                })
+
+        print(f"\n  Extraction summary:")
+        method_counter = Counter(r.get("extraction_method") for r in results
+                                 if r.get("extraction_method"))
+        for method, count in method_counter.most_common():
+            print(f"    {method}: {count}")
+        if self.exclude_languages:
+            print(f"  PDFs filtered by language: {skipped_by_language}/{total}")
+        if self.bedrock_ocr_fallback:
+            print(f"  PDFs rescued via OCR:      {ocr_used}")
+
+        return results
+
+
+# ----------------------------------------------------------------------------
+# Unified pipeline
+# ----------------------------------------------------------------------------
+class UnifiedScraperPipeline:
+    """HTML crawl + PDF processing with optional language filter + OCR fallback."""
+
+    def run(
+        self,
+        url: str,
+        section_prefixes: Optional[List[str]] = None,
+        allow_full_domain: bool = False,
+        max_pages: Optional[int] = None,
+        max_depth: Optional[int] = None,
+        web_delay: float = 0.5,
+        scrape_pdfs: bool = True,
+        verbose: bool = False,
+        extra_seed_urls: Optional[List[str]] = None,
+        exclude_languages: Optional[List[str]] = None,
+        bedrock_ocr_fallback: bool = False,
+    ) -> Dict:
+        if section_prefixes is None and not allow_full_domain:
+            section_prefixes = [derive_section_prefix(url)]
+
+        base_domain = urlparse(url).netloc.replace("www.", "")
+        folder_name = generate_folder_name(url)
+        s3_prefix = f"{S3_BASE_PREFIX}/{folder_name}"
+
+        excluded_canon = [canon_language(x) for x in (exclude_languages or [])]
+
+        print("=" * 70)
+        print("UNIFIED SCRAPER PIPELINE")
+        print("=" * 70)
+        print(f"Start URL:         {url}")
+        print(f"Full domain?:      {allow_full_domain}")
+        print(f"Section prefixes:  {section_prefixes}")
+        print(f"Base domain:       {base_domain}")
+        print(f"Max pages:         {max_pages if max_pages else 'unlimited'}")
+        print(f"Max depth:         {max_depth if max_depth is not None else 'unlimited'}")
+        print(f"Exclude languages: {excluded_canon if excluded_canon else 'none'}")
+        print(f"OCR fallback:      {bedrock_ocr_fallback}")
+        print(f"S3 output:         s3://{S3_BUCKET}/{s3_prefix}")
+        print("=" * 70)
+
+        results = {
+            "url": url,
+            "section_prefixes": section_prefixes,
+            "allow_full_domain": allow_full_domain,
+            "max_depth": max_depth,
+            "exclude_languages": excluded_canon,
+            "bedrock_ocr_fallback": bedrock_ocr_fallback,
+            "s3_bucket": S3_BUCKET,
+            "s3_prefix": s3_prefix,
+            "s3_full_path": f"s3://{S3_BUCKET}/{s3_prefix}",
+            "folder_name": folder_name,
+            "web_results": None,
+            "pdf_results": None,
+        }
+
+        print("\n[STEP 1] Crawling HTML and discovering PDFs...")
+        crawler = SectionCrawler(
+            s3_prefix=s3_prefix,
+            base_domain=base_domain,
+            section_prefixes=section_prefixes,
+            allow_full_domain=allow_full_domain,
+            delay=web_delay,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            verbose=verbose,
+        )
+        seeds = [url] + (extra_seed_urls or [])
+        web_results = crawler.crawl(seeds)
+        results["web_results"] = web_results
+
+        if scrape_pdfs and crawler.pdf_catalog:
+            print("\n[STEP 2] Downloading & summarising PDFs...")
+            processor = PDFProcessor(
+                s3_prefix=s3_prefix,
+                exclude_languages=excluded_canon,
+                bedrock_ocr_fallback=bedrock_ocr_fallback,
+            )
+            pdf_results = processor.process(crawler.pdf_catalog)
+            results["pdf_results"] = pdf_results
+
+            summaries_key = f"{s3_prefix}/pdf_summaries.json"
+            s3_put_object(summaries_key, json.dumps(pdf_results, indent=2), "application/json")
+            print(f"\n  PDF summaries saved: s3://{S3_BUCKET}/{summaries_key}")
+        elif not crawler.pdf_catalog:
+            print("\n[STEP 2] No PDFs discovered.")
+
+        report = self._generate_report(results)
+        report_key = f"{s3_prefix}/pipeline_report.txt"
+        report_path = s3_put_object(report_key, report, "text/plain")
+
+        print("\n" + "=" * 70)
+        print("FINAL REPORT")
+        print("=" * 70)
+        print(f"S3 output:      s3://{S3_BUCKET}/{s3_prefix}")
+        print(f"Report:         {report_path}")
+        print(f"HTML scraped:   {web_results['scraped']}")
+        print(f"PDFs found:     {web_results.get('pdf_count', 0)}")
+        print(f"Deepest depth:  {web_results.get('max_depth_seen', 0)}")
+        if web_results.get("reject_stats"):
+            print(f"Rejected links: {web_results['reject_stats']}")
+
+        if results["pdf_results"]:
+            stats = Counter(r.get("status", "unknown") for r in results["pdf_results"])
+            print(f"PDF outcomes:   {dict(stats)}")
+            methods = Counter(r.get("extraction_method") for r in results["pdf_results"]
+                              if r.get("extraction_method"))
+            print(f"Extraction:     {dict(methods)}")
+            if excluded_canon:
+                print(f"Language filter dropped: "
+                      f"{stats.get('skipped_excluded_language', 0)} PDF(s) "
+                      f"({excluded_canon})")
+        print("=" * 70)
+        return results
+
+    def _generate_report(self, results: Dict) -> str:
+        lines = [
+            "=" * 70,
+            "UNIFIED SCRAPER PIPELINE REPORT",
+            "=" * 70,
+            f"URL:                  {results['url']}",
+            f"Full domain?:         {results['allow_full_domain']}",
+            f"Section prefixes:     {results['section_prefixes']}",
+            f"Max depth:            {results['max_depth']}",
+            f"Exclude languages:    {results.get('exclude_languages') or 'none'}",
+            f"OCR fallback:         {results.get('bedrock_ocr_fallback', False)}",
+            f"S3 path:              {results['s3_full_path']}",
+            f"Timestamp:            {datetime.now().isoformat()}",
+            "",
+        ]
+
+        wr = results.get("web_results") or {}
+        lines += [
+            "HTML CRAWL",
+            "-" * 40,
+            f"  Pages scraped:  {wr.get('scraped', 0)}",
+            f"  Failed:         {wr.get('failed', 0)}",
+            f"  PDFs found:     {wr.get('pdf_count', 0)}",
+            f"  Deepest depth:  {wr.get('max_depth_seen', 0)}",
+            f"  Rejected links: {wr.get('reject_stats', {})}",
+            "  Files:",
+        ]
+        for f in wr.get("s3_files", []):
+            lines.append(f"    - {f}")
+        lines.append("")
+
+        if results.get("pdf_results"):
+            status_counter = Counter(r.get("status", "unknown")
+                                     for r in results["pdf_results"])
+            method_counter = Counter(r.get("extraction_method")
+                                     for r in results["pdf_results"]
+                                     if r.get("extraction_method"))
+            lines += [
+                "PDF PROCESSING",
+                "-" * 40,
+                f"  Status breakdown:     {dict(status_counter)}",
+                f"  Extraction methods:   {dict(method_counter)}",
+                "",
+            ]
+            for r in results["pdf_results"]:
+                status = r.get("status", "unknown")
+                lines.append(f"  [{status}] {r['title']}")
+                lines.append(f"    URL:        {r['url']}")
+                lines.append(f"    Found on:   {r.get('first_seen_on', 'N/A')}")
+                if "language" in r:
+                    lang_extra = ""
+                    if r.get("language_canonical") and r["language_canonical"] != r["language"]:
+                        lang_extra = f" (canonical: {r['language_canonical']})"
+                    lines.append(f"    Language:   {r['language']}{lang_extra}")
+                if "extraction_method" in r:
+                    lines.append(f"    Extracted:  {r['extraction_method']}")
+                if "pdf_s3_path" in r:
+                    lines.append(f"    PDF:        {r['pdf_s3_path']}")
+                if "text_s3_path" in r:
+                    lines.append(f"    Text:       {r['text_s3_path']}")
+                if "summary" in r:
+                    lines.append(f"    Summary:    {r['summary'][:200]}...")
+                if "error" in r:
+                    lines.append(f"    ERROR:      {r['error']}")
+                lines.append("")
+
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+
+from Scrape_data_v4 import UnifiedScraperPipeline
+test_url = "https://ecmc.org"
+url_data = [
+#     "https://borroweraccess.ecmc.org/ba2/",
+# "https://borroweraccess.ecmc.org/ba2/login",
+# "https://borroweraccess.ecmc.org/ba2/tools/#/ip",
+# "https://www.ecmc.org/borrowers/preventing-default/",
+# "https://www.ecmc.org/borrowers/preventing-default/postpone-payments/",
+# "https://www.ecmc.org/borrowers/preventing-default/postpone-payments/#Forbearance",
+# "https://www.ecmc.org/borrowers/preventing-default/repayment-plans-with-your-lender/",
+# "https://www.ecmc.org/borrowers/resolving-default/",
+# "https://www.ecmc.org/borrowers/resolving-default/default-repayment-plan/",
+# "https://www.ecmc.org/borrowers/resolving-default/loan-consolidation/",
+# "https://www.ecmc.org/borrowers/resolving-default/loan-rehabilitation/",
+# "https://www.ecmc.org/borrowers/resolving-default/pay-in-full/",
+# "https://www.ecmc.org/borrowers/resolving-default/resolving-issues-and-disputes/",
+# "https://www.ecmc.org/borrowers/resolving-default/understanding-default/",
+# "https://www.ecmc.org/borrowers/student-loan-basics/loan-forgiveness-and-cancellation/",
+# "https://www.ecmc.org/borrowers/understand-bankruptcy/"#,
+# "https://www.ecmc.org/borrowers/understand-bankruptcy/bankruptcy-and-student-loans/",
+# "https://www.ecmc.org/borrowers/understand-bankruptcy/during-bankruptcy/",
+# "https://www.ecmc.org/borrowers/understand-bankruptcy/during-bankruptcy/#AWG",
+# "https://www.ecmc.org/borrowers/understand-bankruptcy/during-bankruptcy/#Collection",
+# "https://www.ecmc.org/contact-us/"
+# "https://www.ecmc.org",
+"https://www.ecmc.org/borrowers/understand-bankruptcy/",
+]
+pipeline = UnifiedScraperPipeline()
+for start_url in url_data:
+    # print(start_url)
+    results = pipeline.run(url=start_url,section_prefixes=["forms/",
+                                                           "/borrowers/understand-bankruptcy",
+                                                           # "/borrowers",
+                                                           "frequently-asked-questions/",
+                                                           
+                                                          ],
+        max_depth=4, max_pages=200, web_delay=0.5, scrape_pdfs=True, verbose=False, exclude_languages=["spanish"],bedrock_ocr_fallback=True, )
+    if results.get("pdf_results"):
+        from collections import Counter as _C
+        outcomes = _C(r.get("status", "unknown") for r in results["pdf_results"])
+        methods = _C(r.get("extraction_method") for r in results["pdf_results"]
+                     if r.get("extraction_method"))
+        print("\nPDF outcome breakdown:")
+        for status, count in outcomes.most_common():
+            print(f"  {status}: {count}")
+        print("Extraction methods used:")
+        for method, count in methods.most_common():
+            print(f"  {method}: {count}")
+
+    print(f"\nAll outputs saved to: {results['s3_full_path']}")
+#######
 """Add ONE already-Textract-processed document to the term index.
 
 The document must already have gone through process_document() from
