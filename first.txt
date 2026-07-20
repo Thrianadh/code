@@ -1,3 +1,79 @@
+"""Process one document through Textract, then build and validate the
+corpus tree from it.
+
+Edit the four values in CONFIG below, then run:
+    python run_single_document.py
+"""
+import json
+import logging
+import sys
+
+from textract_pipeline import process_document
+from tree_builder import build_corpus_tree_from_job_map, save_tree, validate_tree
+
+# ---------------------------------------------------------------------------
+# CONFIG — edit these four values for your file
+# ---------------------------------------------------------------------------
+SOURCE_BUCKET = "bankrupcy-data-bkt"
+SOURCE_KEY = "Ecmc_scrape_understand_bankruptcy/Phone Guide.pdf"
+OUTPUT_BUCKET = "bankrupcy-data-bkt"
+OUTPUT_PREFIX = "textract-output"
+REGION = "us-east-1"
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger("run_single_document")
+
+    log.info("Processing: s3://%s/%s", SOURCE_BUCKET, SOURCE_KEY)
+    result = process_document(
+        source_bucket=SOURCE_BUCKET,
+        source_key=SOURCE_KEY,
+        output_bucket=OUTPUT_BUCKET,
+        output_prefix=OUTPUT_PREFIX,
+        region=REGION,
+    )
+
+    if result.status != "SUCCEEDED":
+        log.error("Textract job did not succeed. status=%s error=%s",
+                 result.status, result.error)
+        return 1
+
+    log.info("Done: %d tables, %d figures, %d lines",
+             len(result.tables), len(result.figures), result.line_count)
+    log.info("  json:     s3://%s/%s", OUTPUT_BUCKET, result.output_key)
+    log.info("  markdown: s3://%s/%s", OUTPUT_BUCKET, result.markdown_key)
+    log.info("  text:     s3://%s/%s", OUTPUT_BUCKET, result.text_key)
+
+    log.info("Building corpus tree from job map...")
+    tree = build_corpus_tree_from_job_map(bucket=OUTPUT_BUCKET, region=REGION)
+
+    warnings = validate_tree(tree)
+    if warnings:
+        log.warning("Tree validation found %d issue(s):", len(warnings))
+        for w in warnings:
+            log.warning("  - %s", w)
+    else:
+        log.info("Tree validation: no issues found.")
+
+    tree_uri = save_tree(OUTPUT_BUCKET, tree, region=REGION)
+    log.info("Tree saved: %s", tree_uri)
+
+    log.info("Documents in tree so far: %d", len(tree["root"]))
+    print(json.dumps(tree, indent=2, ensure_ascii=False)[:1000])
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+###
 """Textract-only ingestion pipeline: Layout + Tables extraction, ordered by
 physical page position, written as three timestamped output files per
 document (.json/.md/.txt). No Bedrock, Claude, or Nova model of any kind —
