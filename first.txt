@@ -34,6 +34,7 @@ from textract_pipeline import TextractTransientError, load_job_map
 log = logging.getLogger(__name__)
 
 INDEX_KEY = "textract-jobs/index.json"
+INDEX_INTERNAL_KEY = "textract-jobs/index_internal.json"
 NOVA_MODEL_ID = "amazon.nova-2-lite-v1:0"
 TITAN_EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
 EMBED_DIM = 1024
@@ -348,12 +349,22 @@ def process_document_for_index(
             "new_entries": new_count, "merged": merged_count}
 
 
+def _to_public_index(index_entries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Strip embedding vectors for the human-readable public index."""
+    return {
+        term_id: {k: v for k, v in entry.items() if k not in ("embedding", "sample_context")}
+        for term_id, entry in index_entries.items()
+    }
+
+
 def build_index_from_job_map(
     bucket: str, region: str = "us-east-1",
 ) -> Dict[str, Any]:
     """Walk every successfully-processed document (via job_map.json, same
     registry tree_builder.py uses) and build the term index across all of
-    them.
+    them, from scratch. For adding ONE new document to an already-existing
+    index without reprocessing everything, use index_single_document()
+    instead — this function always starts empty.
     """
     s3 = boto3.client("s3", region_name=region)
     bedrock_runtime = boto3.client("bedrock-runtime", region_name=region)
@@ -380,17 +391,53 @@ def build_index_from_job_map(
         )
         summaries.append(summary)
 
-    # Strip the embedding vectors before returning the public index —
-    # they're only needed internally for matching, not useful to a reader.
-    public_index = {
-        term_id: {k: v for k, v in entry.items() if k not in ("embedding", "sample_context")}
-        for term_id, entry in index_entries.items()
-    }
-    return {"terms": public_index, "_document_summaries": summaries}
+    return {"terms": _to_public_index(index_entries), "_document_summaries": summaries}
+
+
+def index_single_document(
+    bucket: str, output_key: str, region: str = "us-east-1",
+) -> Dict[str, Any]:
+    """Add ONE already-Textract-processed document to the index — the
+    incremental path the design doc describes ("a new or edited document
+    only triggers extraction + matching for itself"). Loads whatever index
+    already exists (with embeddings intact, from the internal file) so new
+    terms are correctly matched against everything indexed so far, not
+    matched against nothing.
+
+    output_key is the .json output path from process_document() /
+    process_document_for_index() — i.e. result.output_key from
+    textract_pipeline, or an entry's "output_key" field in job_map.json.
+    """
+    s3 = boto3.client("s3", region_name=region)
+    bedrock_runtime = boto3.client("bedrock-runtime", region_name=region)
+
+    try:
+        index_entries = load_index_internal(bucket, region=region)
+        log.info("loaded existing index: %d terms", len(index_entries))
+    except s3.exceptions.NoSuchKey:
+        index_entries = {}
+        log.info("no existing index found — starting fresh")
+
+    obj = s3.get_object(Bucket=bucket, Key=output_key)
+    doc_output = json.loads(obj["Body"].read())
+    source_key = doc_output.get("source_key", output_key)
+    document_text = doc_output.get("document_markdown", "")
+    content_sequence = doc_output.get("content_sequence", [])
+
+    summary = process_document_for_index(
+        bedrock_runtime, source_key, document_text, content_sequence, index_entries,
+    )
+
+    save_index_internal(bucket, index_entries, region=region)
+    public_index = {"terms": _to_public_index(index_entries), "_last_document": summary}
+    save_index(bucket, public_index, region=region)
+
+    return public_index
 
 
 def save_index(bucket: str, index: Dict[str, Any], region: str = "us-east-1",
               key: str = INDEX_KEY) -> str:
+    """Save the PUBLIC index — clean, no embeddings, safe to read directly."""
     s3 = boto3.client("s3", region_name=region)
     s3.put_object(
         Bucket=bucket, Key=key,
@@ -401,9 +448,78 @@ def save_index(bucket: str, index: Dict[str, Any], region: str = "us-east-1",
 
 
 def load_index(bucket: str, region: str = "us-east-1", key: str = INDEX_KEY) -> Dict[str, Any]:
+    """Load the PUBLIC index — for reading/querying, not for continuing to
+    index new documents (it has no embeddings). Use load_index_internal()
+    if you need to keep matching against it.
+    """
     s3 = boto3.client("s3", region_name=region)
     obj = s3.get_object(Bucket=bucket, Key=key)
     return json.loads(obj["Body"].read())
+
+
+def save_index_internal(bucket: str, index_entries: Dict[str, Dict[str, Any]],
+                        region: str = "us-east-1", key: str = INDEX_INTERNAL_KEY) -> str:
+    """Save the INTERNAL index — includes embedding vectors, needed so a
+    future index_single_document() call can keep matching against every
+    term already indexed. Not meant to be read directly.
+    """
+    s3 = boto3.client("s3", region_name=region)
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(index_entries, indent=2, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json",
+    )
+    return f"s3://{bucket}/{key}"
+
+
+def load_index_internal(bucket: str, region: str = "us-east-1",
+                        key: str = INDEX_INTERNAL_KEY) -> Dict[str, Dict[str, Any]]:
+    s3 = boto3.client("s3", region_name=region)
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return json.loads(obj["Body"].read())
+
+
+# ---------------------------------------------------------------------------
+# Querying — two different tools for two different questions.
+# ---------------------------------------------------------------------------
+def query_index_by_name(index: Dict[str, Any], query: str) -> List[Dict[str, Any]]:
+    """Free, instant lookup: case-insensitive substring match against each
+    term's name and its aliases. No embedding/LLM call. Answers "does this
+    exact term exist in the index" — NOT a natural-language question.
+    Works against the PUBLIC index from load_index().
+    """
+    query_lower = query.lower().strip()
+    matches = []
+    for term_id, entry in index.get("terms", {}).items():
+        names_to_check = [entry.get("term", "")] + entry.get("aliases", [])
+        if any(query_lower in name.lower() for name in names_to_check if name):
+            matches.append({"term_id": term_id, **entry})
+    return matches
+
+
+def query_index_semantic(
+    bedrock_runtime, index_entries: Dict[str, Dict[str, Any]], question: str, top_k: int = 3,
+) -> List[Dict[str, Any]]:
+    """Natural-language lookup: embeds the question and returns the top_k
+    closest terms by cosine similarity — answers a real question like "what
+    happens when someone files bankruptcy", not just an exact term name.
+    Needs the INTERNAL index (embeddings intact) from load_index_internal(),
+    not the public one — this is the one real use for cosine at query time,
+    separate from its role during index-building.
+    """
+    query_vector = embed_term(bedrock_runtime, question, "")
+    scored = [
+        (term_id, _cosine(query_vector, entry["embedding"]), entry)
+        for term_id, entry in index_entries.items()
+    ]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return [
+        {"term_id": tid, "similarity": round(sim, 3), "term": entry["term"],
+         "aliases": entry["aliases"], "sources": entry["sources"]}
+        for tid, sim, entry in scored[:top_k]
+    ]
+
+
 
 
 # ---------------------------------------------------------------------------
