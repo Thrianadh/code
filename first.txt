@@ -1,3 +1,977 @@
+"""
+Textract ingestion pipeline for ECMC bankruptcy documents.
+
+Extracts text, tables, and forms from PDFs using AWS Textract
+(Layout + Tables + Forms), preserving reading order. Outputs
+structured JSON, Markdown, and plain text.
+
+Designed for AWS Lambda + Step Functions migration.
+"""
+
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import boto3
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+REGION = os.getenv("AWS_REGION", "us-east-1")
+SOURCE_BUCKET = os.getenv("SOURCE_BUCKET", "")
+SOURCE_PREFIX = os.getenv("SOURCE_PREFIX", "documents/")
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "extracted/")
+USE_QUERIES = os.getenv("USE_QUERIES", "false").lower() == "true"
+NEEDS_VISION_REVIEW = os.getenv("NEEDS_VISION_REVIEW", "false").lower() == "true"
+
+POLL_SECONDS = 5
+MAX_POLL_SECONDS = 1800
+JOB_MAP_KEY = "textract-jobs/job_map.json"
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# ---------------------------------------------------------------------------
+# TEXTRACT CLIENT (reused across calls)
+# ---------------------------------------------------------------------------
+_textract_client = None
+_s3_client = None
+
+
+def get_textract_client() -> boto3.client:
+    """Return cached Textract client."""
+    global _textract_client
+    if _textract_client is None:
+        _textract_client = boto3.client("textract", region_name=REGION)
+    return _textract_client
+
+
+def get_s3_client() -> boto3.client:
+    """Return cached S3 client."""
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+# ---------------------------------------------------------------------------
+# JOB LIFECYCLE
+# ---------------------------------------------------------------------------
+def start_analysis(bucket: str, key: str) -> str:
+    """Submit PDF to Textract async analysis.
+
+    Args:
+        bucket: S3 bucket containing the PDF.
+        key: S3 key of the PDF.
+
+    Returns:
+        Textract JobId string.
+    """
+    textract = get_textract_client()
+    features = ["LAYOUT", "TABLES", "FORMS"]
+    if USE_QUERIES:
+        features.append("QUERIES")
+
+    resp = textract.start_document_analysis(
+        DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
+        FeatureTypes=features,
+    )
+    job_id = resp["JobId"]
+    logger.info("Started Textract job %s for s3://%s/%s", job_id, bucket, key)
+    return job_id
+
+
+def wait_for_job(job_id: str) -> Dict[str, Any]:
+    """Poll Textract job until completion or timeout.
+
+    Args:
+        job_id: Textract JobId to poll.
+
+    Returns:
+        Textract response dict with Blocks list.
+    """
+    textract = get_textract_client()
+    started = time.time()
+
+    while True:
+        resp = textract.get_document_analysis(JobId=job_id)
+        status = resp["JobStatus"]
+        if status in ("SUCCEEDED", "FAILED"):
+            break
+        if time.time() - started > MAX_POLL_SECONDS:
+            logger.error("Job %s timed out after %s seconds", job_id, MAX_POLL_SECONDS)
+            return {"JobStatus": "TIMEOUT", "Blocks": []}
+        time.sleep(POLL_SECONDS)
+
+    if status != "SUCCEEDED":
+        logger.error("Job %s failed: %s", job_id, resp.get("StatusMessage", "Unknown"))
+        return resp
+
+    # Paginate all blocks
+    blocks = list(resp.get("Blocks", []))
+    next_token = resp.get("NextToken")
+    while next_token:
+        page = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
+        blocks.extend(page.get("Blocks", []))
+        next_token = page.get("NextToken")
+
+    resp["Blocks"] = blocks
+    logger.info("Job %s completed: %d blocks", job_id, len(blocks))
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# BLOCK INDEXING
+# ---------------------------------------------------------------------------
+def index_blocks(blocks: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Build id-to-block lookup map.
+
+    Args:
+        blocks: Raw Textract Blocks list.
+
+    Returns:
+        Dict mapping Block Id to Block dict.
+    """
+    return {b["Id"]: b for b in blocks}
+
+
+# ---------------------------------------------------------------------------
+# TEXT EXTRACTION
+# ---------------------------------------------------------------------------
+def extract_text_elements(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract titles, headers, paragraphs, lists in reading order.
+
+    Args:
+        blocks: Raw Textract Blocks list.
+
+    Returns:
+        List of text elements with type, page, and text.
+    """
+    by_id = index_blocks(blocks)
+    layout_types = {
+        "LAYOUT_TITLE", "LAYOUT_HEADER", "LAYOUT_SECTION_HEADER",
+        "LAYOUT_TEXT", "LAYOUT_LIST", "LAYOUT_FOOTER", "LAYOUT_PAGE_NUMBER",
+    }
+    pages: Dict[int, List[Dict[str, str]]] = {}
+
+    for block in blocks:
+        if block["BlockType"] not in layout_types:
+            continue
+
+        line_ids = [
+            cid
+            for rel in block.get("Relationships", [])
+            if rel["Type"] == "CHILD"
+            for cid in rel["Ids"]
+        ]
+        lines = [
+            by_id[lid]["Text"]
+            for lid in line_ids
+            if by_id.get(lid, {}).get("BlockType") == "LINE"
+        ]
+        if not lines:
+            continue
+
+        page_no = block.get("Page", 1)
+        if block["BlockType"] == "LAYOUT_LIST":
+            for line in lines:
+                if line.strip():
+                    pages.setdefault(page_no, []).append({
+                        "type": "list_item", "text": line.strip(),
+                    })
+        else:
+            text = " ".join(lines).strip()
+            if text:
+                pages.setdefault(page_no, []).append({
+                    "type": block["BlockType"], "text": text,
+                })
+
+    return [
+        {"page": page_no, "elements": elements}
+        for page_no, elements in sorted(pages.items())
+    ]
+
+
+# ---------------------------------------------------------------------------
+# TABLE EXTRACTION
+# ---------------------------------------------------------------------------
+def extract_tables(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Reconstruct tables from TABLE and CELL blocks.
+
+    Args:
+        blocks: Raw Textract Blocks list.
+
+    Returns:
+        List of table dicts with markdown, rows, cols, page.
+    """
+    by_id = index_blocks(blocks)
+    tables = []
+
+    for block in blocks:
+        if block["BlockType"] != "TABLE":
+            continue
+
+        cell_ids = [
+            cid
+            for rel in block.get("Relationships", [])
+            if rel["Type"] == "CHILD"
+            for cid in rel["Ids"]
+        ]
+        cells = [by_id[cid] for cid in cell_ids if by_id.get(cid, {}).get("BlockType") == "CELL"]
+        if not cells:
+            continue
+
+        max_row = max(c["RowIndex"] for c in cells)
+        max_col = max(c["ColumnIndex"] for c in cells)
+        grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+
+        for cell in cells:
+            text = extract_cell_text(cell, by_id)
+            r, c = cell["RowIndex"] - 1, cell["ColumnIndex"] - 1
+            grid[r][c] = text
+
+        tables.append({
+            "table_id": block["Id"],
+            "page": block.get("Page", 1),
+            "rows": max_row,
+            "cols": max_col,
+            "markdown": grid_to_markdown(grid),
+        })
+
+    return tables
+
+
+def extract_cell_text(cell: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
+    """Extract text from a single table cell.
+
+    Args:
+        cell: Textract CELL block.
+        by_id: Block lookup map.
+
+    Returns:
+        Concatenated cell text.
+    """
+    word_ids = [
+        wid
+        for rel in cell.get("Relationships", [])
+        if rel["Type"] == "CHILD"
+        for wid in rel["Ids"]
+    ]
+    words = []
+    for wid in word_ids:
+        child = by_id.get(wid)
+        if not child:
+            continue
+        if child["BlockType"] == "WORD":
+            words.append(child.get("Text", ""))
+        elif child["BlockType"] == "SELECTION_ELEMENT":
+            words.append("[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(words).strip()
+
+
+def grid_to_markdown(grid: List[List[str]]) -> str:
+    """Convert 2D grid to markdown table.
+
+    Args:
+        grid: List of rows, each row is list of cell strings.
+
+    Returns:
+        Markdown table string.
+    """
+    if not grid:
+        return ""
+    lines = ["| " + " | ".join(grid[0]) + " |"]
+    lines.append("|" + "|".join([" --- "] * len(grid[0])) + "|")
+    for row in grid[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# FORM EXTRACTION
+# ---------------------------------------------------------------------------
+def extract_forms(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract key-value pairs from KEY_VALUE_SET blocks.
+
+    Args:
+        blocks: Raw Textract Blocks list.
+
+    Returns:
+        List of form field dicts with key, value, page.
+    """
+    by_id = index_blocks(blocks)
+    fields = []
+
+    for block in blocks:
+        if block["BlockType"] != "KEY_VALUE_SET":
+            continue
+        if "KEY" not in (block.get("EntityTypes") or []):
+            continue
+
+        key_text = extract_cell_text(block, by_id)
+        value_id = None
+        for rel in block.get("Relationships", []):
+            if rel["Type"] == "VALUE" and rel.get("Ids"):
+                value_id = rel["Ids"][0]
+                break
+
+        value_text = ""
+        if value_id:
+            value_block = by_id.get(value_id)
+            if value_block:
+                value_text = extract_cell_text(value_block, by_id)
+
+        if key_text:
+            fields.append({
+                "key_id": block["Id"],
+                "page": block.get("Page", 1),
+                "key": clean_key(key_text),
+                "value": value_text,
+            })
+
+    return fields
+
+
+def clean_key(text: str) -> str:
+    """Strip trailing colon from key text to avoid double colons.
+
+    Args:
+        text: Raw key text from Textract.
+
+    Returns:
+        Cleaned key text.
+    """
+    return text.rstrip(":").rstrip()
+
+
+# ---------------------------------------------------------------------------
+# FIGURE DETECTION (location only, no OCR or vision)
+# ---------------------------------------------------------------------------
+def detect_figures(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Detect figure locations from LAYOUT_FIGURE blocks.
+
+    Args:
+        blocks: Raw Textract Blocks list.
+
+    Returns:
+        List of figure dicts with page and bounding box.
+    """
+    figures = []
+    for block in blocks:
+        if block["BlockType"] == "LAYOUT_FIGURE":
+            figures.append({
+                "figure_id": block["Id"],
+                "page": block.get("Page", 1),
+                "bbox": block["Geometry"]["BoundingBox"],
+            })
+    return figures
+
+
+# ---------------------------------------------------------------------------
+# SEQUENTIAL CONTENT BUILDER
+# ---------------------------------------------------------------------------
+def build_sequence(
+    blocks: List[Dict[str, Any]],
+    tables: List[Dict[str, Any]],
+    forms: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Build unified content sequence in reading order.
+
+    Walks Textract blocks in native order, inserting tables and forms
+    at their detected positions.
+
+    Args:
+        blocks: Raw Textract Blocks list.
+        tables: Extracted tables.
+        forms: Extracted form fields.
+
+    Returns:
+        Ordered list of content elements.
+    """
+    tables_by_id = {t["table_id"]: t for t in tables}
+    forms_by_id = {f["key_id"]: f for f in forms}
+    text_kind_map = {
+        "LAYOUT_TITLE": "title",
+        "LAYOUT_SECTION_HEADER": "section_header",
+        "LAYOUT_TEXT": "paragraph",
+    }
+
+    sequence = []
+    matched_tables = set()
+    matched_forms = set()
+
+    for block in blocks:
+        btype = block["BlockType"]
+        page = block.get("Page", 1)
+
+        if btype in text_kind_map:
+            text = resolve_line_text(block, index_blocks(blocks))
+            if text:
+                sequence.append({
+                    "type": text_kind_map[btype],
+                    "page": page,
+                    "text": text,
+                })
+
+        elif btype == "LAYOUT_LIST":
+            for line_text in resolve_list_items(block, index_blocks(blocks)):
+                sequence.append({
+                    "type": "list_item",
+                    "page": page,
+                    "text": line_text,
+                })
+
+        elif btype == "LAYOUT_TABLE":
+            table_id = match_layout_child(block, blocks, "TABLE")
+            if table_id and table_id in tables_by_id:
+                matched_tables.add(table_id)
+                table = tables_by_id[table_id]
+                sequence.append({
+                    "type": "table",
+                    "page": page,
+                    "table_id": table_id,
+                    "markdown": table["markdown"],
+                    "rows": table["rows"],
+                    "cols": table["cols"],
+                })
+
+        elif btype == "LAYOUT_KEY_VALUE":
+            key_id = match_layout_child(block, blocks, "KEY_VALUE_SET")
+            if key_id and key_id in forms_by_id:
+                matched_forms.add(key_id)
+                form = forms_by_id[key_id]
+                sequence.append({
+                    "type": "key_value",
+                    "page": page,
+                    "key": form["key"],
+                    "value": form["value"],
+                })
+
+        elif btype == "LAYOUT_FIGURE":
+            sequence.append({
+                "type": "figure",
+                "page": page,
+                "figure_id": block["Id"],
+            })
+
+    # Append unmatched tables at end of their page
+    for table in tables:
+        if table["table_id"] not in matched_tables:
+            insert_at = find_page_end(sequence, table["page"])
+            sequence.insert(insert_at, {
+                "type": "table",
+                "page": table["page"],
+                "table_id": table["table_id"],
+                "markdown": table["markdown"],
+                "rows": table["rows"],
+                "cols": table["cols"],
+            })
+
+    # Append unmatched forms at end of their page
+    for form in forms:
+        if form["key_id"] not in matched_forms:
+            insert_at = find_page_end(sequence, form["page"])
+            sequence.insert(insert_at, {
+                "type": "key_value",
+                "page": form["page"],
+                "key": form["key"],
+                "value": form["value"],
+            })
+
+    return sequence
+
+
+def resolve_line_text(block: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
+    """Concatenate child LINE text from a layout block.
+
+    Args:
+        block: Textract layout block.
+        by_id: Block lookup map.
+
+    Returns:
+        Joined line text.
+    """
+    line_ids = [
+        cid
+        for rel in block.get("Relationships", [])
+        if rel["Type"] == "CHILD"
+        for cid in rel["Ids"]
+    ]
+    lines = [
+        by_id[lid]["Text"]
+        for lid in line_ids
+        if by_id.get(lid, {}).get("BlockType") == "LINE"
+    ]
+    return " ".join(lines).strip()
+
+
+def resolve_list_items(block: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Extract individual list items from LAYOUT_LIST block.
+
+    Args:
+        block: Textract LAYOUT_LIST block.
+        by_id: Block lookup map.
+
+    Returns:
+        List of item text strings.
+    """
+    line_ids = [
+        cid
+        for rel in block.get("Relationships", [])
+        if rel["Type"] == "CHILD"
+        for cid in rel["Ids"]
+    ]
+    return [
+        by_id[lid]["Text"].strip()
+        for lid in line_ids
+        if by_id.get(lid, {}).get("BlockType") == "LINE"
+        and by_id[lid].get("Text", "").strip()
+    ]
+
+
+def match_layout_child(
+    layout_block: Dict[str, Any],
+    blocks: List[Dict[str, Any]],
+    target_type: str,
+) -> Optional[str]:
+    """Find raw block that overlaps with a LAYOUT wrapper.
+
+    Args:
+        layout_block: LAYOUT_TABLE or LAYOUT_KEY_VALUE block.
+        blocks: All blocks.
+        target_type: BlockType to match (TABLE or KEY_VALUE_SET).
+
+    Returns:
+        Matching block Id or None.
+    """
+    layout_box = layout_block["Geometry"]["BoundingBox"]
+    layout_page = layout_block.get("Page", 1)
+    best_id = None
+    best_overlap = 0.0
+
+    for candidate in blocks:
+        if candidate["BlockType"] != target_type:
+            continue
+        if candidate.get("Page", 1) != layout_page:
+            continue
+        overlap = bbox_overlap(layout_box, candidate["Geometry"]["BoundingBox"])
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_id = candidate["Id"]
+
+    return best_id if best_overlap > 0.0 else None
+
+
+def bbox_overlap(box_a: Dict[str, float], box_b: Dict[str, float]) -> float:
+    """Calculate intersection-over-union of two bounding boxes.
+
+    Args:
+        box_a: First bounding box dict with Left, Top, Width, Height.
+        box_b: Second bounding box dict.
+
+    Returns:
+        IoU ratio (0.0 to 1.0).
+    """
+    ax0, ay0 = box_a["Left"], box_a["Top"]
+    ax1, ay1 = ax0 + box_a["Width"], ay0 + box_a["Height"]
+    bx0, by0 = box_b["Left"], box_b["Top"]
+    bx1, by1 = bx0 + box_b["Width"], by0 + box_b["Height"]
+
+    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    iy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    intersection = ix * iy
+    union = (
+        box_a["Width"] * box_a["Height"]
+        + box_b["Width"] * box_b["Height"]
+        - intersection
+    )
+    return intersection / union if union > 0 else 0.0
+
+
+def find_page_end(sequence: List[Dict[str, Any]], page: int) -> int:
+    """Find insertion point at end of given page.
+
+    Args:
+        sequence: Current content sequence.
+        page: Target page number.
+
+    Returns:
+        Index to insert at (end of page or end of sequence).
+    """
+    last_idx = -1
+    for idx, item in enumerate(sequence):
+        if item.get("page", 1) <= page:
+            last_idx = idx
+    return last_idx + 1 if last_idx >= 0 else len(sequence)
+
+
+# ---------------------------------------------------------------------------
+# OUTPUT FORMATTERS
+# ---------------------------------------------------------------------------
+def sequence_to_markdown(sequence: List[Dict[str, Any]]) -> str:
+    """Convert sequence to markdown document.
+
+    Args:
+        sequence: Content sequence from build_sequence().
+
+    Returns:
+        Markdown string.
+    """
+    heading_prefix = {"title": "# ", "section_header": "## "}
+    lines = []
+
+    for item in sequence:
+        kind = item["type"]
+        if kind == "list_item":
+            lines.append(f"- {item['text']}")
+        elif kind in ("title", "section_header", "paragraph"):
+            prefix = heading_prefix.get(kind, "")
+            lines.append(f"{prefix}{item['text']}")
+        elif kind == "table":
+            lines.append(item["markdown"])
+        elif kind == "key_value":
+            lines.append(f"**{item['key']}:** {item['value']}")
+        elif kind == "figure":
+            lines.append(f"**[Figure — page {item['page']}]**")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def sequence_to_text(sequence: List[Dict[str, Any]]) -> str:
+    """Convert sequence to plain text document.
+
+    Args:
+        sequence: Content sequence from build_sequence().
+
+    Returns:
+        Plain text string.
+    """
+    lines = []
+    current_page = 0
+
+    for item in sequence:
+        page = item.get("page", 1)
+        if page != current_page:
+            lines.append(f"[PAGE {page}]")
+            current_page = page
+
+        kind = item["type"]
+        if kind == "list_item":
+            lines.append(f"  - {item['text']}")
+        elif kind in ("title", "section_header", "paragraph"):
+            lines.append(item["text"])
+        elif kind == "table":
+            lines.append(table_to_plain(item["markdown"]))
+        elif kind == "key_value":
+            lines.append(f"{item['key']}: {item['value']}")
+        elif kind == "figure":
+            lines.append(f"Figure (page {page})")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def table_to_plain(markdown_table: str) -> str:
+    """Convert markdown table to plain text columns.
+
+    Args:
+        markdown_table: Markdown table string.
+
+    Returns:
+        Plain text table with space-padded columns.
+    """
+    rows = [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in markdown_table.splitlines()
+        if line.strip() and not set(line.replace("|", "").strip()) <= {"-"}
+    ]
+    if not rows:
+        return ""
+    col_widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    return "\n".join(
+        "  ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row))
+        for row in rows
+    )
+
+
+# ---------------------------------------------------------------------------
+# S3 OUTPUT
+# ---------------------------------------------------------------------------
+def write_outputs(
+    bucket: str,
+    prefix: str,
+    source_key: str,
+    timestamp: str,
+    data: Dict[str, Any],
+    markdown: str,
+    text: str,
+) -> Dict[str, str]:
+    """Write JSON, Markdown, and Text outputs to S3.
+
+    Args:
+        bucket: Output S3 bucket.
+        prefix: Output S3 prefix.
+        source_key: Original source key (for naming).
+        timestamp: Shared timestamp string.
+        data: JSON-serializable dict.
+        markdown: Markdown content.
+        text: Plain text content.
+
+    Returns:
+        Dict with keys json_key, md_key, txt_key.
+    """
+    s3 = get_s3_client()
+    stem = Path(source_key).stem
+    safe_stem = re.sub(r"[^\w\-]", "_", stem)
+
+    json_key = f"{prefix.rstrip('/')}/{safe_stem}_{timestamp}.json"
+    md_key = f"{prefix.rstrip('/')}/{safe_stem}_{timestamp}.md"
+    txt_key = f"{prefix.rstrip('/')}/{safe_stem}_{timestamp}.txt"
+
+    s3.put_object(
+        Bucket=bucket, Key=json_key,
+        Body=json.dumps(data, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+    s3.put_object(
+        Bucket=bucket, Key=md_key,
+        Body=markdown.encode("utf-8"),
+        ContentType="text/markdown",
+    )
+    s3.put_object(
+        Bucket=bucket, Key=txt_key,
+        Body=text.encode("utf-8"),
+        ContentType="text/plain",
+    )
+
+    return {"json_key": json_key, "md_key": md_key, "txt_key": txt_key}
+
+
+# ---------------------------------------------------------------------------
+# JOB TRACKING
+# ---------------------------------------------------------------------------
+def load_job_map(bucket: str) -> Dict[str, Any]:
+    """Load job tracking map from S3.
+
+    Args:
+        bucket: S3 bucket.
+
+    Returns:
+        Job map dict or empty dict.
+    """
+    s3 = get_s3_client()
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=JOB_MAP_KEY)
+        return json.loads(obj["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return {}
+    except s3.exceptions.ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return {}
+        raise
+
+
+def save_job_map(bucket: str, job_map: Dict[str, Any]) -> None:
+    """Save job tracking map to S3.
+
+    Args:
+        bucket: S3 bucket.
+        job_map: Job map dict.
+    """
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=bucket, Key=JOB_MAP_KEY,
+        Body=json.dumps(job_map, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+
+
+# ---------------------------------------------------------------------------
+# MAIN PROCESSOR
+# ---------------------------------------------------------------------------
+def process_document(source_bucket: str, source_key: str) -> Dict[str, Any]:
+    """Process single PDF through full Textract pipeline.
+
+    Args:
+        source_bucket: S3 bucket with PDF.
+        source_key: S3 key of PDF.
+
+    Returns:
+        Result dict with status, output keys, counts.
+    """
+    logger.info("Processing s3://%s/%s", source_bucket, source_key)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    # Start Textract
+    job_id = start_analysis(source_bucket, source_key)
+
+    # Wait for completion
+    result = wait_for_job(job_id)
+    status = result["JobStatus"]
+
+    if status != "SUCCEEDED":
+        logger.error("Job failed for %s: %s", source_key, status)
+        return {
+            "source_key": source_key,
+            "job_id": job_id,
+            "status": status,
+            "error": result.get("StatusMessage", "Unknown"),
+        }
+
+    blocks = result["Blocks"]
+
+    # Extract components
+    text_elements = extract_text_elements(blocks)
+    tables = extract_tables(blocks)
+    forms = extract_forms(blocks)
+    figures = detect_figures(blocks)
+
+    # Build unified sequence
+    sequence = build_sequence(blocks, tables, forms)
+
+    # Format outputs
+    markdown = sequence_to_markdown(sequence)
+    plain_text = sequence_to_text(sequence)
+
+    # Build JSON data
+    output_data = {
+        "source_bucket": source_bucket,
+        "source_key": source_key,
+        "job_id": job_id,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "block_count": len(blocks),
+        "line_count": sum(1 for b in blocks if b["BlockType"] == "LINE"),
+        "table_count": len(tables),
+        "form_count": len(forms),
+        "figure_count": len(figures),
+        "text_elements": text_elements,
+        "tables": tables,
+        "forms": forms,
+        "figures": figures,
+        "sequence": sequence,
+    }
+
+    # Write to S3
+    keys = write_outputs(
+        OUTPUT_BUCKET, OUTPUT_PREFIX, source_key, timestamp,
+        output_data, markdown, plain_text,
+    )
+
+    # Update job map
+    job_map = load_job_map(OUTPUT_BUCKET)
+    job_map[source_key] = {
+        "job_id": job_id,
+        "status": "SUCCEEDED",
+        "timestamp": timestamp,
+        **keys,
+    }
+    save_job_map(OUTPUT_BUCKET, job_map)
+
+    logger.info("Completed %s -> %s", source_key, keys["json_key"])
+    return {
+        "source_key": source_key,
+        "job_id": job_id,
+        "status": "SUCCEEDED",
+        **keys,
+    }
+
+
+# ---------------------------------------------------------------------------
+# BATCH PROCESSOR
+# ---------------------------------------------------------------------------
+def process_batch(source_bucket: str, source_prefix: str) -> List[Dict[str, Any]]:
+    """Process all PDFs under an S3 prefix.
+
+    Args:
+        source_bucket: S3 bucket.
+        source_prefix: S3 prefix (folder path).
+
+    Returns:
+        List of result dicts per document.
+    """
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    pdf_keys = [
+        obj["Key"]
+        for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix)
+        for obj in page.get("Contents", [])
+        if obj["Key"].lower().endswith(".pdf")
+    ]
+
+    logger.info("Found %d PDFs under s3://%s/%s", len(pdf_keys), source_bucket, source_prefix)
+
+    results = []
+    for key in pdf_keys:
+        try:
+            result = process_document(source_bucket, key)
+            results.append(result)
+        except Exception as exc:
+            logger.exception("Failed to process %s: %s", key, exc)
+            results.append({
+                "source_key": key,
+                "status": "ERROR",
+                "error": str(exc),
+            })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# LAMBDA HANDLER
+# ---------------------------------------------------------------------------
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """AWS Lambda entry point.
+
+    Expected event format:
+        {
+            "source_bucket": "my-bucket",
+            "source_key": "documents/file.pdf",
+            "source_prefix": "documents/"
+        }
+
+    Args:
+        event: Lambda event dict.
+        context: Lambda context object.
+
+    Returns:
+        Result dict.
+    """
+    bucket = event.get("source_bucket", SOURCE_BUCKET)
+    key = event.get("source_key", "")
+    prefix = event.get("source_prefix", SOURCE_PREFIX)
+
+    if key:
+        return process_document(bucket, key)
+    if prefix:
+        return {"results": process_batch(bucket, prefix)}
+
+    return {"status": "ERROR", "error": "No source_key or source_prefix provided"}
+
+
+# ---------------------------------------------------------------------------
+# LOCAL TESTING
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # Example: process single document
+    # result = process_document("my-bucket", "documents/sample.pdf")
+    # print(json.dumps(result, indent=2))
+
+    # Example: process batch
+    # results = process_batch("my-bucket", "documents/")
+    # print(json.dumps(results, indent=2))
+    pass
+#################
+
+#######################
 # claude 
 Claude Sonnet 4						No access
 us.anthropic.claude-sonnet-4-6				No access
