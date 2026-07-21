@@ -1,3 +1,1068 @@
+"""
+ECMC Scraper v3 — Full Pipeline
+================================
+1. Crawl HTML pages + discover PDF links
+2. Convert HTML → Markdown (saved to S3)
+3. Convert HTML → PDF using PyMuPDF (already installed, no system deps)
+4. Download PDFs from discovered links
+5. Classify PDFs (searchable / image / mixed / empty)
+6. If image/mixed → AWS Textract OCR → searchable PDF
+7. Extract Markdown from all PDFs via pymupdf4llm
+8. Detect language, filter excluded languages
+9. Save everything to S3 with structured reporting
+
+REMOVED:
+    - pytesseract (Tesseract OCR)
+    - WeasyPrint (libgobject dependency)
+    - All system library dependencies
+
+ADDED:
+    - html_to_pdf() using PyMuPDF (fitz) — zero new dependencies
+    - textract_ocr_pdf() using AWS Textract — cloud-based OCR
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import re
+import sys
+import time
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse
+from warnings import filterwarnings
+
+import boto3
+import fitz  # PyMuPDF
+import pymupdf4llm
+import requests
+from bs4 import BeautifulSoup
+from langdetect import DetectorFactory, LangDetectException, detect_langs
+from markdownify import markdownify as md
+
+filterwarnings("ignore", category=UserWarning, module="bs4")
+
+# langdetect seed for reproducibility
+DetectorFactory.seed = 0
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# Constants
+# ============================================================================
+SKIP_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico",
+    ".css", ".js", ".zip", ".doc", ".docx", ".xls", ".xlsx",
+    ".mp3", ".mp4", ".avi", ".mov", ".xml", ".json", ".rss", ".atom",
+)
+
+_LANG_CODE_TO_NAME: Dict[str, str] = {
+    "en": "english", "es": "spanish", "fr": "french", "de": "german",
+    "it": "italian", "pt": "portuguese", "nl": "dutch", "sv": "swedish",
+    "no": "norwegian", "da": "danish", "fi": "finnish", "pl": "polish",
+    "ru": "russian", "zh-cn": "chinese", "zh-tw": "chinese", "ja": "japanese",
+    "ko": "korean", "ar": "arabic", "hi": "hindi", "tr": "turkish",
+    "vi": "vietnamese", "th": "thai",
+}
+
+_LANG_ALIASES: Dict[str, Set[str]] = {
+    "spanish":    {"spanish", "español", "espanol", "castellano",
+                   "es", "es-es", "es-mx", "es-la", "es-419", "sp", "esp"},
+    "english":    {"english", "en", "en-us", "en-gb", "eng"},
+    "french":     {"french", "français", "francais", "fr", "fr-fr", "fr-ca"},
+    "portuguese": {"portuguese", "português", "portugues", "pt", "pt-br", "pt-pt"},
+    "german":     {"german", "deutsch", "de", "de-de"},
+    "italian":    {"italian", "italiano", "it", "it-it"},
+    "chinese":    {"chinese", "mandarin", "zh", "zh-cn", "zh-tw"},
+}
+
+# Textract polling config
+TEXTRACT_POLL_SECONDS = 5
+TEXTRACT_MAX_POLL_SECONDS = 1800  # 30 minutes
+
+# ============================================================================
+# Small helpers
+# ============================================================================
+def _setup_logging():
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S",
+            handlers=[logging.StreamHandler(sys.stdout)],
+        )
+
+
+def canon_language(s: str) -> str:
+    if not s:
+        return ""
+    cleaned = re.sub(r"[^\w\-]", "", s.strip().lower())
+    for canon, aliases in _LANG_ALIASES.items():
+        if cleaned in aliases:
+            return canon
+    if cleaned in _LANG_CODE_TO_NAME:
+        return _LANG_CODE_TO_NAME[cleaned]
+    return cleaned
+
+
+def is_excluded_language(detected: str, exclude_list: List[str]) -> bool:
+    if not exclude_list:
+        return False
+    detected_canon = canon_language(detected)
+    if not detected_canon:
+        return False
+    excluded_canon = {canon_language(x) for x in exclude_list}
+    return detected_canon in excluded_canon
+
+
+def generate_folder_name(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.strip("/")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if path:
+        last = path.split("/")[-1] if "/" in path else path
+        last = re.sub(r"\.(html|htm|php|asp|aspx|jsp)$", "", last, flags=re.IGNORECASE)
+        clean_name = re.sub(r"[^a-zA-Z0-9]+", "_", last).strip("_")[:80]
+        if not clean_name:
+            clean_name = re.sub(r"[^a-zA-Z0-9]+", "_", parsed.netloc).strip("_")
+    else:
+        clean_name = re.sub(r"[^a-zA-Z0-9]+", "_", parsed.netloc).strip("_")
+    return f"{clean_name}_{timestamp}"
+
+
+def derive_section_prefix(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    if "." in path.split("/")[-1]:
+        path = "/".join(path.split("/")[:-1])
+    return path or "/"
+
+
+def normalize_url(url: str) -> str:
+    return url.split("#")[0].rstrip("/")
+
+
+def normalize_prefix(prefix: str) -> str:
+    p = prefix.strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return p.rstrip("/") or "/"
+
+
+def clean_pdf_filename(name: str) -> str:
+    clean = "".join(c for c in name if c.isalnum() or c in (".", "-", "_")).strip()
+    if not clean.endswith(".pdf"):
+        clean += ".pdf"
+    return clean or "document.pdf"
+
+
+# ============================================================================
+# S3 helpers
+# ============================================================================
+def _s3_client(region: str):
+    return boto3.client("s3", region_name=region)
+
+
+def s3_put(s3, bucket: str, key: str, body, content_type: str = "text/plain") -> str:
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type)
+    return f"s3://{bucket}/{key}"
+
+
+# ============================================================================
+# Language detection
+# ============================================================================
+def detect_language(text: str) -> Tuple[str, float]:
+    if not text or len(text.strip()) < 20:
+        return "unknown", 0.0
+    try:
+        langs = detect_langs(text[:2000])
+        if not langs:
+            return "unknown", 0.0
+        top = langs[0]
+        return canon_language(top.lang), float(top.prob)
+    except LangDetectException:
+        return "unknown", 0.0
+
+
+# ============================================================================
+# HTML -> Markdown
+# ============================================================================
+def html_to_markdown(html: str, source_url: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "meta", "link",
+                     "header", "footer", "nav", "aside", "form", "iframe"]):
+        tag.decompose()
+    content = soup.find("main") or soup.find("article") or soup.body or soup
+    if content is None:
+        return ""
+    md_text = md(
+        str(content),
+        heading_style="ATX",
+        strip=["a"],
+        bullets="-",
+    )
+    md_text = re.sub(r"\n{3,}", "\n\n", md_text).strip()
+    return f"<!-- source_url: {source_url} -->\n\n{md_text}"
+
+
+# ============================================================================
+# HTML -> PDF (PyMuPDF — NO system dependencies)
+# ============================================================================
+def html_to_pdf(html_content: str, css_styles: str = None, output_path: str = None) -> bytes:
+    """
+    Convert HTML content to PDF using PyMuPDF (fitz).
+    Zero system dependencies — fitz is already imported in this project.
+    
+    Args:
+        html_content: HTML string to convert
+        css_styles: Optional CSS for basic styling
+        output_path: Optional file path to save PDF
+    
+    Returns:
+        PDF bytes
+    """
+    if css_styles is None:
+        css_styles = """
+        body { font-family: Arial, sans-serif; font-size: 12px; line-height: 1.5; color: #333; }
+        h1 { font-size: 18px; color: #222; margin-top: 20px; }
+        h2 { font-size: 16px; color: #444; margin-top: 15px; }
+        h3 { font-size: 14px; color: #555; margin-top: 10px; }
+        p { margin: 8px 0; }
+        table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+        td, th { border: 1px solid #ddd; padding: 6px; font-size: 11px; }
+        th { background-color: #f5f5f5; }
+        ul, ol { margin: 8px 0; padding-left: 20px; }
+        li { margin: 4px 0; }
+        a { color: #0066cc; text-decoration: underline; }
+        """
+    
+    full_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>{css_styles}</style>
+</head>
+<body>{html_content}</body>
+</html>"""
+    
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)  # A4 in points
+    
+    # PyMuPDF's insert_htmlbox renders HTML with basic CSS support
+    rect = fitz.Rect(50, 50, 545, 792)  # Margins: ~17mm all sides
+    page.insert_htmlbox(rect, full_html, css=css_styles)
+    
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    
+    if output_path:
+        with open(output_path, "wb") as f:
+            f.write(pdf_bytes)
+    
+    return pdf_bytes
+
+
+# ============================================================================
+# PDF classification
+# ============================================================================
+def classify_pdf_type(pdf_bytes: bytes) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages_with_text = 0
+    pages_without_text = 0
+    try:
+        for page in doc:
+            text = (page.get_text("text") or "").strip()
+            has_real_text = False
+            if len(text) >= 30:
+                alnum = sum(c.isalnum() for c in text)
+                if alnum / len(text) >= 0.20:
+                    has_real_text = True
+            if has_real_text:
+                pages_with_text += 1
+            else:
+                pages_without_text += 1
+    finally:
+        doc.close()
+    total = pages_with_text + pages_without_text
+    if total == 0:
+        return "empty"
+    if pages_with_text == total:
+        return "searchable"
+    if pages_without_text == total:
+        return "image"
+    return "mixed"
+
+
+# ============================================================================
+# TEXTRACT OCR — Replaces Tesseract
+# ============================================================================
+class BoundingBox:
+    """Helper to manipulate Textract bounding boxes for PyMuPDF overlay."""
+    
+    def __init__(self, left: float, bottom: float, right: float, top: float) -> None:
+        self.bounds = [left, bottom, right, top]
+    
+    @classmethod
+    def from_textract_bbox(cls, textract_bbox: Dict[str, float]) -> "BoundingBox":
+        return cls(
+            left=textract_bbox["Left"],
+            bottom=textract_bbox["Top"] + textract_bbox["Height"],
+            right=textract_bbox["Left"] + textract_bbox["Width"],
+            top=textract_bbox["Top"],
+        )
+    
+    def scale(self, x_scale: float, y_scale: Optional[float] = None) -> None:
+        if y_scale is None:
+            y_scale = x_scale
+        self.bounds[0] *= x_scale
+        self.bounds[1] *= y_scale
+        self.bounds[2] *= x_scale
+        self.bounds[3] *= y_scale
+    
+    @property
+    def left(self) -> float:
+        return self.bounds[0]
+    
+    @property
+    def bottom(self) -> float:
+        return self.bounds[1]
+    
+    @property
+    def right(self) -> float:
+        return self.bounds[2]
+    
+    @property
+    def top(self) -> float:
+        return self.bounds[3]
+    
+    @property
+    def width(self) -> float:
+        return abs(self.bounds[0] - self.bounds[2])
+    
+    @property
+    def height(self) -> float:
+        return abs(self.bounds[3] - self.bounds[1])
+
+
+def _get_textract_client(region: str):
+    return boto3.client("textract", region_name=region)
+
+
+def _wait_for_textract_job(textract, job_id: str) -> Dict[str, any]:
+    """Poll Textract async job until completion or timeout."""
+    started = time.time()
+    while True:
+        resp = textract.get_document_text_detection(JobId=job_id)
+        status = resp["JobStatus"]
+        if status in ("SUCCEEDED", "FAILED"):
+            break
+        if time.time() - started > TEXTRACT_MAX_POLL_SECONDS:
+            log.error("Textract job %s timed out after %d seconds", job_id, TEXTRACT_MAX_POLL_SECONDS)
+            return {"JobStatus": "TIMEOUT", "Blocks": []}
+        time.sleep(TEXTRACT_POLL_SECONDS)
+    
+    if status != "SUCCEEDED":
+        log.error("Textract job %s failed: %s", job_id, resp.get("StatusMessage", "Unknown"))
+        return resp
+    
+    blocks = list(resp.get("Blocks", []))
+    next_token = resp.get("NextToken")
+    while next_token:
+        page = textract.get_document_text_detection(JobId=job_id, NextToken=next_token)
+        blocks.extend(page.get("Blocks", []))
+        next_token = page.get("NextToken")
+    
+    resp["Blocks"] = blocks
+    log.info("Textract job %s completed: %d blocks", job_id, len(blocks))
+    return resp
+
+
+def textract_ocr_pdf(pdf_bytes: bytes, region: str = "us-east-1", dpi: int = 200) -> bytes:
+    """
+    Convert non-searchable PDF to searchable PDF using AWS Textract + PyMuPDF.
+    
+    Process:
+        1. Upload PDF to temporary S3 (Textract requires S3 for PDFs)
+        2. Start async Textract text detection
+        3. Poll for completion
+        4. Render each page as image
+        5. Overlay invisible text from Textract WORD blocks at bounding box positions
+        6. Return searchable PDF bytes
+    """
+    textract = _get_textract_client(region)
+    s3 = _s3_client(region)
+    
+    temp_bucket = os.getenv("TEMP_BUCKET", os.getenv("BUCKET", "ecmc-dev-bucket"))
+    temp_key = f"temp/textract_ocr_{hashlib.md5(pdf_bytes).hexdigest()[:16]}.pdf"
+    
+    log.info("Uploading to temporary S3 for Textract: s3://%s/%s", temp_bucket, temp_key)
+    s3.put_object(Bucket=temp_bucket, Key=temp_key, Body=pdf_bytes, ContentType="application/pdf")
+    
+    try:
+        resp = textract.start_document_text_detection(
+            DocumentLocation={"S3Object": {"Bucket": temp_bucket, "Name": temp_key}}
+        )
+        job_id = resp["JobId"]
+        log.info("Started Textract OCR job: %s", job_id)
+        
+        result = _wait_for_textract_job(textract, job_id)
+        if result["JobStatus"] != "SUCCEEDED":
+            raise RuntimeError(f"Textract job failed: {result.get('StatusMessage', 'Unknown')}")
+        
+        blocks = result["Blocks"]
+        
+        source_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        output_doc = fitz.open()
+        
+        try:
+            for page_idx in range(len(source_doc)):
+                source_page = source_doc[page_idx]
+                pix = source_page.get_pixmap(dpi=dpi, alpha=False)
+                new_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
+                new_page.insert_image(new_page.rect, stream=pix.tobytes("png"))
+            
+            page_blocks: Dict[int, List[Dict]] = {}
+            for block in blocks:
+                if block["BlockType"] == "WORD":
+                    page_num = block.get("Page", 1)
+                    page_blocks.setdefault(page_num, []).append(block)
+            
+            for page_num, word_blocks in page_blocks.items():
+                if page_num > len(output_doc):
+                    continue
+                    
+                pdf_page = output_doc[page_num - 1]
+                page_width = pdf_page.rect.width
+                page_height = pdf_page.rect.height
+                
+                for block in word_blocks:
+                    text = block.get("Text", "")
+                    if not text:
+                        continue
+                    
+                    bbox = BoundingBox.from_textract_bbox(block["Geometry"]["BoundingBox"])
+                    bbox.scale(page_width, page_height)
+                    
+                    text_length = fitz.get_text_length(text, fontname="helv", fontsize=12)
+                    if text_length > 0:
+                        optimal_size = min(12, math.floor((bbox.width / text_length) * 12))
+                        optimal_size = max(4, optimal_size)
+                    else:
+                        optimal_size = 8
+                    
+                    pdf_page.insert_text(
+                        point=fitz.Point(bbox.left, bbox.bottom),
+                        text=text,
+                        fontname="helv",
+                        fontsize=optimal_size,
+                        color=(0, 0, 0),
+                        fill_opacity=0,
+                    )
+            
+            searchable_bytes = output_doc.tobytes()
+            word_count = len([b for b in blocks if b["BlockType"] == "WORD"])
+            log.info("Created searchable PDF: %d pages, %d words overlayed", len(output_doc), word_count)
+            return searchable_bytes
+            
+        finally:
+            source_doc.close()
+            output_doc.close()
+            
+    finally:
+        try:
+            s3.delete_object(Bucket=temp_bucket, Key=temp_key)
+            log.info("Cleaned up temporary S3 object: %s", temp_key)
+        except Exception as e:
+            log.warning("Failed to cleanup temp S3 object: %s", e)
+
+
+# ============================================================================
+# PDF -> Markdown via pymupdf4llm
+# ============================================================================
+def extract_markdown_from_pdf(pdf_bytes: bytes) -> Tuple[str, List[Dict]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page_chunks = pymupdf4llm.to_markdown(
+            doc,
+            page_chunks=True,
+            write_images=False,
+            show_progress=False,
+        )
+    finally:
+        doc.close()
+    
+    markdown_parts: List[str] = []
+    tables: List[Dict] = []
+    for i, page in enumerate(page_chunks, 1):
+        text = (page.get("text") or "").strip()
+        markdown_parts.append(f"\n\n<!-- page {i} -->\n\n{text}")
+        for t in page.get("tables") or []:
+            tables.append({
+                "page": i,
+                "bbox": t.get("bbox"),
+                "rows": t.get("rows"),
+            })
+    
+    return "\n".join(markdown_parts).strip(), tables
+
+
+# ============================================================================
+# HTML crawler
+# ============================================================================
+@dataclass
+class CrawlConfig:
+    bucket: str
+    s3_prefix: str
+    base_domain: str
+    section_prefixes: List[str] = field(default_factory=list)
+    allow_full_domain: bool = False
+    delay: float = 0.5
+    max_pages: Optional[int] = None
+    max_depth: Optional[int] = None
+    request_timeout: int = 20
+    aws_region: str = "us-east-1"
+    save_html_as_pdf: bool = True  # NEW: Convert HTML to PDF
+
+
+def crawl_html_and_discover_pdfs(
+    seed_urls: List[str], cfg: CrawlConfig
+) -> Tuple[List[Dict], Dict[str, Dict], Dict]:
+    s3 = _s3_client(cfg.aws_region)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    })
+
+    visited: Set[str] = set()
+    queued: Set[str] = set()
+    pdf_catalog: Dict[str, Dict] = {}
+    reject_stats: Counter = Counter()
+    to_visit: deque = deque()
+    html_outputs: List[Dict] = []
+    scraped = 0
+    failed = 0
+    deepest = 0
+
+    def same_site(url: str) -> bool:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = p.netloc.replace("www.", "")
+        return host == cfg.base_domain or host.endswith("." + cfg.base_domain)
+
+    def in_scope(url: str) -> bool:
+        if cfg.allow_full_domain:
+            return True
+        if not cfg.section_prefixes:
+            return True
+        path = urlparse(url).path.rstrip("/") or "/"
+        for prefix in cfg.section_prefixes:
+            if path == prefix or path.startswith(prefix + "/"):
+                return True
+        return False
+
+    def classify_link(url: str) -> Tuple[str, str]:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return "reject", "bad_scheme"
+        if not same_site(url):
+            return "reject", "off_site"
+        path_lower = p.path.lower()
+        if path_lower.endswith(".pdf"):
+            return "pdf", "pdf"
+        if path_lower.endswith(SKIP_EXTENSIONS):
+            return "reject", "binary_extension"
+        if not in_scope(url):
+            return "reject", "out_of_scope"
+        return "crawl", "in_scope"
+
+    def html_filename(url: str) -> str:
+        p = urlparse(url)
+        path = p.path.strip("/")
+        if path:
+            safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", path.replace("/", "_"))[:100]
+        else:
+            safe = "index"
+        domain = p.netloc.replace("www.", "")
+        full = f"{domain}_{safe}"
+        if len(full) > 150:
+            full = f"{domain}_{hashlib.md5(url.encode()).hexdigest()[:8]}"
+        return full
+
+    def record_pdf(anchor, full_url: str, source_page: str):
+        if full_url in pdf_catalog:
+            pdf_catalog[full_url]["referrers"].add(source_page)
+            return
+        title = anchor.get_text(strip=True)
+        if not title:
+            parent = anchor.find_parent(["h1", "h2", "h3", "h4", "li"])
+            if parent:
+                title = parent.get_text(strip=True)
+        if not title:
+            title = Path(urlparse(full_url).path).stem.replace("-", " ").title()
+        pdf_catalog[full_url] = {
+            "title": title[:150],
+            "url": full_url,
+            "filename": Path(urlparse(full_url).path).name,
+            "first_seen_on": source_page,
+            "referrers": {source_page},
+        }
+
+    for seed in seed_urls:
+        seed = normalize_url(seed)
+        if seed not in queued:
+            queued.add(seed)
+            to_visit.append((seed, 0))
+
+    log.info("Starting crawl (base=%s, scope=%s, max_depth=%s, max_pages=%s)",
+             cfg.base_domain,
+             "FULL" if cfg.allow_full_domain else cfg.section_prefixes,
+             cfg.max_depth, cfg.max_pages)
+
+    while to_visit:
+        if cfg.max_pages and scraped >= cfg.max_pages:
+            log.info("Reached max_pages=%d; stopping.", cfg.max_pages)
+            break
+
+        url, depth = to_visit.popleft()
+        if url in visited:
+            continue
+        visited.add(url)
+        deepest = max(deepest, depth)
+
+        try:
+            log.info("[HTML d=%d] %s", depth, url)
+            resp = session.get(url, timeout=cfg.request_timeout, allow_redirects=True)
+            resp.raise_for_status()
+
+            ctype = resp.headers.get("content-type", "").lower()
+            if "text/html" not in ctype and "application/xhtml" not in ctype:
+                failed += 1
+                log.info("  skip: non-HTML content-type %s", ctype)
+                continue
+
+            final_url = normalize_url(resp.url)
+            if not same_site(final_url):
+                failed += 1
+                log.info("  skip: redirected off-site to %s", final_url)
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                    continue
+                full = normalize_url(urljoin(url, href))
+                category, reason = classify_link(full)
+                if category == "pdf":
+                    record_pdf(a, full, source_page=url)
+                elif category == "crawl":
+                    if full not in visited and full not in queued:
+                        if cfg.max_depth is None or depth + 1 <= cfg.max_depth:
+                            queued.add(full)
+                            to_visit.append((full, depth + 1))
+                        else:
+                            reject_stats["depth_capped"] += 1
+                else:
+                    reject_stats[reason] += 1
+
+            page_markdown = html_to_markdown(resp.text, source_url=url)
+            base = html_filename(url)
+            
+            # Save HTML as Markdown
+            md_key = f"{cfg.s3_prefix}/web_md/{base}.md"
+            md_s3 = s3_put(s3, cfg.bucket, md_key, page_markdown, "text/markdown")
+
+            # NEW: Convert HTML to PDF and save
+            html_pdf_s3 = None
+            if cfg.save_html_as_pdf:
+                try:
+                    pdf_bytes = html_to_pdf(resp.text)
+                    pdf_key = f"{cfg.s3_prefix}/html_as_pdf/{base}.pdf"
+                    s3.put_object(
+                        Bucket=cfg.bucket, Key=pdf_key,
+                        Body=pdf_bytes, ContentType="application/pdf"
+                    )
+                    html_pdf_s3 = f"s3://{cfg.bucket}/{pdf_key}"
+                    log.info("  Saved HTML as PDF: %s", pdf_key)
+                except Exception as e:
+                    log.warning("  Failed to convert HTML to PDF: %s", e)
+
+            page_language, page_conf = detect_language(page_markdown)
+
+            html_outputs.append({
+                "url": url,
+                "s3_markdown": md_s3,
+                "s3_html_pdf": html_pdf_s3,
+                "language": page_language,
+                "language_confidence": round(page_conf, 4),
+                "chars": len(page_markdown),
+                "depth": depth,
+            })
+            scraped += 1
+
+            if to_visit and cfg.delay > 0:
+                time.sleep(cfg.delay)
+
+        except Exception as e:
+            failed += 1
+            log.warning("  failed: %s", e)
+
+    stats = {
+        "scraped": scraped,
+        "failed": failed,
+        "deepest_depth_seen": deepest,
+        "reject_stats": dict(reject_stats),
+        "pdf_count_discovered": len(pdf_catalog),
+    }
+    log.info("HTML crawl done: scraped=%d failed=%d PDFs_found=%d",
+             scraped, failed, len(pdf_catalog))
+    return html_outputs, pdf_catalog, stats
+
+
+# ============================================================================
+# PDF processing — Textract OCR replaces Tesseract
+# ============================================================================
+@dataclass
+class PdfConfig:
+    bucket: str
+    s3_prefix: str
+    exclude_languages: List[str] = field(default_factory=list)
+    enable_ocr_for_image_pdfs: bool = True
+    ocr_dpi: int = 200
+    request_timeout: int = 60
+    aws_region: str = "us-east-1"
+
+
+def process_pdfs(pdf_catalog: Dict[str, Dict], cfg: PdfConfig) -> List[Dict]:
+    s3 = _s3_client(cfg.aws_region)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    })
+
+    results: List[Dict] = []
+    seen_filenames: Dict[str, str] = {}
+    total = len(pdf_catalog)
+
+    for i, (pdf_url, meta) in enumerate(pdf_catalog.items(), 1):
+        log.info("[PDF %d/%d] %s", i, total, meta["title"])
+        result: Dict = {
+            "title": meta["title"],
+            "url": pdf_url,
+            "first_seen_on": meta["first_seen_on"],
+            "referrers": sorted(meta["referrers"]),
+        }
+
+        try:
+            resp = session.get(pdf_url, timeout=cfg.request_timeout)
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+            size_mb = len(pdf_bytes) / (1024 * 1024)
+            result["size_mb"] = round(size_mb, 3)
+
+            pdf_type = classify_pdf_type(pdf_bytes)
+            result["pdf_type"] = pdf_type
+            log.info("  type: %s | size: %.2f MB", pdf_type, size_mb)
+
+            filename = clean_pdf_filename(meta["filename"])
+            if filename in seen_filenames and seen_filenames[filename] != pdf_url:
+                suffix = hashlib.md5(pdf_url.encode()).hexdigest()[:6]
+                filename = filename.replace(".pdf", f"_{suffix}.pdf")
+            seen_filenames[filename] = pdf_url
+            base_no_ext = filename[:-4]
+
+            original_key = f"{cfg.s3_prefix}/pdfs/{filename}"
+            s3.put_object(
+                Bucket=cfg.bucket, Key=original_key,
+                Body=pdf_bytes, ContentType="application/pdf",
+            )
+            result["s3_pdf"] = f"s3://{cfg.bucket}/{original_key}"
+
+            extraction_input_bytes = pdf_bytes
+            extraction_method = "pymupdf4llm"
+
+            if pdf_type in ("image", "mixed") and cfg.enable_ocr_for_image_pdfs:
+                log.info("  OCR: running Textract at %d DPI...", cfg.ocr_dpi)
+                try:
+                    searchable_bytes = textract_ocr_pdf(
+                        pdf_bytes, 
+                        region=cfg.aws_region, 
+                        dpi=cfg.ocr_dpi
+                    )
+                    searchable_key = f"{cfg.s3_prefix}/pdfs/{base_no_ext}_searchable.pdf"
+                    s3.put_object(
+                        Bucket=cfg.bucket, Key=searchable_key,
+                        Body=searchable_bytes, ContentType="application/pdf",
+                    )
+                    result["s3_pdf_searchable"] = f"s3://{cfg.bucket}/{searchable_key}"
+                    extraction_input_bytes = searchable_bytes
+                    extraction_method = "textract_then_pymupdf4llm"
+                    log.info("  Textract OCR done: %.1f KB", len(searchable_bytes) / 1024)
+                except Exception as e:
+                    log.warning("  Textract OCR failed, falling back to original: %s", e)
+                    result["ocr_error"] = str(e)
+            elif pdf_type == "empty":
+                log.info("  empty PDF: no pages")
+                result["status"] = "empty_pdf"
+                results.append(result)
+                continue
+
+            try:
+                markdown_text, tables = extract_markdown_from_pdf(extraction_input_bytes)
+            except Exception as e:
+                log.error("  pymupdf4llm extraction failed: %s", e)
+                result["status"] = "extraction_failed"
+                result["error"] = str(e)
+                result["extraction_method"] = extraction_method
+                results.append(result)
+                continue
+
+            result["extraction_method"] = extraction_method
+            result["char_count"] = len(markdown_text)
+            result["table_count"] = len(tables)
+
+            language, confidence = detect_language(markdown_text)
+            result["language"] = language
+            result["language_confidence"] = round(confidence, 4)
+            log.info("  language: %s (conf=%.3f)", language, confidence)
+
+            if is_excluded_language(language, cfg.exclude_languages):
+                log.info("  skipped: language '%s' is in exclude list", language)
+                result["status"] = "skipped_excluded_language"
+                results.append(result)
+                continue
+
+            md_key = f"{cfg.s3_prefix}/pdf_md/{base_no_ext}.md"
+            s3_put(s3, cfg.bucket, md_key, markdown_text, "text/markdown")
+            result["s3_markdown"] = f"s3://{cfg.bucket}/{md_key}"
+
+            if tables:
+                tables_key = f"{cfg.s3_prefix}/pdf_md/{base_no_ext}_tables.json"
+                s3_put(s3, cfg.bucket, tables_key,
+                       json.dumps(tables, indent=2, ensure_ascii=False),
+                       "application/json")
+                result["s3_tables_json"] = f"s3://{cfg.bucket}/{tables_key}"
+
+            result["status"] = "success"
+
+        except Exception as e:
+            log.exception("  failed: %s", e)
+            result["status"] = "error"
+            result["error"] = str(e)
+
+        results.append(result)
+
+    return results
+
+
+# ============================================================================
+# Report writer
+# ============================================================================
+def write_report(
+    event: Dict, s3_prefix: str, html_outputs: List[Dict],
+    pdf_results: List[Dict], html_stats: Dict, bucket: str, aws_region: str,
+) -> str:
+    report = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "event": event,
+        "s3_output_prefix": f"s3://{bucket}/{s3_prefix}/",
+        "html": {
+            "stats": html_stats,
+            "outputs": html_outputs,
+        },
+        "pdfs": {
+            "total": len(pdf_results),
+            "by_status": dict(Counter(r.get("status", "unknown") for r in pdf_results)),
+            "by_type": dict(Counter(r.get("pdf_type") for r in pdf_results
+                                    if r.get("pdf_type"))),
+            "by_extraction": dict(Counter(r.get("extraction_method")
+                                          for r in pdf_results
+                                          if r.get("extraction_method"))),
+            "by_language": dict(Counter(r.get("language") for r in pdf_results
+                                        if r.get("language"))),
+            "outputs": pdf_results,
+        },
+    }
+    s3 = _s3_client(aws_region)
+    key = f"{s3_prefix}/pipeline_report.json"
+    return s3_put(s3, bucket, key, json.dumps(report, indent=2, ensure_ascii=False),
+                  "application/json")
+
+
+# ============================================================================
+# Top-level handler
+# ============================================================================
+def handler(event: Dict, context=None) -> Dict:
+    """
+    Lambda-style entry point.
+    
+    New fields:
+        save_html_as_pdf: bool (default: True) — Convert HTML pages to PDF
+    """
+    _setup_logging()
+
+    try:
+        bucket = event.get("bucket", "ecmc-dev-bucket")
+        s3_base_prefix = event.get("s3_base_prefix", "Ecmc_scrape_understand_bankruptcy")
+        aws_region = event.get("aws_region", "us-east-1")
+
+        start_url = event.get("start_url")
+        if not start_url:
+            return {"status": "error", "error": "event.start_url is required"}
+
+        extra_seed_urls = event.get("extra_seed_urls") or []
+        allow_full_domain = bool(event.get("allow_full_domain", False))
+        section_prefixes = event.get("section_prefixes")
+        if section_prefixes is None and not allow_full_domain:
+            section_prefixes = [derive_section_prefix(start_url)]
+        section_prefixes = [normalize_prefix(p) for p in (section_prefixes or [])]
+
+        max_pages = event.get("max_pages")
+        max_depth = event.get("max_depth", 4)
+        web_delay = float(event.get("web_delay_seconds", 0.5))
+        request_timeout = int(event.get("request_timeout_seconds", 60))
+
+        exclude_languages = event.get("exclude_languages", ["spanish"])
+        enable_ocr = bool(event.get("enable_ocr_for_image_pdfs", True))
+        ocr_dpi = int(event.get("ocr_dpi", 200))
+        scrape_pdfs = bool(event.get("scrape_pdfs", True))
+        save_html_as_pdf = bool(event.get("save_html_as_pdf", True))
+
+        base_domain = urlparse(start_url).netloc.replace("www.", "")
+        run_folder = generate_folder_name(start_url)
+        s3_prefix = f"{s3_base_prefix}/{run_folder}"
+
+        log.info("=" * 70)
+        log.info("ECMC SCRAPER v3 (Textract OCR + PyMuPDF HTML→PDF) — starting run")
+        log.info("  start_url:        %s", start_url)
+        log.info("  s3 output prefix: s3://%s/%s/", bucket, s3_prefix)
+        log.info("  scope:            %s",
+                 "FULL DOMAIN" if allow_full_domain else section_prefixes)
+        log.info("  max_pages:        %s", max_pages)
+        log.info("  max_depth:        %s", max_depth)
+        log.info("  exclude_langs:    %s", exclude_languages)
+        log.info("  ocr enabled:      %s (Textract, dpi=%d)", enable_ocr, ocr_dpi)
+        log.info("  save_html_as_pdf: %s", save_html_as_pdf)
+        log.info("=" * 70)
+
+        # Step 1: Crawl HTML
+        crawl_cfg = CrawlConfig(
+            bucket=bucket,
+            s3_prefix=s3_prefix,
+            base_domain=base_domain,
+            section_prefixes=section_prefixes,
+            allow_full_domain=allow_full_domain,
+            delay=web_delay,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            request_timeout=request_timeout,
+            aws_region=aws_region,
+            save_html_as_pdf=save_html_as_pdf,
+        )
+        seeds = [start_url] + list(extra_seed_urls)
+        html_outputs, pdf_catalog, html_stats = crawl_html_and_discover_pdfs(
+            seeds, crawl_cfg,
+        )
+
+        # Step 2: Process PDFs with Textract OCR
+        pdf_results: List[Dict] = []
+        if scrape_pdfs and pdf_catalog:
+            pdf_cfg = PdfConfig(
+                bucket=bucket,
+                s3_prefix=s3_prefix,
+                exclude_languages=exclude_languages,
+                enable_ocr_for_image_pdfs=enable_ocr,
+                ocr_dpi=ocr_dpi,
+                request_timeout=request_timeout,
+                aws_region=aws_region,
+            )
+            pdf_results = process_pdfs(pdf_catalog, pdf_cfg)
+
+        # Step 3: Write report
+        report_uri = write_report(
+            event=event,
+            s3_prefix=s3_prefix,
+            html_outputs=html_outputs,
+            pdf_results=pdf_results,
+            html_stats=html_stats,
+            bucket=bucket,
+            aws_region=aws_region,
+        )
+
+        return {
+            "status": "success",
+            "s3_output_prefix": f"s3://{bucket}/{s3_prefix}/",
+            "run_folder": run_folder,
+            "report_uri": report_uri,
+            "html": {
+                "pages_scraped": html_stats["scraped"],
+                "pages_failed": html_stats["failed"],
+                "deepest_depth_seen": html_stats["deepest_depth_seen"],
+                "reject_stats": html_stats["reject_stats"],
+                "outputs": html_outputs,
+            },
+            "pdfs": {
+                "total_discovered": len(pdf_catalog),
+                "processed": len(pdf_results),
+                "by_status": dict(Counter(r.get("status", "unknown")
+                                              for r in pdf_results)),
+                "by_type": dict(Counter(r.get("pdf_type") for r in pdf_results
+                                        if r.get("pdf_type"))),
+                "by_extraction": dict(Counter(r.get("extraction_method")
+                                              for r in pdf_results
+                                              if r.get("extraction_method"))),
+                "by_language": dict(Counter(r.get("language") for r in pdf_results
+                                            if r.get("language"))),
+                "outputs": pdf_results,
+            },
+        }
+
+    except Exception as e:
+        log.exception("Handler failed: %s", e)
+        return {"status": "error", "error": str(e)}
+
+
+# ============================================================================
+# Local testing
+# ============================================================================
+if __name__ == "__main__":
+    _setup_logging()
+    
+    test_event = {
+        "bucket": "ecmc-dev-bucket",
+        "s3_base_prefix": "Ecmc_scrape_understand_bankruptcy",
+        "start_url": "https://www.ecmc.org/borrowers/resolving-default/",
+        "max_pages": 10,
+        "max_depth": 2,
+        "enable_ocr_for_image_pdfs": True,
+        "ocr_dpi": 200,
+        "save_html_as_pdf": True,
+    }
+    
+    result = handler(test_event)
+    print(json.dumps(result, indent=2, default=str))
+#########
+##########
 import weasyprint  # pip install weasyprint
 
 def html_to_pdf(html_content: str, base_url: str = "") -> bytes:
