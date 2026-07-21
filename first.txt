@@ -1,4 +1,305 @@
 """
+Test script for Tree Index ONLY + 5 Query Tests.
+
+Usage:
+    python test_tree_index.py
+
+Tests:
+    1. Section boundary detection (no AWS)
+    2. JSON save/load (no AWS)
+    3. Tree index build (requires AWS/Claude)
+    4. Query engine - keyword search (no AWS)
+    5. Query engine - 5 sample queries (no AWS, uses mock tree)
+"""
+
+import json
+import logging
+import os
+from pathlib import Path
+import time
+
+# Set these for local testing
+os.environ.setdefault("AWS_REGION", "us-east-1")
+os.environ.setdefault("CORPUS_BUCKET", "")
+os.environ.setdefault("CORPUS_PREFIX", "extracted/")
+os.environ.setdefault("OUTPUT_BUCKET", "")
+os.environ.setdefault("OUTPUT_PREFIX", "indices/")
+os.environ.setdefault("CLAUDE_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+
+from tree_index_builder import (
+    detect_section_boundaries,
+    build_tree_index,
+    TreeQueryEngine,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SAMPLE DATA (same as before)
+# ---------------------------------------------------------------------------
+SAMPLE_SEQUENCE = [
+    {"type": "title", "text": "GROUP 11 -- MAKE A PAYMENT/SET UP PAYMENT ARRANGEMENTS", "page": 1},
+    {"type": "paragraph", "text": "Borrowers are not required to make monthly payments during bankruptcy unless they have provided for direct payment outside of their Chapter 13 plan.", "page": 1},
+    {"type": "paragraph", "text": "Interest will continue to accrue while borrowers are in bankruptcy.", "page": 1},
+    {"type": "section_header", "text": "Outside pay/direct pay", "page": 1},
+    {"type": "paragraph", "text": "Review comment to see if we received a Chapter 13 plan indicating outside/direct pay.", "page": 1},
+    {"type": "section_header", "text": "Employer paying on behalf of borrower", "page": 1},
+    {"type": "list_item", "text": "Ensure employer puts on remittance that payment is not a Garnishment.", "page": 1},
+    {"type": "list_item", "text": "Have the employer use the borrower voluntary payment address.", "page": 1},
+    {"type": "title", "text": "GROUP 11 -- TITLE IV/RETURNING TO SCHOOL", "page": 2},
+    {"type": "paragraph", "text": "To be eligible for federal financial aid, one must submit a T4 letter aka a Default clearance letter.", "page": 2},
+    {"type": "section_header", "text": "Requirements for defaulted borrower", "page": 2},
+    {"type": "list_item", "text": "Student loan creditor listed on schedule F", "page": 2},
+    {"type": "list_item", "text": "Trustee Payment History - Borrower making at least 6 months of payments", "page": 2},
+]
+
+SAMPLE_CORPUS = {
+    "source_key": "documents/GROUP_11_MAKE_A_PAYMENT.pdf",
+    "sequence": SAMPLE_SEQUENCE,
+    "document_markdown": "GROUP 11 -- MAKE A PAYMENT/SET UP PAYMENT ARRANGEMENTS\n\nBorrowers are not required to make monthly payments...",
+}
+
+# ---------------------------------------------------------------------------
+# TEST 1: Section Boundary Detection
+# ---------------------------------------------------------------------------
+def test_section_boundaries():
+    logger.info("=" * 60)
+    logger.info("TEST 1: Section Boundary Detection")
+    logger.info("=" * 60)
+
+    sections = detect_section_boundaries(SAMPLE_SEQUENCE)
+
+    logger.info("Detected %d sections:", len(sections))
+    for idx, sec in enumerate(sections, 1):
+        logger.info("  [%d] %s (page %d, %d chars)", idx, sec["title"], sec["page"], len(sec["text"]))
+
+    assert len(sections) == 3, f"Expected 3 sections, got {len(sections)}"
+    assert sections[0]["title"] == "GROUP 11 -- MAKE A PAYMENT/SET UP PAYMENT ARRANGEMENTS"
+    assert sections[1]["title"] == "Outside pay/direct pay"
+    assert sections[2]["title"] == "GROUP 11 -- TITLE IV/RETURNING TO SCHOOL"
+
+    logger.info("✅ TEST 1 PASSED\n")
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# TEST 2: JSON Save/Load
+# ---------------------------------------------------------------------------
+def test_json_io():
+    logger.info("=" * 60)
+    logger.info("TEST 2: JSON Save/Load")
+    logger.info("=" * 60)
+
+    test_data = {
+        "test": True,
+        "nodes": [{"id": "test_001", "title": "Test Section"}]
+    }
+
+    output_dir = Path("/mnt/agents/output/test_indices")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_dir / "test_tree.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(test_data, f, indent=2)
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+
+    assert loaded["test"] is True
+    assert loaded["nodes"][0]["id"] == "test_001"
+
+    logger.info("Saved and loaded: %s", json_path)
+    logger.info("✅ TEST 2 PASSED\n")
+
+
+# ---------------------------------------------------------------------------
+# TEST 3: Full Tree Index Build (requires AWS/Claude)
+# ---------------------------------------------------------------------------
+def test_tree_index():
+    logger.info("=" * 60)
+    logger.info("TEST 3: Full Tree Index Build (AWS/Claude required)")
+    logger.info("=" * 60)
+
+    tree = build_tree_index(SAMPLE_CORPUS)
+
+    logger.info("Root: %s", tree["root"])
+    logger.info("Sections: %d", tree["section_count"])
+    logger.info("Nodes:")
+    for node in tree["nodes"]:
+        logger.info("  [%s] %s", node["node_id"], node["title"])
+        logger.info("      Summary: %s", node["summary"][:100])
+
+    assert tree["section_count"] == 3
+    assert tree["nodes"][0]["node_id"] == "GROUP_11_MAKE_A_PAYMENT_S0000"
+
+    logger.info("✅ TEST 3 PASSED\n")
+    return tree
+
+
+# ---------------------------------------------------------------------------
+# TEST 4: Query Engine - Keyword Search (no AWS)
+# ---------------------------------------------------------------------------
+def test_query_engine():
+    logger.info("=" * 60)
+    logger.info("TEST 4: Query Engine - Keyword Search")
+    logger.info("=" * 60)
+
+    # Build a mock tree index with known summaries
+    mock_tree = {
+        "root": "GROUP_11",
+        "section_count": 3,
+        "nodes": [
+            {
+                "node_id": "G11_S0000",
+                "title": "GROUP 11 -- MAKE A PAYMENT/SET UP PAYMENT ARRANGEMENTS",
+                "page": 1,
+                "summary": "Explains that borrowers in Chapter 13 bankruptcy are not required to make monthly payments unless they arrange direct payment outside the plan. Interest continues to accrue.",
+                "full_text": "Borrowers are not required to make monthly payments during bankruptcy unless they have provided for direct payment outside of their Chapter 13 plan. Interest will continue to accrue while borrowers are in bankruptcy."
+            },
+            {
+                "node_id": "G11_S0001",
+                "title": "Outside pay/direct pay",
+                "page": 1,
+                "summary": "Instructions for reviewing Chapter 13 plans to identify outside or direct payment arrangements.",
+                "full_text": "Review comment to see if we received a Chapter 13 plan indicating outside/direct pay."
+            },
+            {
+                "node_id": "G11_S0002",
+                "title": "GROUP 11 -- TITLE IV/RETURNING TO SCHOOL",
+                "page": 2,
+                "summary": "Requirements for defaulted borrowers to regain federal financial aid eligibility, including submitting a T4 letter and trustee payment history.",
+                "full_text": "To be eligible for federal financial aid, one must submit a T4 letter aka a Default clearance letter. Student loan creditor listed on schedule F. Trustee Payment History - Borrower making at least 6 months of payments."
+            }
+        ]
+    }
+
+    engine = TreeQueryEngine(mock_tree)
+
+    # Test basic search
+    results = engine.search("payment during bankruptcy", top_k=2)
+    logger.info("Search 'payment during bankruptcy' -> %d results", len(results))
+    for r in results:
+        logger.info("  [%s] %s (score: %.1f)", r["node_id"], r["title"], r["score"])
+
+    assert len(results) > 0, "Should find at least one result"
+    assert results[0]["title"] == "GROUP 11 -- MAKE A PAYMENT/SET UP PAYMENT ARRANGEMENTS"
+
+    logger.info("✅ TEST 4 PASSED\n")
+    return mock_tree
+
+
+# ---------------------------------------------------------------------------
+# TEST 5: 5 Sample Queries
+# ---------------------------------------------------------------------------
+def test_five_queries():
+    logger.info("=" * 60)
+    logger.info("TEST 5: Five Sample Queries")
+    logger.info("=" * 60)
+
+    # Use the mock tree from Test 4
+    mock_tree = {
+        "root": "GROUP_11",
+        "section_count": 3,
+        "nodes": [
+            {
+                "node_id": "G11_S0000",
+                "title": "GROUP 11 -- MAKE A PAYMENT/SET UP PAYMENT ARRANGEMENTS",
+                "page": 1,
+                "summary": "Explains that borrowers in Chapter 13 bankruptcy are not required to make monthly payments unless they arrange direct payment outside the plan. Interest continues to accrue.",
+                "full_text": "Borrowers are not required to make monthly payments during bankruptcy unless they have provided for direct payment outside of their Chapter 13 plan. Interest will continue to accrue while borrowers are in bankruptcy."
+            },
+            {
+                "node_id": "G11_S0001",
+                "title": "Outside pay/direct pay",
+                "page": 1,
+                "summary": "Instructions for reviewing Chapter 13 plans to identify outside or direct payment arrangements.",
+                "full_text": "Review comment to see if we received a Chapter 13 plan indicating outside/direct pay."
+            },
+            {
+                "node_id": "G11_S0002",
+                "title": "GROUP 11 -- TITLE IV/RETURNING TO SCHOOL",
+                "page": 2,
+                "summary": "Requirements for defaulted borrowers to regain federal financial aid eligibility, including submitting a T4 letter and trustee payment history.",
+                "full_text": "To be eligible for federal financial aid, one must submit a T4 letter aka a Default clearance letter. Student loan creditor listed on schedule F. Trustee Payment History - Borrower making at least 6 months of payments."
+            }
+        ]
+    }
+
+    engine = TreeQueryEngine(mock_tree)
+
+    queries = [
+        "Do I need to make payments during bankruptcy?",
+        "What is a T4 letter?",
+        "How can I return to school after default?",
+        "What is outside pay or direct pay?",
+        "Does interest stop during bankruptcy?",
+    ]
+
+    results_log = []
+    for i, query in enumerate(queries, 1):
+        logger.info("-" * 50)
+        logger.info("Query %d: %s", i, query)
+        start = time.time()
+        result = engine.answer(query)
+        latency = time.time() - start
+
+        logger.info("Answer: %s", result["answer"])
+        logger.info("Confidence: %s", result["confidence"])
+        logger.info("Sources: %d | Latency: %.3fs", len(result["sources"]), latency)
+
+        results_log.append({
+            "query_number": i,
+            "query": query,
+            "answer": result["answer"],
+            "confidence": result["confidence"],
+            "sources": result["sources"],
+            "latency_ms": round(latency * 1000, 2)
+        })
+
+    # Save results
+    output_dir = Path("/mnt/agents/output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "tree_query_results.json"
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results_log, f, indent=2)
+
+    logger.info("-" * 50)
+    logger.info("✅ TEST 5 PASSED — Results saved to %s", output_path)
+    logger.info("=" * 60)
+
+    return results_log
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+def run_all_tests():
+    logger.info("Starting Tree Index ONLY Tests")
+    logger.info("=" * 60)
+
+    # Tests that don't require AWS
+    test_section_boundaries()
+    test_json_io()
+    test_query_engine()
+    test_five_queries()
+
+    # Test that requires AWS credentials
+    try:
+        test_tree_index()
+    except Exception as exc:
+        logger.error("TEST 3 FAILED (AWS/Claude required): %s", exc)
+
+    logger.info("=" * 60)
+    logger.info("All tests completed")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    run_all_tests()
+########
+"""
 Vectorless RAG — Step 2 & Step 3
 ================================
 Builds dual index from Textract corpus output:
