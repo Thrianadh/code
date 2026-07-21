@@ -1,3 +1,24 @@
+import weasyprint  # pip install weasyprint
+
+def html_to_pdf(html_content: str, base_url: str = "") -> bytes:
+    """
+    Convert HTML string to PDF bytes.
+    Requires: pip install weasyprint
+    """
+    pdf_bytes = weasyprint.HTML(
+        string=html_content,
+        base_url=base_url
+    ).write_pdf()
+    return pdf_bytes
+
+
+# In crawl_html_and_discover_pdfs(), after extracting markdown:
+# ALSO convert to PDF and save
+
+pdf_bytes = html_to_pdf(resp.text, base_url=url)
+pdf_key = f"{cfg.s3_prefix}/html_as_pdf/{base}.pdf"
+s3.put_object(Bucket=cfg.bucket, Key=pdf_key, Body=pdf_bytes, ContentType="application/pdf")
+result["s3_html_pdf"] = f"s3://{cfg.bucket}/{pdf_key}"
 """
 ECMC Scraper v3 — Textract OCR Edition
 =====================================
