@@ -1,3 +1,10 @@
+Mayank reached out to me and asked, apart from Nova models, to suggest the top three models from Anthropic Claude. He also mentioned that you (Swapnil) had already shortlisted three models and included embedding models like Cohere and Rerank. The models I shortlisted were:
+
+us anthropic claude-sonnet-5
+
+us anthropic.claude-opus-4-8
+
+us.anthropic.claude-opus-4-7
 """
 ECMC unified scraper — v5.
 
