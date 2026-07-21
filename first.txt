@@ -1,3 +1,20 @@
+from textract_pipeline import process_key_list
+
+pdf_list = [
+    "s3://bankrupcy-data-bkt/ecmc_org/understand_bankruptcy_20260721_163208/pdfs/nod.pdf",
+    "s3://bankrupcy-data-bkt/Ecmc_scrape_understand_bankruptcy/reasearch_and_development/BK team.pdf",
+    "s3://bankrupcy-data-bkt/Ecmc_scrape_understand_bankruptcy/reasearch_and_development/ECMC Phone Numbers.pdf",
+]
+
+results = process_key_list(
+    s3_uris=pdf_list,
+    output_bucket="bankrupcy-data-bkt",
+    output_prefix="textract-output",
+)
+
+for r in results:
+    print(r.source_key, r.status)
+#####
 """Run Textract over every PDF from one or more S3 source prefixes —
 typically the scraper's pdfs/ folder and the OneNote research_and_development
 folder. Uses process_batch() unchanged (already handles ordering correctly:
