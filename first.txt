@@ -1,4 +1,354 @@
 """
+Vectorless RAG — Step 2: Tree Index ONLY
+=========================================
+Builds hierarchical tree index from Textract corpus output.
+Uses Claude Sonnet for section summaries.
+
+Input:  corpus.json (from textract_pipeline.py Step 1)
+Output: tree_index.json
+
+Designed for AWS Lambda + Step Functions.
+"""
+
+import json
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import boto3
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+REGION = os.getenv("AWS_REGION", "us-east-1")
+CORPUS_BUCKET = os.getenv("CORPUS_BUCKET", "")
+CORPUS_PREFIX = os.getenv("CORPUS_PREFIX", "extracted/")
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "indices/")
+CLAUDE_MODEL_ID = os.getenv("CLAUDE_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# BEDROCK CLIENT (cached)
+# ---------------------------------------------------------------------------
+_bedrock_client = None
+
+def get_bedrock_client() -> boto3.client:
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+# ---------------------------------------------------------------------------
+# S3 HELPERS
+# ---------------------------------------------------------------------------
+_s3_client = None
+
+def get_s3_client() -> boto3.client:
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+def load_json_from_s3(bucket: str, key: str) -> Dict[str, Any]:
+    s3 = get_s3_client()
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return json.loads(obj["Body"].read())
+
+
+def save_json_to_s3(bucket: str, key: str, data: Dict[str, Any]) -> None:
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(data, indent=2, ensure_ascii=False).encode(),
+        ContentType="application/json",
+    )
+
+
+def list_s3_objects(bucket: str, prefix: str) -> List[str]:
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".json"):
+                keys.append(obj["Key"])
+    return keys
+
+
+# ---------------------------------------------------------------------------
+# BEDROCK CONVERSE API
+# ---------------------------------------------------------------------------
+def bedrock_chat(model_id: str, prompt: str, max_tokens: int = 1024) -> str:
+    client = get_bedrock_client()
+    try:
+        resp = client.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        logger.error("Bedrock error with %s: %s", model_id, exc)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# STEP 2: TREE INDEX BUILDER
+# ---------------------------------------------------------------------------
+def detect_section_boundaries(sequence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Split sequence into sections at heading boundaries."""
+    heading_types = {"title", "section_header"}
+    sections = []
+    current_title = "Untitled"
+    current_lines = []
+    current_page = 1
+
+    for item in sequence:
+        if item["type"] in heading_types:
+            if current_lines:
+                sections.append({
+                    "title": current_title,
+                    "text": "\n".join(current_lines).strip(),
+                    "page": current_page,
+                })
+            current_title = item["text"]
+            current_page = item.get("page", 1)
+            current_lines = []
+        elif item["type"] in ("paragraph", "list_item", "key_value"):
+            if item["type"] == "key_value":
+                current_lines.append(f"{item['key']}: {item['value']}")
+            else:
+                current_lines.append(item["text"])
+        elif item["type"] == "table":
+            current_lines.append(f"[TABLE: {item.get('rows', 0)} rows x {item.get('cols', 0)} cols]")
+        elif item["type"] == "figure":
+            current_lines.append(f"[FIGURE: page {item.get('page', '')}]")
+
+    if current_lines:
+        sections.append({
+            "title": current_title,
+            "text": "\n".join(current_lines).strip(),
+            "page": current_page,
+        })
+
+    return sections
+
+
+def summarize_with_claude(title: str, text: str) -> str:
+    """Ask Claude to summarize a document section in 1-2 sentences."""
+    prompt = (
+        f"Summarize the following ECMC bankruptcy guide section in 1-2 sentences. "
+        f"Be specific about what information it contains. Do not use generic phrases.\n\n"
+        f"Title: {title}\n"
+        f"Content: {text[:3000]}\n\n"
+        f"Summary:"
+    )
+    summary = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=150)
+    return summary or f"Section about {title}"
+
+
+def build_tree_index(corpus_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Build hierarchical tree index from corpus."""
+    doc_id = Path(corpus_data["source_key"]).stem
+    sequence = corpus_data.get("sequence", [])
+
+    logger.info("Building tree index for %s", doc_id)
+
+    sections = detect_section_boundaries(sequence)
+    nodes = []
+
+    for idx, section in enumerate(sections):
+        if idx % 5 == 0:
+            logger.info("  Summarizing section %d/%d", idx + 1, len(sections))
+
+        summary = summarize_with_claude(section["title"], section["text"])
+        nodes.append({
+            "node_id": f"{doc_id}_S{idx:04d}",
+            "title": section["title"],
+            "page": section["page"],
+            "summary": summary,
+            "full_text": section["text"],
+        })
+
+    return {
+        "root": doc_id,
+        "source_key": corpus_data["source_key"],
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "section_count": len(nodes),
+        "nodes": nodes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# QUERY ENGINE (for testing)
+# ---------------------------------------------------------------------------
+class TreeQueryEngine:
+    """Simple query engine over tree index. No vectors, no embeddings."""
+
+    def __init__(self, tree_index: Dict[str, Any]):
+        self.tree = tree_index
+        self.nodes = tree_index.get("nodes", [])
+
+    def _score_node(self, query: str, node: Dict[str, Any]) -> float:
+        """Score how relevant a node is to the query using keyword overlap."""
+        query_words = set(re.findall(r'\b\w+\b', query.lower()))
+        title_words = set(re.findall(r'\b\w+\b', node["title"].lower()))
+        summary_words = set(re.findall(r'\b\w+\b', node["summary"].lower()))
+        text_words = set(re.findall(r'\b\w+\b', node["full_text"].lower()))
+
+        # Weighted scoring
+        title_match = len(query_words & title_words) * 3.0
+        summary_match = len(query_words & summary_words) * 2.0
+        text_match = len(query_words & text_words) * 1.0
+
+        return title_match + summary_match + text_match
+
+    def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Find top-k most relevant nodes for a query."""
+        scored = []
+        for node in self.nodes:
+            score = self._score_node(query, node)
+            if score > 0:
+                scored.append({**node, "score": score})
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:top_k]
+
+    def answer(self, query: str) -> Dict[str, Any]:
+        """Generate a structured answer with citations."""
+        results = self.search(query, top_k=3)
+
+        if not results:
+            return {
+                "query": query,
+                "answer": "No relevant sections found in the document.",
+                "sources": [],
+                "confidence": "none"
+            }
+
+        # Build answer from top result summary + full text
+        top = results[0]
+        answer_text = (
+            f"Based on the section '{top['title']}' (page {top['page']}): "
+            f"{top['summary']}"
+        )
+
+        if len(results) > 1:
+            answer_text += f" Additional context from '{results[1]['title']}'."
+
+        return {
+            "query": query,
+            "answer": answer_text,
+            "sources": [
+                {
+                    "node_id": r["node_id"],
+                    "title": r["title"],
+                    "page": r["page"],
+                    "score": r["score"],
+                    "summary": r["summary"]
+                }
+                for r in results
+            ],
+            "confidence": "high" if top["score"] > 5 else "medium" if top["score"] > 2 else "low"
+        }
+
+
+# ---------------------------------------------------------------------------
+# ORCHESTRATION
+# ---------------------------------------------------------------------------
+def process_single_document(corpus_key: str) -> Dict[str, Any]:
+    """Process one corpus file into tree index."""
+    logger.info("Processing corpus: %s", corpus_key)
+
+    corpus_data = load_json_from_s3(CORPUS_BUCKET, corpus_key)
+    tree = build_tree_index(corpus_data)
+
+    doc_stem = Path(corpus_data["source_key"]).stem
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    tree_key = f"{OUTPUT_PREFIX.rstrip('/')}/{doc_stem}_tree_{timestamp}.json"
+
+    save_json_to_s3(OUTPUT_BUCKET, tree_key, tree)
+
+    logger.info("Saved tree index: %s", tree_key)
+
+    return {
+        "source_key": corpus_data["source_key"],
+        "tree_key": tree_key,
+        "section_count": tree["section_count"],
+        "status": "SUCCEEDED",
+    }
+
+
+def process_all_documents() -> List[Dict[str, Any]]:
+    """Process all corpus files under prefix."""
+    corpus_keys = list_s3_objects(CORPUS_BUCKET, CORPUS_PREFIX)
+    logger.info("Found %d corpus files to process", len(corpus_keys))
+
+    results = []
+    for key in corpus_keys:
+        try:
+            result = process_single_document(key)
+            results.append(result)
+        except Exception as exc:
+            logger.exception("Failed to process %s: %s", key, exc)
+            results.append({
+                "corpus_key": key,
+                "status": "ERROR",
+                "error": str(exc),
+            })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# LAMBDA HANDLER
+# ---------------------------------------------------------------------------
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """AWS Lambda entry point.
+
+    Expected event:
+        {"corpus_key": "extracted/GROUP_11_20260721_091532.json"}
+    Or for batch:
+        {"batch": true}
+    """
+    corpus_key = event.get("corpus_key", "")
+    is_batch = event.get("batch", False)
+
+    if is_batch:
+        return {"results": process_all_documents()}
+    if corpus_key:
+        return process_single_document(corpus_key)
+
+    return {"status": "ERROR", "error": "No corpus_key or batch flag provided"}
+
+
+# ---------------------------------------------------------------------------
+# LOCAL TESTING
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    pass
+##########
+"""
 Test script for Tree Index ONLY + 5 Query Tests.
 
 Usage:
