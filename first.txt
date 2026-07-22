@@ -1,4 +1,384 @@
 """
+Term Index Builder — Flat Domain Term Extraction
+=================================================
+Builds flat term index from Markdown files.
+Extracts domain terms with aliases, cross-document sources, occurrence counts.
+
+Input: 13 Markdown files (same as Tree Index Builder)
+Output: term_index.json
+
+Design:
+    - Re-reads 13 Markdown files (fresh extraction)
+    - Uses Claude Sonnet for term extraction per section
+    - Simple string match deduplication
+    - No glossary definitions (layered later if needed)
+    - Source format: source_key + section_title
+
+Term structure:
+    {
+        "term": "Title IV Eligibility Letter",
+        "aliases": ["Title IV letter", "T4 letter", "TIV letter"],
+        "category": "document",
+        "sources": [
+            {"source_key": "s3://bucket/file.md", "section_title": "What Is a Title IV Letter", "context_snippet": "..."}
+        ],
+        "occurrence_count": 4
+    }
+"""
+
+import json
+import logging
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import boto3
+
+# ============================================================================
+# Configuration
+# ============================================================================
+REGION = os.getenv("AWS_REGION", "us-east-1")
+INPUT_BUCKET = os.getenv("INPUT_BUCKET", "ecmc-dev-bucket")
+MD_PREFIX = os.getenv("MD_PREFIX", "markdown/")
+TEXTRACT_MD_PREFIX = os.getenv("TEXTRACT_MD_PREFIX", "textract_output/")
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "ecmc-dev-bucket")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "indices/")
+CLAUDE_MODEL_ID = os.getenv("CLAUDE_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# AWS Clients
+# ============================================================================
+_s3_client = None
+_bedrock_client = None
+
+
+def get_s3_client() -> boto3.client:
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+def get_bedrock_client() -> boto3.client:
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+# ============================================================================
+# S3 Helpers
+# ============================================================================
+def list_md_keys(bucket: str, prefix: str) -> List[str]:
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            k = obj["Key"]
+            if k.lower().endswith((".md", ".markdown")):
+                keys.append(k)
+                log.info("Found MD file: %s", k)
+    return keys
+
+
+def load_s3_text(bucket: str, key: str) -> str:
+    s3 = get_s3_client()
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+
+
+def save_s3_json(bucket: str, key: str, data: Dict[str, Any]) -> str:
+    s3 = get_s3_client()
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    return f"s3://{bucket}/{key}"
+
+
+# ============================================================================
+# Section Parser (same logic as Tree Index Builder)
+# ============================================================================
+def extract_sections(md_text: str) -> List[Dict[str, Any]]:
+    """
+    Split Markdown into sections at ## and ### headings.
+    Returns list of {title, level, text} dicts.
+    """
+    lines = md_text.splitlines()
+    sections = []
+    current_title = "Untitled"
+    current_level = 0
+    current_lines = []
+    section_counter = 0
+
+    for line in lines:
+        stripped = line.strip()
+
+        # ## Section
+        m2 = re.match(r"^##\s+(.+)", stripped)
+        if m2:
+            if current_lines:
+                sections.append({
+                    "node_id": f"S{section_counter:04d}",
+                    "title": current_title,
+                    "level": current_level,
+                    "text": "\n".join(current_lines).strip()
+                })
+                section_counter += 1
+            current_title = m2.group(1).strip()
+            current_level = 2
+            current_lines = []
+            continue
+
+        # ### Subsection
+        m3 = re.match(r"^###\s+(.+)", stripped)
+        if m3:
+            if current_lines:
+                sections.append({
+                    "node_id": f"S{section_counter:04d}",
+                    "title": current_title,
+                    "level": current_level,
+                    "text": "\n".join(current_lines).strip()
+                })
+                section_counter += 1
+            current_title = m3.group(1).strip()
+            current_level = 3
+            current_lines = []
+            continue
+
+        # Skip title and comments
+        if re.match(r"^#\s+", stripped) or stripped.startswith("<!--") or not stripped:
+            continue
+
+        current_lines.append(stripped)
+
+    # Final section
+    if current_lines:
+        sections.append({
+            "node_id": f"S{section_counter:04d}",
+            "title": current_title,
+            "level": current_level,
+            "text": "\n".join(current_lines).strip()
+        })
+
+    return sections
+
+
+# ============================================================================
+# Claude Term Extraction
+# ============================================================================
+def bedrock_chat(model_id: str, prompt: str, max_tokens: int = 1024) -> str:
+    client = get_bedrock_client()
+    try:
+        resp = client.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        log.error("Bedrock error: %s", exc)
+        return ""
+
+
+def extract_terms_from_section(section_title: str, section_text: str) -> List[Dict[str, Any]]:
+    """
+    Ask Claude to extract domain terms from a section.
+    Returns list of {term, aliases, category} dicts.
+    """
+    prompt = (
+        "You are analyzing an ECMC bankruptcy student loan document section. "
+        "Extract all important domain-specific terms that a borrower or agent "
+        "might ask about. Include legal terms, procedures, forms, loan statuses, "
+        "and specific document names or codes.\n\n"
+        "For each term, provide:\n"
+        "- The canonical term name\n"
+        "- Common aliases or abbreviations\n"
+        - A category: legal, procedure, form, status, or document\n\n"
+        "Return ONLY a JSON array with this exact shape:\n"
+        '[{"term": "Exact Term", "aliases": ["alias1", "alias2"], "category": "legal|procedure|form|status|document"}]\n\n'
+        f"Section title: {section_title}\n"
+        f"Section text:\n{section_text[:3000]}\n\n"
+        "Terms (JSON only):"
+    )
+
+    resp = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=1024)
+
+    terms = []
+    try:
+        cleaned = re.sub(r"```json\s*|\s*```", "", resp).strip()
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            terms = parsed
+        elif isinstance(parsed, dict) and "terms" in parsed:
+            terms = parsed["terms"]
+    except Exception as exc:
+        log.error("Failed to parse Claude response: %s — raw: %s", exc, resp[:200])
+
+    return terms
+
+
+# ============================================================================
+# Term Deduplication (Simple String Match)
+# ============================================================================
+def normalize_term(term: str) -> str:
+    """Normalize term for deduplication."""
+    return re.sub(r"[^\w\s]", "", term.lower()).strip()
+
+
+def merge_term_into_index(
+    term_item: Dict[str, Any],
+    source_key: str,
+    section_title: str,
+    context_snippet: str,
+    term_index: Dict[str, Dict[str, Any]]
+) -> None:
+    """
+    Merge term into index. Simple string match on normalized term name.
+    If term exists, add source. If new, create entry.
+    """
+    term_name = term_item.get("term", "").strip()
+    if not term_name:
+        return
+
+    normalized = normalize_term(term_name)
+
+    if normalized not in term_index:
+        term_index[normalized] = {
+            "term": term_name,
+            "aliases": term_item.get("aliases", []),
+            "category": term_item.get("category", "unknown"),
+            "sources": [],
+            "occurrence_count": 0
+        }
+
+    term_index[normalized]["sources"].append({
+        "source_key": source_key,
+        "section_title": section_title,
+        "context_snippet": context_snippet[:300].replace("\n", " ")
+    })
+    term_index[normalized]["occurrence_count"] += 1
+
+
+# ============================================================================
+# Main Orchestrator
+# ============================================================================
+def process_all_documents() -> Dict[str, Any]:
+    log.info("=" * 60)
+    log.info("Term Index Builder")
+    log.info("Input: s3://%s/%s, s3://%s/%s", INPUT_BUCKET, TEXTRACT_MD_PREFIX, INPUT_BUCKET, MD_PREFIX)
+    log.info("Output: s3://%s/%s", OUTPUT_BUCKET, OUTPUT_PREFIX)
+    log.info("=" * 60)
+
+    # List all Markdown files
+    textract_keys = list_md_keys(INPUT_BUCKET, TEXTRACT_MD_PREFIX)
+    scrapy_keys = list_md_keys(INPUT_BUCKET, MD_PREFIX)
+    all_keys = textract_keys + scrapy_keys
+
+    log.info("TOTAL files found: %d (Textract: %d, Scrapy: %d)",
+             len(all_keys), len(textract_keys), len(scrapy_keys))
+
+    if not all_keys:
+        log.error("NO Markdown files found!")
+        return {"status": "ERROR", "error": "No files found"}
+
+    # Build term index
+    term_index: Dict[str, Dict[str, Any]] = {}
+
+    for key in all_keys:
+        try:
+            log.info("Processing: %s", key)
+            md_text = load_s3_text(INPUT_BUCKET, key)
+            doc_id = Path(key).stem
+
+            sections = extract_sections(md_text)
+            log.info("  -> %d sections", len(sections))
+
+            for sec in sections:
+                if not sec["text"].strip():
+                    continue
+
+                # Extract terms from section
+                terms = extract_terms_from_section(sec["title"], sec["text"])
+
+                for term_item in terms:
+                    merge_term_into_index(
+                        term_item=term_item,
+                        source_key=key,
+                        section_title=sec["title"],
+                        context_snippet=sec["text"],
+                        term_index=term_index
+                    )
+
+        except Exception as exc:
+            log.exception("Failed to process %s: %s", key, exc)
+
+    if not term_index:
+        log.error("No terms extracted!")
+        return {"status": "ERROR", "error": "No terms extracted"}
+
+    # Build output
+    unified_terms = {
+        "index_type": "term",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "total_terms": len(term_index),
+        "terms": list(term_index.values())
+    }
+
+    # Save to S3
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    term_key = f"{OUTPUT_PREFIX.rstrip('/')}/term_index_{timestamp}.json"
+    term_uri = save_s3_json(OUTPUT_BUCKET, term_key, unified_terms)
+
+    log.info("=" * 60)
+    log.info("COMPLETE: %d unique terms", len(term_index))
+    log.info("Output: %s", term_uri)
+    log.info("=" * 60)
+
+    return {
+        "status": "SUCCEEDED",
+        "term_index_uri": term_uri,
+        "total_terms": len(term_index),
+        "sample_terms": [t["term"] for t in list(term_index.values())[:5]]
+    }
+
+
+# ============================================================================
+# Lambda Handler
+# ============================================================================
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    global REGION, INPUT_BUCKET, TEXTRACT_MD_PREFIX, MD_PREFIX
+    global OUTPUT_BUCKET, OUTPUT_PREFIX, CLAUDE_MODEL_ID
+    global _s3_client, _bedrock_client
+
+    REGION = event.get("aws_region", REGION)
+    INPUT_BUCKET = event.get("input_bucket", INPUT_BUCKET)
+    TEXTRACT_MD_PREFIX = event.get("textract_md_prefix", TEXTRACT_MD_PREFIX)
+    MD_PREFIX = event.get("md_prefix", MD_PREFIX)
+    OUTPUT_BUCKET = event.get("output_bucket", OUTPUT_BUCKET)
+    OUTPUT_PREFIX = event.get("output_prefix", OUTPUT_PREFIX)
+    CLAUDE_MODEL_ID = event.get("claude_model_id", CLAUDE_MODEL_ID)
+
+    _s3_client = None
+    _bedrock_client = None
+
+    return process_all_documents()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    result = process_all_documents()
+    print(json.dumps(result, indent=2, default=str))
+#######
+"""
 Tree Index Builder — Markdown to Hierarchical Index
 ====================================================
 Builds tree index from Markdown files with typed sequence blocks.
