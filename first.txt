@@ -1,4 +1,541 @@
 """
+Query Engine — Vectorless RAG Query Interface
+=============================================
+Answers user questions using Tree Index + Term Index.
+
+Input: User question (text) + tree_index.json + term_index.json
+Output: Answer with citations and confidence score
+
+Supports:
+    - Term queries: "What is a T4 letter?" → Term Index lookup
+    - Section queries: "How do I make payments?" → Tree Index keyword search
+    - Hybrid: combines both paths
+
+Design decisions (confirmed):
+    - Input: CLI + Lambda compatible
+    - Output: JSON with answer, citations, confidence
+    - Citation: detailed (source_key + section_title)
+    - Top-K: 3 for term, 5 for section
+    - Fallback: "not found" + suggest related terms
+    - Claude model: same as index builders
+"""
+
+import json
+import logging
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+
+# ============================================================================
+# Configuration
+# ============================================================================
+REGION = os.getenv("AWS_REGION", "us-east-1")
+INPUT_BUCKET = os.getenv("INPUT_BUCKET", "ecmc-dev-bucket")
+TREE_INDEX_PREFIX = os.getenv("TREE_INDEX_PREFIX", "indices/tree_index_")
+TERM_INDEX_PREFIX = os.getenv("TERM_INDEX_PREFIX", "indices/term_index_")
+CLAUDE_MODEL_ID = os.getenv("CLAUDE_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# AWS Client
+# ============================================================================
+_bedrock_client = None
+_s3_client = None
+
+
+def get_bedrock_client() -> boto3.client:
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+def get_s3_client() -> boto3.client:
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+# ============================================================================
+# S3 Helpers
+# ============================================================================
+def list_index_keys(bucket: str, prefix: str) -> List[str]:
+    """List latest index file under prefix."""
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".json"):
+                keys.append(obj["Key"])
+    # Return latest (sorted by key name which includes timestamp)
+    return sorted(keys, reverse=True)
+
+
+def load_s3_json(bucket: str, key: str) -> Dict[str, Any]:
+    s3 = get_s3_client()
+    return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+
+
+def load_index(bucket: str, prefix: str) -> Optional[Dict[str, Any]]:
+    """Load latest index file from S3."""
+    keys = list_index_keys(bucket, prefix)
+    if not keys:
+        log.error("No index found for prefix: %s", prefix)
+        return None
+    latest = keys[0]
+    log.info("Loading index: s3://%s/%s", bucket, latest)
+    return load_s3_json(bucket, latest)
+
+
+# ============================================================================
+# Bedrock Chat
+# ============================================================================
+def bedrock_chat(model_id: str, prompt: str, max_tokens: int = 1024) -> str:
+    client = get_bedrock_client()
+    try:
+        resp = client.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        log.error("Bedrock error: %s", exc)
+        return ""
+
+
+# ============================================================================
+# Query Result
+# ============================================================================
+@dataclass
+class QueryResult:
+    query: str
+    answer: str
+    citations: List[Dict[str, str]] = field(default_factory=list)
+    confidence: str = "none"
+    sources_used: int = 0
+    query_type: str = "unknown"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query": self.query,
+            "answer": self.answer,
+            "citations": self.citations,
+            "confidence": self.confidence,
+            "sources_used": self.sources_used,
+            "query_type": self.query_type
+        }
+
+
+# ============================================================================
+# Term Lookup
+# ============================================================================
+class TermLookup:
+    """Search Term Index for canonical terms and aliases."""
+
+    def __init__(self, term_index: Dict[str, Any]):
+        self.terms = term_index.get("terms", [])
+        self._build_index()
+
+    def _build_index(self):
+        """Build normalized lookup maps."""
+        self.by_term: Dict[str, Dict] = {}      # normalized canonical -> term
+        self.by_alias: Dict[str, str] = {}     # normalized alias -> canonical
+
+        for term in self.terms:
+            canonical = self._normalize(term["term"])
+            self.by_term[canonical] = term
+
+            for alias in term.get("aliases", []):
+                norm_alias = self._normalize(alias)
+                self.by_alias[norm_alias] = canonical
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return re.sub(r"[^\w\s]", "", text.lower()).strip()
+
+    def search(self, query: str) -> Optional[Dict[str, Any]]:
+        """
+        Search for term by query.
+        Returns term entry with all sources if found, None otherwise.
+        """
+        norm_query = self._normalize(query)
+
+        # Direct match on canonical term
+        if norm_query in self.by_term:
+            return self.by_term[norm_query]
+
+        # Match on alias
+        if norm_query in self.by_alias:
+            canonical = self.by_alias[norm_query]
+            return self.by_term.get(canonical)
+
+        # Partial match: check if query is substring of any term/alias
+        for canonical, term in self.by_term.items():
+            if norm_query in canonical:
+                return term
+            for alias in term.get("aliases", []):
+                if norm_query in self._normalize(alias):
+                    return term
+
+        return None
+
+    def get_related_terms(self, query: str, top_k: int = 3) -> List[str]:
+        """Suggest related terms if exact match not found."""
+        norm_query = self._normalize(query)
+        scored = []
+
+        for term in self.terms:
+            canonical = self._normalize(term["term"])
+            score = 0
+            if norm_query in canonical or canonical in norm_query:
+                score += 2
+            for alias in term.get("aliases", []):
+                if norm_query in self._normalize(alias):
+                    score += 1
+            if score > 0:
+                scored.append((score, term["term"]))
+
+        scored.sort(reverse=True)
+        return [t[1] for t in scored[:top_k]]
+
+
+# ============================================================================
+# Section Retriever
+# ============================================================================
+class SectionRetriever:
+    """Search Tree Index for relevant sections by keywords."""
+
+    def __init__(self, tree_index: Dict[str, Any]):
+        self.documents = tree_index.get("documents", [])
+        self._flatten_nodes()
+
+    def _flatten_nodes(self):
+        """Flatten all nodes from all documents into searchable list."""
+        self.all_nodes = []
+        for doc in self.documents:
+            for node in doc.get("nodes", []):
+                self.all_nodes.append({
+                    **node,
+                    "doc_id": doc.get("doc_id", "unknown"),
+                    "doc_title": doc.get("doc_title", "unknown")
+                })
+
+    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Score nodes by keyword overlap and return top-K.
+        """
+        query_words = set(self._tokenize(query))
+        scored = []
+
+        for node in self.all_nodes:
+            score = self._score_node(node, query_words)
+            if score > 0:
+                scored.append({**node, "_score": score})
+
+        scored.sort(key=lambda x: x["_score"], reverse=True)
+        return scored[:top_k]
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """Simple tokenization."""
+        return re.findall(r"\b\w+\b", text.lower())
+
+    def _score_node(self, node: Dict, query_words: set) -> float:
+        """Score how relevant a node is to query."""
+        title_words = set(self._tokenize(node.get("title", "")))
+        summary_words = set(self._tokenize(node.get("summary", "")))
+        text_words = set(self._tokenize(node.get("full_text", "")))
+
+        # Weighted scoring
+        title_match = len(query_words & title_words) * 3.0
+        summary_match = len(query_words & summary_words) * 2.0
+        text_match = len(query_words & text_words) * 1.0
+
+        return title_match + summary_match + text_match
+
+
+# ============================================================================
+# Context Builder
+# ============================================================================
+class ContextBuilder:
+    """Format retrieved sections into Claude prompt context."""
+
+    @staticmethod
+    def build_context(sections: List[Dict[str, Any]]) -> str:
+        """Build structured context string from sections."""
+        parts = []
+        for i, sec in enumerate(sections, 1):
+            part = ContextBuilder._format_section(sec, i)
+            parts.append(part)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _format_section(sec: Dict, index: int) -> str:
+        """Format single section for context."""
+        lines = [f"[SOURCE {index}]"]
+        lines.append(f"Document: {sec.get('doc_title', 'unknown')} ({sec.get('doc_id', 'unknown')})")
+        lines.append(f"Section: {sec.get('title', 'Untitled')}")
+        lines.append(f"Summary: {sec.get('summary', 'No summary')}")
+        lines.append("")
+
+        # Add sequence blocks
+        for block in sec.get("sequence", []):
+            btype = block.get("type", "unknown")
+            content = block.get("content", {})
+
+            if btype == "paragraph":
+                lines.append(content)
+            elif btype == "table":
+                cols = ", ".join(content.get("columns", []))
+                lines.append(f"[TABLE: columns = {cols}]")
+            elif btype == "list":
+                items = content.get("items", [])
+                for item in items:
+                    lines.append(f"  - {item}")
+            elif btype == "figure":
+                alt = content.get("alt_text", "no description")
+                lines.append(f"[FIGURE: {alt}]")
+            elif btype == "key_value":
+                lines.append(f"{content['key']}: {content['value']}")
+
+        return "\n".join(lines)
+
+
+# ============================================================================
+# Answer Generator
+# ============================================================================
+class AnswerGenerator:
+    """Generate answer using Claude with retrieved context."""
+
+    def __init__(self, model_id: str = CLAUDE_MODEL_ID):
+        self.model_id = model_id
+
+    def generate(self, query: str, context: str, citations: List[Dict]) -> Tuple[str, str]:
+        """
+        Generate answer from context.
+        Returns (answer, confidence).
+        """
+        prompt = self._build_prompt(query, context)
+        response = bedrock_chat(self.model_id, prompt, max_tokens=2048)
+
+        # Simple confidence based on response quality
+        confidence = self._assess_confidence(response, citations)
+
+        return response, confidence
+
+    def _build_prompt(self, query: str, context: str) -> str:
+        return (
+            "You are an ECMC bankruptcy student loan document assistant. "
+            "Answer the user's question using ONLY the provided context below. "
+            "Be specific and accurate. If the context does not contain the answer, say so clearly. "
+            "Cite the source number [SOURCE N] when referencing information.\n\n"
+            f"{context}\n\n"
+            f"[USER QUESTION]\n{query}\n\n"
+            "[ANSWER]"
+        )
+
+    @staticmethod
+    def _assess_confidence(answer: str, citations: List[Dict]) -> str:
+        """Assess confidence based on answer quality and citations."""
+        if not answer or len(answer) < 20:
+            return "none"
+        if "not found" in answer.lower() or "not contain" in answer.lower():
+            return "low"
+        if len(citations) >= 3:
+            return "high"
+        if len(citations) >= 1:
+            return "medium"
+        return "low"
+
+
+# ============================================================================
+# Query Engine (Main)
+# ============================================================================
+class QueryEngine:
+    """
+    Main query engine combining Term Index + Tree Index.
+    """
+
+    def __init__(self, tree_index: Dict[str, Any], term_index: Dict[str, Any]):
+        self.term_lookup = TermLookup(term_index)
+        self.section_retriever = SectionRetriever(tree_index)
+        self.context_builder = ContextBuilder()
+        self.answer_generator = AnswerGenerator()
+
+    def query(self, user_query: str) -> QueryResult:
+        """
+        Process user query and return answer.
+        """
+        log.info("Query: %s", user_query)
+
+        # Try term lookup first
+        term_result = self.term_lookup.search(user_query)
+
+        if term_result:
+            return self._handle_term_query(user_query, term_result)
+        else:
+            return self._handle_section_query(user_query)
+
+    def _handle_term_query(self, query: str, term: Dict) -> QueryResult:
+        """Handle term-based query."""
+        log.info("Term match: %s", term["term"])
+
+        # Load sections from tree index using term sources
+        sources = term.get("sources", [])
+        sections = self._load_sections_from_sources(sources)
+
+        if not sections:
+            # Fallback to keyword search
+            sections = self.section_retriever.search(query, top_k=3)
+
+        return self._generate_answer(query, sections, "term")
+
+    def _handle_section_query(self, query: str) -> QueryResult:
+        """Handle general section query."""
+        log.info("No term match, using section search")
+
+        sections = self.section_retriever.search(query, top_k=5)
+
+        if not sections:
+            # Suggest related terms
+            suggestions = self.term_lookup.get_related_terms(query)
+            return QueryResult(
+                query=query,
+                answer=f"No relevant information found. Did you mean: {', '.join(suggestions)}?" if suggestions else "No relevant information found.",
+                confidence="none",
+                query_type="section"
+            )
+
+        return self._generate_answer(query, sections, "section")
+
+    def _load_sections_from_sources(self, sources: List[Dict]) -> List[Dict]:
+        """Load section nodes from Tree Index matching term sources."""
+        sections = []
+        for src in sources:
+            section_title = src.get("section_title", "")
+            # Find matching node in tree
+            for node in self.section_retriever.all_nodes:
+                if node.get("title") == section_title:
+                    sections.append(node)
+                    break
+        return sections
+
+    def _generate_answer(self, query: str, sections: List[Dict], query_type: str) -> QueryResult:
+        """Build context, generate answer, format result."""
+        # Build citations
+        citations = []
+        for sec in sections:
+            citations.append({
+                "document": sec.get("doc_title", "unknown"),
+                "doc_id": sec.get("doc_id", "unknown"),
+                "section": sec.get("title", "Untitled"),
+                "node_id": sec.get("node_id", "unknown")
+            })
+
+        # Build context and generate answer
+        context = self.context_builder.build_context(sections)
+        answer, confidence = self.answer_generator.generate(query, context, citations)
+
+        return QueryResult(
+            query=query,
+            answer=answer,
+            citations=citations,
+            confidence=confidence,
+            sources_used=len(sections),
+            query_type=query_type
+        )
+
+
+# ============================================================================
+# Main Orchestrator
+# ============================================================================
+def run_query(user_query: str) -> Dict[str, Any]:
+    """
+    Load indices and run query.
+    """
+    log.info("=" * 60)
+    log.info("Query Engine")
+    log.info("Query: %s", user_query)
+    log.info("=" * 60)
+
+    # Load indices from S3
+    tree_index = load_index(INPUT_BUCKET, TREE_INDEX_PREFIX)
+    term_index = load_index(INPUT_BUCKET, TERM_INDEX_PREFIX)
+
+    if not tree_index or not term_index:
+        return {
+            "status": "ERROR",
+            "error": "Failed to load indices",
+            "tree_loaded": tree_index is not None,
+            "term_loaded": term_index is not None
+        }
+
+    # Run query
+    engine = QueryEngine(tree_index, term_index)
+    result = engine.query(user_query)
+
+    log.info("=" * 60)
+    log.info("Answer: %s", result.answer[:200])
+    log.info("Confidence: %s", result.confidence)
+    log.info("Sources: %d", result.sources_used)
+    log.info("=" * 60)
+
+    return {
+        "status": "SUCCEEDED",
+        **result.to_dict()
+    }
+
+
+# ============================================================================
+# Lambda Handler
+# ============================================================================
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    global REGION, INPUT_BUCKET, TREE_INDEX_PREFIX, TERM_INDEX_PREFIX, CLAUDE_MODEL_ID
+    global _bedrock_client, _s3_client
+
+    REGION = event.get("aws_region", REGION)
+    INPUT_BUCKET = event.get("input_bucket", INPUT_BUCKET)
+    TREE_INDEX_PREFIX = event.get("tree_index_prefix", TREE_INDEX_PREFIX)
+    TERM_INDEX_PREFIX = event.get("term_index_prefix", TERM_INDEX_PREFIX)
+    CLAUDE_MODEL_ID = event.get("claude_model_id", CLAUDE_MODEL_ID)
+
+    _bedrock_client = None
+    _s3_client = None
+
+    query = event.get("query", "")
+    if not query:
+        return {"status": "ERROR", "error": "No query provided"}
+
+    return run_query(query)
+
+
+# ============================================================================
+# CLI Entry Point
+# ============================================================================
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
+    # Get query from command line or use default
+    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "What is a T4 letter?"
+
+    result = run_query(query)
+    print(json.dumps(result, indent=2, default=str))
+###########
+"""
 Term Index Builder — Flat Domain Term Extraction
 =================================================
 Builds flat term index from Markdown files.
