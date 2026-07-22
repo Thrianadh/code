@@ -1,4 +1,703 @@
 """
+ECMC Textract Pipeline — PDF Extraction with Optional Nova Enhancement
+======================================================================
+Processes PDFs through AWS Textract (LAYOUT + TABLES + FORMS).
+If NOVA_ENABLED=true, detected figures are analyzed via Nova Lite and
+descriptions are embedded into the markdown output.
+
+Outputs per PDF:
+    - .json : Full Textract block data + sequence
+    - .md   : Markdown with embedded figure descriptions (if Nova enabled)
+    - .txt  : Plain text version
+
+Environment:
+    NOVA_ENABLED=true|false  (default: false)
+"""
+
+import json
+import logging
+import math
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from warnings import filterwarnings
+
+import boto3
+import fitz  # PyMuPDF — for figure cropping
+
+filterwarnings("ignore")
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# Configuration
+# ============================================================================
+REGION = os.getenv("AWS_REGION", "us-east-1")
+INPUT_BUCKET = os.getenv("INPUT_BUCKET", "ecmc-dev-bucket")
+PDF_PREFIX = os.getenv("PDF_PREFIX", "pdfs/")
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "ecmc-dev-bucket")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "textract_output/")
+NOVA_ENABLED = os.getenv("NOVA_ENABLED", "false").lower() == "true"
+NOVA_MODEL_ID = os.getenv("NOVA_MODEL_ID", "us.amazon.nova-lite-v1:0")
+
+TEXTRACT_POLL_SECONDS = 5
+TEXTRACT_MAX_POLL_SECONDS = 1800
+
+log.info("Configuration: NOVA_ENABLED=%s, REGION=%s", NOVA_ENABLED, REGION)
+
+# ============================================================================
+# AWS Clients (cached)
+# ============================================================================
+_textract_client = None
+_bedrock_client = None
+_s3_client = None
+
+
+def get_textract_client():
+    global _textract_client
+    if _textract_client is None:
+        _textract_client = boto3.client("textract", region_name=REGION)
+    return _textract_client
+
+
+def get_bedrock_client():
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+# ============================================================================
+# S3 Helpers
+# ============================================================================
+def list_pdf_keys(bucket: str, prefix: str) -> List[str]:
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            k = obj["Key"]
+            if k.lower().endswith(".pdf"):
+                keys.append(k)
+    return keys
+
+
+def load_s3_bytes(bucket: str, key: str) -> bytes:
+    s3 = get_s3_client()
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
+def save_s3_object(bucket: str, key: str, body: bytes, content_type: str):
+    s3 = get_s3_client()
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type)
+    return f"s3://{bucket}/{key}"
+
+
+# ============================================================================
+# Textract Core
+# ============================================================================
+def start_textract_job(bucket: str, key: str) -> str:
+    textract = get_textract_client()
+    resp = textract.start_document_analysis(
+        DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
+        FeatureTypes=["LAYOUT", "TABLES", "FORMS"],
+    )
+    job_id = resp["JobId"]
+    log.info("Started Textract job %s for s3://%s/%s", job_id, bucket, key)
+    return job_id
+
+
+def wait_for_textract_job(job_id: str) -> Dict[str, Any]:
+    textract = get_textract_client()
+    started = time.time()
+
+    while True:
+        resp = textract.get_document_analysis(JobId=job_id)
+        status = resp["JobStatus"]
+        if status in ("SUCCEEDED", "FAILED"):
+            break
+        if time.time() - started > TEXTRACT_MAX_POLL_SECONDS:
+            log.error("Job %s timed out", job_id)
+            return {"JobStatus": "TIMEOUT", "Blocks": []}
+        time.sleep(TEXTRACT_POLL_SECONDS)
+
+    if status != "SUCCEEDED":
+        log.error("Job %s failed: %s", job_id, resp.get("StatusMessage", "Unknown"))
+        return resp
+
+    blocks = list(resp.get("Blocks", []))
+    next_token = resp.get("NextToken")
+    while next_token:
+        page = textract.get_document_analysis(JobId=job_id, NextToken=next_token)
+        blocks.extend(page.get("Blocks", []))
+        next_token = page.get("NextToken")
+
+    resp["Blocks"] = blocks
+    log.info("Job %s completed: %d blocks", job_id, len(blocks))
+    return resp
+
+
+def index_blocks(blocks: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {b["Id"]: b for b in blocks}
+
+
+def extract_cell_text(cell: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
+    words = []
+    for rel in cell.get("Relationships", []):
+        if rel["Type"] == "CHILD":
+            for wid in rel["Ids"]:
+                child = by_id.get(wid)
+                if not child:
+                    continue
+                if child["BlockType"] == "WORD":
+                    words.append(child.get("Text", ""))
+                elif child["BlockType"] == "SELECTION_ELEMENT":
+                    words.append("[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(words).strip()
+
+
+def grid_to_markdown(grid: List[List[str]]) -> str:
+    if not grid:
+        return ""
+    lines = ["| " + " | ".join(grid[0]) + " |"]
+    lines.append("|" + "|".join([" --- "] * len(grid[0])) + "|")
+    for row in grid[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def extract_tables(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_id = index_blocks(blocks)
+    tables = []
+    for block in blocks:
+        if block["BlockType"] != "TABLE":
+            continue
+        cells = []
+        for rel in block.get("Relationships", []):
+            if rel["Type"] == "CHILD":
+                for cid in rel["Ids"]:
+                    child = by_id.get(cid)
+                    if child and child["BlockType"] == "CELL":
+                        cells.append(child)
+        if not cells:
+            continue
+        max_row = max(c["RowIndex"] for c in cells)
+        max_col = max(c["ColumnIndex"] for c in cells)
+        grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+        for cell in cells:
+            text = extract_cell_text(cell, by_id)
+            r, c = cell["RowIndex"] - 1, cell["ColumnIndex"] - 1
+            grid[r][c] = text
+        tables.append({
+            "table_id": block["Id"],
+            "page": block.get("Page", 1),
+            "rows": max_row,
+            "cols": max_col,
+            "markdown": grid_to_markdown(grid),
+            "grid": grid,
+        })
+    return tables
+
+
+def extract_forms(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_id = index_blocks(blocks)
+    fields = []
+    for block in blocks:
+        if block["BlockType"] != "KEY_VALUE_SET":
+            continue
+        if "KEY" not in (block.get("EntityTypes") or []):
+            continue
+        key_text = extract_cell_text(block, by_id)
+        value_id = None
+        for rel in block.get("Relationships", []):
+            if rel["Type"] == "VALUE" and rel.get("Ids"):
+                value_id = rel["Ids"][0]
+                break
+        value_text = ""
+        if value_id:
+            value_block = by_id.get(value_id)
+            if value_block:
+                value_text = extract_cell_text(value_block, by_id)
+        if key_text:
+            fields.append({
+                "key_id": block["Id"],
+                "page": block.get("Page", 1),
+                "key": key_text.rstrip(":").rstrip(),
+                "value": value_text,
+            })
+    return fields
+
+
+def detect_figures(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    figures = []
+    for block in blocks:
+        if block["BlockType"] == "LAYOUT_FIGURE":
+            figures.append({
+                "figure_id": block["Id"],
+                "page": block.get("Page", 1),
+                "bbox": block["Geometry"]["BoundingBox"],
+            })
+    return figures
+
+
+def bbox_overlap(box_a: Dict[str, float], box_b: Dict[str, float]) -> float:
+    ax0, ay0 = box_a["Left"], box_a["Top"]
+    ax1, ay1 = ax0 + box_a["Width"], ay0 + box_a["Height"]
+    bx0, by0 = box_b["Left"], box_b["Top"]
+    bx1, by1 = bx0 + box_b["Width"], by0 + box_b["Height"]
+    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    iy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    intersection = ix * iy
+    union = box_a["Width"] * box_a["Height"] + box_b["Width"] * box_b["Height"] - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def build_sequence(blocks: List[Dict[str, Any]], tables: List[Dict], forms: List[Dict]) -> List[Dict[str, Any]]:
+    by_id = index_blocks(blocks)
+    tables_by_id = {t["table_id"]: t for t in tables}
+    forms_by_id = {f["key_id"]: f for f in forms}
+
+    text_kind_map = {
+        "LAYOUT_TITLE": "title",
+        "LAYOUT_SECTION_HEADER": "section_header",
+        "LAYOUT_TEXT": "paragraph",
+    }
+
+    sequence = []
+    matched_tables = set()
+    matched_forms = set()
+
+    for block in blocks:
+        btype = block["BlockType"]
+        page = block.get("Page", 1)
+
+        if btype in text_kind_map:
+            line_ids = [cid for rel in block.get("Relationships", [])
+                       if rel["Type"] == "CHILD" for cid in rel["Ids"]]
+            lines = [by_id[lid]["Text"] for lid in line_ids
+                    if by_id.get(lid, {}).get("BlockType") == "LINE"]
+            text = " ".join(lines).strip()
+            if text:
+                sequence.append({"type": text_kind_map[btype], "page": page, "text": text})
+
+        elif btype == "LAYOUT_LIST":
+            for rel in block.get("Relationships", []):
+                if rel["Type"] == "CHILD":
+                    for lid in rel["Ids"]:
+                        line = by_id.get(lid)
+                        if line and line.get("BlockType") == "LINE" and line.get("Text", "").strip():
+                            sequence.append({"type": "list_item", "page": page, "text": line["Text"].strip()})
+
+        elif btype == "LAYOUT_TABLE":
+            layout_box = block["Geometry"]["BoundingBox"]
+            best_id = None
+            best_overlap = 0.0
+            for candidate in blocks:
+                if candidate["BlockType"] != "TABLE":
+                    continue
+                if candidate.get("Page", 1) != page:
+                    continue
+                overlap = bbox_overlap(layout_box, candidate["Geometry"]["BoundingBox"])
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_id = candidate["Id"]
+            if best_id and best_id in tables_by_id:
+                matched_tables.add(best_id)
+                t = tables_by_id[best_id]
+                sequence.append({
+                    "type": "table", "page": page, "table_id": best_id,
+                    "markdown": t["markdown"], "grid": t["grid"],
+                    "rows": t["rows"], "cols": t["cols"],
+                })
+
+        elif btype == "LAYOUT_KEY_VALUE":
+            layout_box = block["Geometry"]["BoundingBox"]
+            best_id = None
+            best_overlap = 0.0
+            for candidate in blocks:
+                if candidate["BlockType"] != "KEY_VALUE_SET":
+                    continue
+                if "KEY" not in (candidate.get("EntityTypes") or []):
+                    continue
+                if candidate.get("Page", 1) != page:
+                    continue
+                overlap = bbox_overlap(layout_box, candidate["Geometry"]["BoundingBox"])
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_id = candidate["Id"]
+            if best_id and best_id in forms_by_id:
+                matched_forms.add(best_id)
+                f = forms_by_id[best_id]
+                sequence.append({
+                    "type": "key_value", "page": page,
+                    "key": f["key"], "value": f["value"],
+                })
+
+        elif btype == "LAYOUT_FIGURE":
+            sequence.append({
+                "type": "figure", "page": page,
+                "figure_id": block["Id"],
+                "bbox": block["Geometry"]["BoundingBox"],
+                "description": None,  # Filled by Nova if enabled
+            })
+
+    # Append unmatched
+    for t in tables:
+        if t["table_id"] not in matched_tables:
+            sequence.append({
+                "type": "table", "page": t["page"],
+                "table_id": t["table_id"], "markdown": t["markdown"],
+                "grid": t["grid"], "rows": t["rows"], "cols": t["cols"],
+            })
+    for f in forms:
+        if f["key_id"] not in matched_forms:
+            sequence.append({
+                "type": "key_value", "page": f["page"],
+                "key": f["key"], "value": f["value"],
+            })
+
+    return sequence
+
+
+# ============================================================================
+# Nova Figure Analysis (Optional)
+# ============================================================================
+def bedrock_converse(model_id: str, prompt: str, image_bytes: Optional[bytes] = None, max_tokens: int = 1024) -> str:
+    client = get_bedrock_client()
+    content = [{"text": prompt}]
+    if image_bytes:
+        import base64
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        content.append({
+            "image": {
+                "format": "png",
+                "source": {"bytes": b64_image}
+            }
+        })
+    try:
+        resp = client.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": content}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        log.error("Bedrock error: %s", exc)
+        return ""
+
+
+def analyze_figure_with_nova(pdf_bytes: bytes, figure: Dict[str, Any], doc_context: str = "") -> str:
+    """
+    Crop figure from PDF using bounding box, send to Nova for analysis.
+    """
+    page_num = figure["page"] - 1
+    bbox = figure["bbox"]
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page = doc[page_num]
+        page_rect = page.rect
+
+        x0 = bbox["Left"] * page_rect.width
+        y0 = bbox["Top"] * page_rect.height
+        x1 = x0 + bbox["Width"] * page_rect.width
+        y1 = y0 + bbox["Height"] * page_rect.height
+
+        clip_rect = fitz.Rect(x0, y0, x1, y1)
+        pix = page.get_pixmap(clip=clip_rect, dpi=200)
+        img_bytes = pix.tobytes("png")
+
+        prompt = (
+            f"You are analyzing a figure from an ECMC bankruptcy document. "
+            f"Document context: {doc_context[:500]}\n\n"
+            f"Analyze this image and describe:\n"
+            f"1. What type of content is this? (screenshot, diagram, form, table-image, flowchart, etc.)\n"
+            f"2. If it contains UI elements, list them with labels and purposes.\n"
+            f"3. If it contains a form or table, extract all visible fields/data.\n"
+            f"4. If it is a flowchart or diagram, describe the process step-by-step.\n"
+            f"5. If it is a software screenshot, describe user actions.\n\n"
+            f"Return structured text. Be specific."
+        )
+
+        return bedrock_converse(NOVA_MODEL_ID, prompt, image_bytes=img_bytes, max_tokens=2048)
+
+    finally:
+        doc.close()
+
+
+def enhance_figures_with_nova(pdf_bytes: bytes, sequence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    If NOVA_ENABLED=true, analyze all figure blocks and embed descriptions.
+    If false, leave descriptions as None (converted to placeholder in markdown).
+    """
+    if not NOVA_ENABLED:
+        log.info("NOVA_ENABLED=false, skipping figure analysis")
+        for item in sequence:
+            if item["type"] == "figure":
+                item["description"] = None
+        return sequence
+
+    figures = [item for item in sequence if item["type"] == "figure"]
+    if not figures:
+        log.info("No figures detected, Nova not needed")
+        return sequence
+
+    log.info("NOVA_ENABLED=true, analyzing %d figures with Nova", len(figures))
+
+    # Build context from surrounding text
+    context_parts = []
+    for item in sequence:
+        if item["type"] in ("title", "section_header", "paragraph"):
+            context_parts.append(item.get("text", ""))
+    doc_context = " ".join(context_parts)[:1000]
+
+    for item in figures:
+        try:
+            description = analyze_figure_with_nova(pdf_bytes, item, doc_context)
+            item["description"] = description
+            item["nova_analyzed"] = True
+            log.info("Figure page %d analyzed successfully", item["page"])
+        except Exception as e:
+            log.warning("Failed to analyze figure page %d: %s", item["page"], e)
+            item["description"] = f"[Figure analysis failed: {str(e)}]"
+            item["nova_analyzed"] = False
+
+    return sequence
+
+
+# ============================================================================
+# Output Formatters
+# ============================================================================
+def sequence_to_markdown(sequence: List[Dict[str, Any]]) -> str:
+    lines = []
+    for item in sequence:
+        kind = item["type"]
+        if kind == "title":
+            lines.append(f"# {item['text']}")
+        elif kind == "section_header":
+            lines.append(f"## {item['text']}")
+        elif kind == "paragraph":
+            lines.append(item["text"])
+        elif kind == "list_item":
+            lines.append(f"- {item['text']}")
+        elif kind == "table":
+            lines.append(item["markdown"])
+        elif kind == "key_value":
+            lines.append(f"**{item['key']}:** {item['value']}")
+        elif kind == "figure":
+            desc = item.get("description")
+            if desc:
+                lines.append(f"**[Figure — page {item['page']}]**\n{desc}")
+            else:
+                lines.append(f"**[Figure — page {item['page']}]**")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def sequence_to_text(sequence: List[Dict[str, Any]]) -> str:
+    lines = []
+    current_page = 0
+    for item in sequence:
+        page = item.get("page", 1)
+        if page != current_page:
+            lines.append(f"[PAGE {page}]")
+            current_page = page
+
+        kind = item["type"]
+        if kind == "list_item":
+            lines.append(f"  - {item['text']}")
+        elif kind in ("title", "section_header", "paragraph"):
+            lines.append(item["text"])
+        elif kind == "table":
+            lines.append("[TABLE]")
+        elif kind == "key_value":
+            lines.append(f"{item['key']}: {item['value']}")
+        elif kind == "figure":
+            desc = item.get("description")
+            if desc:
+                lines.append(f"[FIGURE: page {page}] {desc}")
+            else:
+                lines.append(f"[FIGURE: page {page}]")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+def process_single_pdf(bucket: str, key: str) -> Dict[str, Any]:
+    log.info("Processing PDF: s3://%s/%s", bucket, key)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    doc_id = Path(key).stem
+
+    # Load PDF bytes for Nova cropping
+    pdf_bytes = load_s3_bytes(bucket, key)
+
+    # Start Textract
+    job_id = start_textract_job(bucket, key)
+
+    # Wait for completion
+    result = wait_for_textract_job(job_id)
+    status = result["JobStatus"]
+
+    if status != "SUCCEEDED":
+        return {
+            "source_key": key,
+            "job_id": job_id,
+            "status": status,
+            "error": result.get("StatusMessage", "Unknown"),
+        }
+
+    blocks = result["Blocks"]
+
+    # Extract components
+    tables = extract_tables(blocks)
+    forms = extract_forms(blocks)
+    figures = detect_figures(blocks)
+    sequence = build_sequence(blocks, tables, forms)
+
+    # Enhance figures with Nova if enabled
+    sequence = enhance_figures_with_nova(pdf_bytes, sequence)
+
+    # Format outputs
+    markdown = sequence_to_markdown(sequence)
+    plain_text = sequence_to_text(sequence)
+
+    # Build JSON data
+    output_data = {
+        "source_bucket": bucket,
+        "source_key": key,
+        "job_id": job_id,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "nova_enabled": NOVA_ENABLED,
+        "block_count": len(blocks),
+        "table_count": len(tables),
+        "form_count": len(forms),
+        "figure_count": len(figures),
+        "figures_analyzed": sum(1 for item in sequence if item.get("nova_analyzed", False)),
+        "sequence": sequence,
+        "tables": tables,
+        "forms": forms,
+        "figures": figures,
+    }
+
+    # Save to S3
+    safe_stem = re.sub(r"[^\w\-]", "_", doc_id)
+    base_prefix = f"{OUTPUT_PREFIX.rstrip('/')}/{safe_stem}_{timestamp}"
+
+    json_uri = save_s3_object(
+        OUTPUT_BUCKET, f"{base_prefix}.json",
+        json.dumps(output_data, indent=2, ensure_ascii=False).encode(),
+        "application/json"
+    )
+    md_uri = save_s3_object(
+        OUTPUT_BUCKET, f"{base_prefix}.md",
+        markdown.encode("utf-8"),
+        "text/markdown"
+    )
+    txt_uri = save_s3_object(
+        OUTPUT_BUCKET, f"{base_prefix}.txt",
+        plain_text.encode("utf-8"),
+        "text/plain"
+    )
+
+    log.info("Saved: JSON=%s, MD=%s, TXT=%s", json_uri, md_uri, txt_uri)
+
+    return {
+        "source_key": key,
+        "job_id": job_id,
+        "status": "SUCCEEDED",
+        "doc_id": doc_id,
+        "nova_enabled": NOVA_ENABLED,
+        "figures_analyzed": output_data["figures_analyzed"],
+        "json_s3": json_uri,
+        "md_s3": md_uri,
+        "txt_s3": txt_uri,
+    }
+
+
+def process_all_pdfs() -> Dict[str, Any]:
+    log.info("=" * 60)
+    log.info("ECMC Textract Pipeline")
+    log.info("NOVA_ENABLED=%s", NOVA_ENABLED)
+    log.info("Input: s3://%s/%s", INPUT_BUCKET, PDF_PREFIX)
+    log.info("Output: s3://%s/%s", OUTPUT_BUCKET, OUTPUT_PREFIX)
+    log.info("=" * 60)
+
+    pdf_keys = list_pdf_keys(INPUT_BUCKET, PDF_PREFIX)
+    log.info("Found %d PDFs", len(pdf_keys))
+
+    results = []
+    for key in pdf_keys:
+        try:
+            result = process_single_pdf(INPUT_BUCKET, key)
+            results.append(result)
+        except Exception as exc:
+            log.exception("Failed to process %s: %s", key, exc)
+            results.append({"source_key": key, "status": "ERROR", "error": str(exc)})
+
+    succeeded = [r for r in results if r.get("status") == "SUCCEEDED"]
+    failed = [r for r in results if r.get("status") != "SUCCEEDED"]
+
+    log.info("=" * 60)
+    log.info("Complete: %d succeeded, %d failed", len(succeeded), len(failed))
+    if NOVA_ENABLED:
+        total_figures = sum(r.get("figures_analyzed", 0) for r in succeeded)
+        log.info("Total figures analyzed by Nova: %d", total_figures)
+    log.info("=" * 60)
+
+    return {
+        "status": "COMPLETE",
+        "nova_enabled": NOVA_ENABLED,
+        "total": len(results),
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+        "results": results,
+    }
+
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    global REGION, INPUT_BUCKET, PDF_PREFIX, OUTPUT_BUCKET, OUTPUT_PREFIX
+    global NOVA_ENABLED, NOVA_MODEL_ID
+    global _textract_client, _bedrock_client, _s3_client
+
+    REGION = event.get("aws_region", REGION)
+    INPUT_BUCKET = event.get("input_bucket", INPUT_BUCKET)
+    PDF_PREFIX = event.get("pdf_prefix", PDF_PREFIX)
+    OUTPUT_BUCKET = event.get("output_bucket", OUTPUT_BUCKET)
+    OUTPUT_PREFIX = event.get("output_prefix", OUTPUT_PREFIX)
+    NOVA_ENABLED = str(event.get("nova_enabled", NOVA_ENABLED)).lower() == "true"
+    NOVA_MODEL_ID = event.get("nova_model_id", NOVA_MODEL_ID)
+
+    _textract_client = None
+    _bedrock_client = None
+    _s3_client = None
+
+    return process_all_pdfs()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    result = process_all_pdfs()
+    print(json.dumps(result, indent=2, default=str))
+##########
+"""
 ECMC Scraper v3 — Full Pipeline
 ================================
 1. Crawl HTML pages + discover PDF links
