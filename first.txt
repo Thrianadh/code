@@ -1,4 +1,688 @@
 """
+Tree Index Builder — Markdown to Hierarchical Index
+====================================================
+Builds tree index from Markdown files with zero information loss.
+
+Input: Markdown files (from Textract .md or Scrapy HTML→Markdown)
+Output: tree_index.json with typed sequence blocks, metadata, raw preservation
+
+Design:
+    - sequence[]: typed blocks (paragraph, table, list, figure, key_value)
+    - metadata: source tracking per node
+    - sequence[].raw: original Markdown per block
+    - raw_markdown: full section backup
+    - No Nova during indexing. Figure alt_text used as-is.
+    - Nova on-demand only if query fails against alt_text.
+
+Heading levels:
+    #   → document title (root level, not a node)
+    ##  → section node boundary (new node_id, sequence starts)
+    ### → nested section node (child of ##, own node_id)
+"""
+
+import json
+import logging
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import boto3
+
+# ============================================================================
+# Configuration
+# ============================================================================
+REGION = os.getenv("AWS_REGION", "us-east-1")
+INPUT_BUCKET = os.getenv("INPUT_BUCKET", "ecmc-dev-bucket")
+MD_PREFIX = os.getenv("MD_PREFIX", "markdown/")          # Scrapy HTML→Markdown
+TEXTRACT_MD_PREFIX = os.getenv("TEXTRACT_MD_PREFIX", "textract_output/")  # Textract .md
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "ecmc-dev-bucket")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "indices/")
+CLAUDE_MODEL_ID = os.getenv("CLAUDE_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# AWS Clients
+# ============================================================================
+_s3_client = None
+_bedrock_client = None
+
+
+def get_s3_client() -> boto3.client:
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+def get_bedrock_client() -> boto3.client:
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+# ============================================================================
+# S3 Helpers
+# ============================================================================
+def list_md_keys(bucket: str, prefix: str) -> List[str]:
+    """List all .md and .markdown keys under S3 prefix."""
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            k = obj["Key"]
+            if k.lower().endswith((".md", ".markdown")):
+                keys.append(k)
+    return keys
+
+
+def load_s3_text(bucket: str, key: str) -> str:
+    """Load and decode text from S3."""
+    s3 = get_s3_client()
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+
+
+def save_s3_json(bucket: str, key: str, data: Dict[str, Any]) -> str:
+    """Save JSON to S3, return s3:// URI."""
+    s3 = get_s3_client()
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    return f"s3://{bucket}/{key}"
+
+
+# ============================================================================
+# Metadata Extraction from HTML Comments
+# ============================================================================
+def extract_metadata_from_comments(text: str) -> Dict[str, Any]:
+    """
+    Parse HTML comments like <!-- source_url: https://... --> into metadata dict.
+    Returns empty dict if no comments found.
+    """
+    metadata = {}
+    pattern = r"<!--\s*(\w+):\s*(.*?)\s*-->"
+    for match in re.finditer(pattern, text):
+        key = match.group(1).strip().lower()
+        value = match.group(2).strip()
+        metadata[key] = value
+    return metadata
+
+
+# ============================================================================
+# Markdown Block Parser — Zero Information Loss
+# ============================================================================
+@dataclass
+class ParsedBlock:
+    type: str
+    content: Any
+    raw: str
+
+
+def parse_markdown_to_blocks(md_text: str) -> Tuple[List[ParsedBlock], Dict[str, Any]]:
+    """
+    Parse Markdown into typed blocks with raw preservation.
+
+    Returns:
+        blocks: List of ParsedBlock (type, content, raw)
+        metadata: Dict from HTML comments
+    """
+    lines = md_text.splitlines()
+    blocks: List[ParsedBlock] = []
+    metadata = extract_metadata_from_comments(md_text)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Skip empty lines and HTML comments (already extracted)
+        if not stripped or stripped.startswith("<!--"):
+            i += 1
+            continue
+
+        # Heading — detected but not stored as block (triggers section boundary)
+        if stripped.startswith("#"):
+            # Headings are section boundaries, not content blocks
+            # They will be handled by section builder
+            i += 1
+            continue
+
+        # Table (pipe format)
+        if stripped.startswith("|"):
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i])
+                i += 1
+
+            raw_table = "\n".join(table_lines)
+            table_data = parse_pipe_table(raw_table)
+            if table_data:
+                blocks.append(ParsedBlock(
+                    type="table",
+                    content=table_data,
+                    raw=raw_table
+                ))
+            continue
+
+        # Unordered list
+        if stripped.startswith(("- ", "* ", "+ ")):
+            list_lines = []
+            while i < len(lines):
+                current = lines[i].strip()
+                if not current:
+                    i += 1
+                    continue
+                if current.startswith(("- ", "* ", "+ ")):
+                    list_lines.append(current[2:].strip())
+                    i += 1
+                elif current.startswith("  ") and list_lines:
+                    # Continuation of list item
+                    list_lines[-1] += " " + current.strip()
+                    i += 1
+                else:
+                    break
+
+            if list_lines:
+                raw_list = "\n".join([f"- {item}" for item in list_lines])
+                blocks.append(ParsedBlock(
+                    type="list",
+                    content={"items": list_lines, "ordered": False},
+                    raw=raw_list
+                ))
+            continue
+
+        # Ordered list
+        ordered_match = re.match(r"^(\d+)\.\s+(.+)", stripped)
+        if ordered_match:
+            list_lines = []
+            while i < len(lines):
+                current = lines[i].strip()
+                if not current:
+                    i += 1
+                    continue
+                m = re.match(r"^(\d+)\.\s+(.+)", current)
+                if m:
+                    list_lines.append(m.group(2).strip())
+                    i += 1
+                elif current.startswith("  ") and list_lines:
+                    list_lines[-1] += " " + current.strip()
+                    i += 1
+                else:
+                    break
+
+            if list_lines:
+                raw_list = "\n".join([f"{idx+1}. {item}" for idx, item in enumerate(list_lines)])
+                blocks.append(ParsedBlock(
+                    type="list",
+                    content={"items": list_lines, "ordered": True},
+                    raw=raw_list
+                ))
+            continue
+
+        # Figure / Image
+        img_match = re.match(r"^!\[(.*?)\]\((.*?)\)", stripped)
+        if img_match:
+            alt_text = img_match.group(1)
+            url = img_match.group(2)
+            raw = stripped
+            blocks.append(ParsedBlock(
+                type="figure",
+                content={
+                    "alt_text": alt_text,
+                    "source_url": url,
+                    "description": None  # Nova on-demand only
+                },
+                raw=raw
+            ))
+            i += 1
+            continue
+
+        # Key-Value pattern (bold key + colon + value)
+        kv_match = re.match(r"^\*\*(.+?)\*\*:\s*(.+)", stripped)
+        if kv_match:
+            key = kv_match.group(1).strip()
+            value = kv_match.group(2).strip()
+            raw = stripped
+            blocks.append(ParsedBlock(
+                type="key_value",
+                content={"key": key, "value": value},
+                raw=raw
+            ))
+            i += 1
+            continue
+
+        # Paragraph (default)
+        para_lines = [stripped]
+        i += 1
+        while i < len(lines):
+            current = lines[i].strip()
+            if not current:
+                i += 1
+                break
+            # Stop at block-level elements
+            if current.startswith(("#", "|", "- ", "* ", "+ ", "!")):
+                break
+            if re.match(r"^\d+\.\s+", current):
+                break
+            if re.match(r"^\*\*(.+?)\*\*:\s*", current):
+                break
+            para_lines.append(current)
+            i += 1
+
+        raw_para = " ".join(para_lines)
+        # Strip inline markdown for content, keep raw for exact reproduction
+        content_text = strip_inline_markdown(raw_para)
+        blocks.append(ParsedBlock(
+            type="paragraph",
+            content=content_text,
+            raw=raw_para
+        ))
+
+    return blocks, metadata
+
+
+def parse_pipe_table(raw_table: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse pipe-delimited Markdown table into structured data.
+    Handles basic tables. Merged cells will create empty strings.
+    """
+    lines = [line.strip() for line in raw_table.splitlines() if line.strip().startswith("|")]
+    if len(lines) < 2:
+        return None
+
+    # Filter out separator line (| --- | --- |)
+    data_lines = []
+    for line in lines:
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        cells = [c for c in cells if c or c == ""]  # Keep empty cells
+        # Check if this is a separator line
+        is_separator = all(re.match(r"^[-:]+$", c.strip()) for c in cells if c.strip())
+        if not is_separator:
+            data_lines.append(cells)
+
+    if not data_lines:
+        return None
+
+    return {
+        "columns": data_lines[0],
+        "rows": data_lines[1:],
+        "row_count": len(data_lines) - 1,
+        "col_count": len(data_lines[0]) if data_lines else 0
+    }
+
+
+def strip_inline_markdown(text: str) -> str:
+    """
+    Strip inline Markdown formatting for clean LLM consumption.
+    Preserves raw Markdown in block.raw for exact reconstruction.
+    """
+    # Bold **text** or __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    # Italic *text* or _text_
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"_(.+?)_", r"\1", text)
+    # Inline code `text`
+    text = re.sub(r"`(.+?)`", r"\1", text)
+    # Links [text](url) → keep text only
+    text = re.sub(r"\[(.+?)\]\(.*?\)", r"\1", text)
+    # Strikethrough ~~text~~
+    text = re.sub(r"~~(.+?)~~", r"\1", text)
+    return text.strip()
+
+
+# ============================================================================
+# Section Builder — Heading Boundaries
+# ============================================================================
+def build_sections_from_blocks(
+    blocks: List[ParsedBlock],
+    md_text: str,
+    metadata: Dict[str, Any],
+    source_key: str
+) -> List[Dict[str, Any]]:
+    """
+    Split blocks into sections at heading boundaries.
+
+    #   → document title (not a section)
+    ##  → section node
+    ### → nested section node (child)
+    """
+    lines = md_text.splitlines()
+    sections = []
+    current_title = "Untitled"
+    current_level = 0  # 0 = root, 2 = ##, 3 = ###
+    current_blocks: List[ParsedBlock] = []
+    current_raw_lines: List[str] = []
+    section_counter = 0
+
+    # Extract document title from first # heading
+    doc_title = "Untitled"
+    for line in lines:
+        if line.strip().startswith("# "):
+            doc_title = line.strip()[2:].strip()
+            break
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Detect heading
+        if stripped.startswith("## "):
+            # Save previous section
+            if current_blocks:
+                sections.append({
+                    "node_id": f"S{section_counter:04d}",
+                    "title": current_title,
+                    "level": current_level,
+                    "blocks": current_blocks,
+                    "raw_markdown": "\n".join(current_raw_lines).strip(),
+                    "metadata": {
+                        "source_key": source_key,
+                        **metadata
+                    }
+                })
+                section_counter += 1
+
+            current_title = stripped[3:].strip()
+            current_level = 2
+            current_blocks = []
+            current_raw_lines = []
+            i += 1
+            continue
+
+        if stripped.startswith("### "):
+            # Save previous section
+            if current_blocks:
+                sections.append({
+                    "node_id": f"S{section_counter:04d}",
+                    "title": current_title,
+                    "level": current_level,
+                    "blocks": current_blocks,
+                    "raw_markdown": "\n".join(current_raw_lines).strip(),
+                    "metadata": {
+                        "source_key": source_key,
+                        **metadata
+                    }
+                })
+                section_counter += 1
+
+            current_title = stripped[4:].strip()
+            current_level = 3
+            current_blocks = []
+            current_raw_lines = []
+            i += 1
+            continue
+
+        # Skip title heading (already captured as doc_title)
+        if stripped.startswith("# "):
+            i += 1
+            continue
+
+        # Skip comments and empty lines
+        if not stripped or stripped.startswith("<!--"):
+            i += 1
+            continue
+
+        # Find which block this line belongs to
+        # We rebuild blocks from lines to match with existing blocks
+        current_raw_lines.append(line)
+        i += 1
+
+    # Save final section
+    if current_blocks or current_raw_lines:
+        sections.append({
+            "node_id": f"S{section_counter:04d}",
+            "title": current_title,
+            "level": current_level,
+            "blocks": current_blocks,
+            "raw_markdown": "\n".join(current_raw_lines).strip(),
+            "metadata": {
+                "source_key": source_key,
+                **metadata
+            }
+        })
+
+    return sections, doc_title
+
+
+# ============================================================================
+# Block-to-Sequence Converter
+# ============================================================================
+def blocks_to_sequence(blocks: List[ParsedBlock]) -> List[Dict[str, Any]]:
+    """Convert ParsedBlock list to JSON-serializable sequence."""
+    return [
+        {
+            "type": b.type,
+            "content": b.content,
+            "raw": b.raw
+        }
+        for b in blocks
+    ]
+
+
+# ============================================================================
+# Claude Summarization
+# ============================================================================
+def bedrock_chat(model_id: str, prompt: str, max_tokens: int = 1024) -> str:
+    """Call Bedrock Converse API."""
+    client = get_bedrock_client()
+    try:
+        resp = client.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        log.error("Bedrock error: %s", exc)
+        return ""
+
+
+def summarize_with_claude(title: str, text: str) -> str:
+    """Ask Claude to summarize a section in 1-2 sentences."""
+    prompt = (
+        f"Summarize the following ECMC bankruptcy document section in 1-2 sentences. "
+        f"Be specific about what information it contains. Do not use generic phrases.\n\n"
+        f"Title: {title}\n"
+        f"Content: {text[:3000]}\n\n"
+        f"Summary:"
+    )
+    summary = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=150)
+    return summary or f"Section about {title}"
+
+
+# ============================================================================
+# Tree Index Builder
+# ============================================================================
+def build_tree_index_for_document(
+    source_key: str,
+    doc_id: str,
+    md_text: str
+) -> Dict[str, Any]:
+    """
+    Build tree index for a single Markdown document.
+
+    Returns document node with sections as children.
+    """
+    log.info("Building tree index for %s", doc_id)
+
+    # Parse blocks and metadata
+    blocks, metadata = parse_markdown_to_blocks(md_text)
+
+    # Build sections from headings
+    sections_data, doc_title = build_sections_from_blocks(blocks, md_text, metadata, source_key)
+
+    # Build nodes from sections
+    nodes = []
+    for sec in sections_data:
+        # Build sequence from blocks
+        sequence = blocks_to_sequence(sec["blocks"])
+
+        # Build full text for summarization (concatenate content)
+        text_parts = []
+        for item in sequence:
+            if item["type"] == "paragraph":
+                text_parts.append(item["content"])
+            elif item["type"] == "table":
+                text_parts.append(f"[TABLE: {item['content'].get('row_count', 0)} rows x {item['content'].get('col_count', 0)} cols]")
+            elif item["type"] == "list":
+                text_parts.append(f"[LIST: {len(item['content'].get('items', []))} items]")
+            elif item["type"] == "figure":
+                text_parts.append(f"[FIGURE: {item['content'].get('alt_text', 'no description')}]")
+            elif item["type"] == "key_value":
+                text_parts.append(f"{item['content']['key']}: {item['content']['value']}")
+
+        full_text = "\n".join(text_parts)
+
+        # Generate summary
+        summary = summarize_with_claude(sec["title"], full_text)
+
+        nodes.append({
+            "node_id": f"{doc_id}_{sec['node_id']}",
+            "title": sec["title"],
+            "level": sec["level"],
+            "summary": summary,
+            "full_text": full_text,
+            "sequence": sequence,
+            "raw_markdown": sec["raw_markdown"],
+            "metadata": sec["metadata"]
+        })
+
+    return {
+        "doc_id": doc_id,
+        "doc_title": doc_title,
+        "source_key": source_key,
+        "source_type": "markdown",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "section_count": len(nodes),
+        "nodes": nodes
+    }
+
+
+# ============================================================================
+# Main Orchestrator
+# ============================================================================
+def process_all_documents() -> Dict[str, Any]:
+    """
+    Process all Markdown files from S3 and build unified tree index.
+
+    Reads from:
+        - INPUT_BUCKET/TEXTRACT_MD_PREFIX (Textract .md files)
+        - INPUT_BUCKET/MD_PREFIX (Scrapy HTML→Markdown files)
+
+    Outputs:
+        - tree_index_{timestamp}.json to OUTPUT_BUCKET/OUTPUT_PREFIX
+    """
+    log.info("=" * 60)
+    log.info("Tree Index Builder — Markdown Input")
+    log.info("Input buckets: s3://%s/%s, s3://%s/%s", 
+             INPUT_BUCKET, TEXTRACT_MD_PREFIX, INPUT_BUCKET, MD_PREFIX)
+    log.info("Output: s3://%s/%s", OUTPUT_BUCKET, OUTPUT_PREFIX)
+    log.info("=" * 60)
+
+    # Collect all Markdown keys
+    textract_keys = list_md_keys(INPUT_BUCKET, TEXTRACT_MD_PREFIX)
+    scrapy_keys = list_md_keys(INPUT_BUCKET, MD_PREFIX)
+    all_keys = textract_keys + scrapy_keys
+
+    log.info("Found %d Textract .md files, %d Scrapy .md files", 
+             len(textract_keys), len(scrapy_keys))
+
+    documents = []
+    for key in all_keys:
+        try:
+            md_text = load_s3_text(INPUT_BUCKET, key)
+            doc_id = Path(key).stem
+
+            tree = build_tree_index_for_document(key, doc_id, md_text)
+            documents.append(tree)
+
+            log.info("Document %s: %d sections", doc_id, tree["section_count"])
+
+        except Exception as exc:
+            log.exception("Failed to process %s: %s", key, exc)
+
+    # Build unified tree index
+    unified_tree = {
+        "index_type": "tree",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "document_count": len(documents),
+        "documents": documents
+    }
+
+    # Save to S3
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    tree_key = f"{OUTPUT_PREFIX.rstrip('/')}/tree_index_{timestamp}.json"
+    tree_uri = save_s3_json(OUTPUT_BUCKET, tree_key, unified_tree)
+
+    total_sections = sum(d["section_count"] for d in documents)
+
+    log.info("=" * 60)
+    log.info("Tree index complete: %d documents, %d sections", 
+             len(documents), total_sections)
+    log.info("Output: %s", tree_uri)
+    log.info("=" * 60)
+
+    return {
+        "status": "SUCCEEDED",
+        "tree_index_uri": tree_uri,
+        "document_count": len(documents),
+        "total_sections": total_sections,
+        "documents": [d["doc_id"] for d in documents]
+    }
+
+
+# ============================================================================
+# Lambda Handler
+# ============================================================================
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    AWS Lambda entry point.
+
+    Environment variables (or event overrides):
+        INPUT_BUCKET, TEXTRACT_MD_PREFIX, MD_PREFIX
+        OUTPUT_BUCKET, OUTPUT_PREFIX
+        CLAUDE_MODEL_ID, AWS_REGION
+    """
+    global REGION, INPUT_BUCKET, TEXTRACT_MD_PREFIX, MD_PREFIX
+    global OUTPUT_BUCKET, OUTPUT_PREFIX, CLAUDE_MODEL_ID
+    global _s3_client, _bedrock_client
+
+    REGION = event.get("aws_region", REGION)
+    INPUT_BUCKET = event.get("input_bucket", INPUT_BUCKET)
+    TEXTRACT_MD_PREFIX = event.get("textract_md_prefix", TEXTRACT_MD_PREFIX)
+    MD_PREFIX = event.get("md_prefix", MD_PREFIX)
+    OUTPUT_BUCKET = event.get("output_bucket", OUTPUT_BUCKET)
+    OUTPUT_PREFIX = event.get("output_prefix", OUTPUT_PREFIX)
+    CLAUDE_MODEL_ID = event.get("claude_model_id", CLAUDE_MODEL_ID)
+
+    _s3_client = None
+    _bedrock_client = None
+
+    return process_all_documents()
+
+
+# ============================================================================
+# Local Testing
+# ============================================================================
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    result = process_all_documents()
+    print(json.dumps(result, indent=2, default=str))
+##########
+"""
 ECMC Textract Pipeline — PDF Extraction with Optional Nova Enhancement
 ======================================================================
 Processes PDFs through AWS Textract (LAYOUT + TABLES + FORMS).
