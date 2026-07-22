@@ -1,3 +1,24 @@
+import pandas as pd
+# test questions from document 11 and 12
+queries = ["what are my options and timelines to restore federal student aid eligibility? (title IV)",
+"what is loan consolidation and how does it work? (tittle IV touches on this)",
+"How do i start a rehailitation process?(tittle IV / payment",
+"will bankruptcy completion change my situation (tittle IV)"]
+rows = []
+for q in queries:
+    r_vec = vector_rag.answer(q, db_path=Path("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/Untitled Folder/vectorless rag/demo/data/vector_index.db"),)
+    r_less = vectorless_rag_claude.answer(q, tree_path=Path("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/Untitled Folder/vectorless rag/demo/data/tree_index.json"))
+    rows.append({
+        "query": q,
+        "vector_rag_answer": r_vec["answer"],
+        "vector_rag_ms": r_vec["elapsed_ms"]["total"]/1000,
+        "vectorless_rag_answer": r_less["answer"],
+        "vectorless_rag_ms": r_less["elapsed_ms"]["total"]/1000,
+    })
+
+df = pd.DataFrame(rows)
+df.to_excel("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/Untitled Folder/vectorless rag/demo/nova_lite_comparison.xlsx", index=False)
+######
 """
 Query Engine — Vectorless RAG Query Interface
 =============================================
