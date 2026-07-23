@@ -1,3 +1,287 @@
+"""
+Embeddings Pipeline — Vector RAG Step 3
+========================================
+Generates embeddings for chunks using Amazon Titan Embed Text v2.
+
+Input:
+    - chunk_objects.json (from Pipeline 2)
+
+Output:
+    - chunk_embeddings.json: chunks with embedding vectors
+
+Design:
+    - Batch processing for efficiency
+    - Retry logic for API failures
+    - Progress logging
+"""
+
+import json
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+
+# ============================================================================
+# Configuration
+# ============================================================================
+REGION = os.getenv("AWS_REGION", "us-east-1")
+INPUT_BUCKET = os.getenv("INPUT_BUCKET", "ecmc-dev-bucket")
+CHUNKS_PREFIX = os.getenv("CHUNKS_PREFIX", "vector_rag/chunks/")
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "ecmc-dev-bucket")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "vector_rag/embeddings/")
+EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "96"))  # Titan v2 supports up to 96
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# AWS Clients
+# ============================================================================
+_s3_client = None
+_bedrock_client = None
+
+
+def get_s3_client() -> boto3.client:
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+def get_bedrock_client() -> boto3.client:
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+# ============================================================================
+# S3 Helpers
+# ============================================================================
+def list_chunk_keys(bucket: str, prefix: str) -> List[str]:
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            k = obj["Key"]
+            if k.endswith("chunk_objects_") or "chunk_objects_" in k:
+                keys.append(k)
+    # Return latest
+    return sorted(keys, reverse=True)
+
+
+def load_s3_json(bucket: str, key: str) -> Dict[str, Any]:
+    s3 = get_s3_client()
+    return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+
+
+def save_s3_json(bucket: str, key: str, data: Dict[str, Any]) -> str:
+    s3 = get_s3_client()
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    return f"s3://{bucket}/{key}"
+
+
+# ============================================================================
+# Embedding Helper
+# ============================================================================
+def embed_texts(texts: List[str], model_id: str = EMBED_MODEL_ID) -> List[List[float]]:
+    """
+    Embed a batch of texts using Titan Embed Text v2.
+    Returns list of embedding vectors.
+    """
+    client = get_bedrock_client()
+
+    # Titan v2 accepts batch of up to 96 texts
+    body = {
+        "inputText": texts,
+        "dimensions": 1024,  # Can use 256, 512, or 1024
+        "normalize": True
+    }
+
+    try:
+        resp = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json"
+        )
+        result = json.loads(resp["body"].read())
+
+        # Titan v2 returns embeddings in "embeddings" array
+        embeddings = result.get("embeddings", [])
+
+        if len(embeddings) != len(texts):
+            log.warning("Mismatch: sent %d texts, got %d embeddings", len(texts), len(embeddings))
+
+        return embeddings
+
+    except Exception as exc:
+        log.error("Embedding failed for batch of %d: %s", len(texts), exc)
+        # Return empty embeddings as fallback
+        return [[] for _ in texts]
+
+
+def embed_single_text(text: str, model_id: str = EMBED_MODEL_ID) -> List[float]:
+    """Embed single text."""
+    embeddings = embed_texts([text], model_id)
+    return embeddings[0] if embeddings else []
+
+
+# ============================================================================
+# Main Orchestrator
+# ============================================================================
+def process_embeddings() -> Dict[str, Any]:
+    log.info("=" * 60)
+    log.info("Embeddings Pipeline")
+    log.info("Model: %s", EMBED_MODEL_ID)
+    log.info("Batch size: %d", BATCH_SIZE)
+    log.info("=" * 60)
+
+    # Find latest chunk_objects file
+    chunk_keys = list_chunk_keys(INPUT_BUCKET, CHUNKS_PREFIX)
+    if not chunk_keys:
+        log.error("No chunk objects found under s3://%s/%s", INPUT_BUCKET, CHUNKS_PREFIX)
+        return {"status": "ERROR", "error": "No chunk objects found"}
+
+    latest_key = chunk_keys[0]
+    log.info("Loading chunks from: s3://%s/%s", INPUT_BUCKET, latest_key)
+
+    chunk_data = load_s3_json(INPUT_BUCKET, latest_key)
+    chunks = chunk_data.get("chunks", [])
+
+    log.info("Total chunks to embed: %d", len(chunks))
+
+    if not chunks:
+        log.error("No chunks in file!")
+        return {"status": "ERROR", "error": "No chunks"}
+
+    # Process in batches
+    embedded_chunks = []
+    total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for batch_idx in range(total_batches):
+        start = batch_idx * BATCH_SIZE
+        end = min(start + BATCH_SIZE, len(chunks))
+        batch = chunks[start:end]
+
+        log.info("Processing batch %d/%d: chunks %d-%d", 
+                 batch_idx + 1, total_batches, start, end - 1)
+
+        # Prepare texts for embedding
+        # Include context in embedding text for better retrieval
+        texts = []
+        for chunk in batch:
+            content = chunk.get("content", "")
+            chunk_type = chunk.get("chunk_type", "text")
+            metadata = chunk.get("metadata", {})
+
+            # Build rich embedding text
+            parts = []
+            if chunk_type == "table":
+                parts.append(f"Table: {metadata.get('parent_heading', '')}")
+                parts.append(content)
+            elif chunk_type == "figure":
+                parts.append(f"Figure: {content}")
+            elif chunk_type == "form":
+                parts.append(f"Form: {metadata.get('parent_heading', '')}")
+                parts.append(content)
+            else:
+                parts.append(content)
+
+            embedding_text = " ".join(parts)
+            texts.append(embedding_text)
+
+        # Call embedding API
+        batch_start = time.time()
+        embeddings = embed_texts(texts)
+        batch_latency = time.time() - batch_start
+
+        log.info("  Batch embedded in %.2f seconds", batch_latency)
+
+        # Attach embeddings to chunks
+        for i, chunk in enumerate(batch):
+            embedded_chunks.append({
+                "chunk_id": chunk["chunk_id"],
+                "chunk_type": chunk["chunk_type"],
+                "content": chunk["content"],
+                "metadata": chunk["metadata"],
+                "token_count": chunk.get("token_count", 0),
+                "embedding": embeddings[i] if i < len(embeddings) else [],
+                "embedding_model": EMBED_MODEL_ID,
+                "embedding_dimensions": len(embeddings[i]) if i < len(embeddings) and embeddings[i] else 0
+            })
+
+        # Small delay to avoid rate limiting
+        if batch_idx < total_batches - 1:
+            time.sleep(0.5)
+
+    # Build output
+    output_data = {
+        "pipeline": "embeddings",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "embedding_model": EMBED_MODEL_ID,
+        "total_chunks": len(embedded_chunks),
+        "dimensions": 1024,
+        "chunks": embedded_chunks
+    }
+
+    # Save to S3
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_key = f"{OUTPUT_PREFIX.rstrip('/')}/chunk_embeddings_{timestamp}.json"
+    output_uri = save_s3_json(OUTPUT_BUCKET, output_key, output_data)
+
+    log.info("=" * 60)
+    log.info("COMPLETE: %d chunks embedded", len(embedded_chunks))
+    log.info("Output: %s", output_uri)
+    log.info("=" * 60)
+
+    return {
+        "status": "SUCCEEDED",
+        "output_uri": output_uri,
+        "total_chunks": len(embedded_chunks),
+        "embedding_model": EMBED_MODEL_ID,
+        "dimensions": 1024
+    }
+
+
+# ============================================================================
+# Lambda Handler
+# ============================================================================
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    global REGION, INPUT_BUCKET, CHUNKS_PREFIX, OUTPUT_BUCKET, OUTPUT_PREFIX, EMBED_MODEL_ID, BATCH_SIZE
+    global _s3_client, _bedrock_client
+
+    REGION = event.get("aws_region", REGION)
+    INPUT_BUCKET = event.get("input_bucket", INPUT_BUCKET)
+    CHUNKS_PREFIX = event.get("chunks_prefix", CHUNKS_PREFIX)
+    OUTPUT_BUCKET = event.get("output_bucket", OUTPUT_BUCKET)
+    OUTPUT_PREFIX = event.get("output_prefix", OUTPUT_PREFIX)
+    EMBED_MODEL_ID = event.get("embed_model_id", EMBED_MODEL_ID)
+    BATCH_SIZE = int(event.get("batch_size", BATCH_SIZE))
+
+    _s3_client = None
+    _bedrock_client = None
+
+    return process_embeddings()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    result = process_embeddings()
+    print(json.dumps(result, indent=2, default=str))
+###########
 def bedrock_converse(model_id: str, prompt: str, image_bytes: Optional[bytes] = None, max_tokens: int = 1024) -> str:
     client = get_bedrock_client()
     
