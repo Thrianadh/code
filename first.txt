@@ -1,4 +1,367 @@
 """
+Retrieval + Generation Pipeline — Vector RAG Step 5
+=====================================================
+Answers user questions using FAISS vector search + Claude generation.
+
+Input:
+    - Local FAISS index (faiss_index_*.bin)
+    - Local metadata (chunk_metadata_*.json)
+    - User query (text)
+
+Output:
+    - Answer with citations and confidence
+
+Supports:
+    - Vector search: Embed query → search FAISS → retrieve top-K chunks
+    - Context building: Format retrieved chunks for Claude
+    - Answer generation: Claude synthesizes answer with citations
+    - Latency tracking: Total time from query to answer
+
+Usage:
+    python retrieval_pipeline.py "What is a T4 letter?"
+"""
+
+import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+import numpy as np
+
+# ============================================================================
+# Configuration
+# ============================================================================
+REGION = os.getenv("AWS_REGION", "us-east-1")
+INDEX_DIR = os.getenv("INDEX_DIR", "./vector_db_output")  # Local directory with FAISS files
+EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
+CLAUDE_MODEL_ID = os.getenv("CLAUDE_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+TOP_K = int(os.getenv("TOP_K", "5"))  # Number of chunks to retrieve
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# AWS Client (Bedrock only — no S3 needed)
+# ============================================================================
+_bedrock_client = None
+
+
+def get_bedrock_client() -> boto3.client:
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+# ============================================================================
+# FAISS Index Loader
+# ============================================================================
+def load_faiss_and_metadata(index_dir: str) -> Tuple[Any, List[Dict], Dict]:
+    """
+    Load FAISS index and metadata from local directory.
+    Returns (index, metadata_list, index_info).
+    """
+    import faiss
+
+    dir_path = Path(index_dir)
+    if not dir_path.exists():
+        raise FileNotFoundError(f"Index directory not found: {index_dir}")
+
+    # Find latest files
+    index_files = sorted(dir_path.glob("faiss_index_*.bin"), reverse=True)
+    meta_files = sorted(dir_path.glob("chunk_metadata_*.json"), reverse=True)
+
+    if not index_files:
+        raise FileNotFoundError(f"No FAISS index files in {index_dir}")
+    if not meta_files:
+        raise FileNotFoundError(f"No metadata files in {index_dir}")
+
+    index_path = index_files[0]
+    meta_path = meta_files[0]
+
+    log.info("Loading FAISS index: %s", index_path)
+    index = faiss.read_index(str(index_path))
+
+    log.info("Loading metadata: %s", meta_path)
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_data = json.load(f)
+
+    metadata = meta_data.get("metadata", [])
+    index_info = {
+        "total_vectors": meta_data.get("total_vectors", 0),
+        "dimensions": meta_data.get("dimensions", 0),
+        "index_type": meta_data.get("index_type", "unknown"),
+        "metric_type": meta_data.get("metric_type", "unknown"),
+        "index_file": str(index_path),
+        "metadata_file": str(meta_path)
+    }
+
+    log.info("Loaded: %d vectors, %d dimensions", index_info["total_vectors"], index_info["dimensions"])
+    return index, metadata, index_info
+
+
+# ============================================================================
+# Embedding (Single Text)
+# ============================================================================
+def embed_query(text: str, model_id: str = EMBED_MODEL_ID) -> np.ndarray:
+    """Embed a single query text using Titan v2."""
+    client = get_bedrock_client()
+
+    body = {
+        "inputText": text,
+        "dimensions": 1024,
+        "normalize": True
+    }
+
+    try:
+        resp = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json"
+        )
+        result = json.loads(resp["body"].read())
+        embedding = result.get("embedding", [])
+
+        if not embedding:
+            log.warning("Empty embedding for query")
+            return np.array([], dtype=np.float32)
+
+        return np.array(embedding, dtype=np.float32).reshape(1, -1)
+
+    except Exception as exc:
+        log.error("Embedding failed: %s", exc)
+        return np.array([], dtype=np.float32)
+
+
+# ============================================================================
+# Vector Search
+# ============================================================================
+def search_faiss(index: Any, query_vector: np.ndarray, metadata: List[Dict], top_k: int = 5) -> List[Dict]:
+    """
+    Search FAISS index and return top-K chunks with metadata.
+    """
+    if query_vector.size == 0:
+        log.error("Empty query vector")
+        return []
+
+    # Search
+    distances, indices = index.search(query_vector, top_k)
+
+    results = []
+    for i, idx in enumerate(indices[0]):
+        if idx < 0 or idx >= len(metadata):
+            continue
+
+        meta = metadata[idx]
+        results.append({
+            **meta,
+            "_distance": float(distances[0][i]),
+            "_rank": i + 1
+        })
+
+    return results
+
+
+# ============================================================================
+# Context Builder
+# ============================================================================
+def build_context(retrieved_chunks: List[Dict]) -> str:
+    """Build structured context string from retrieved chunks."""
+    parts = []
+
+    for i, chunk in enumerate(retrieved_chunks, 1):
+        chunk_type = chunk.get("chunk_type", "text")
+        content = chunk.get("content", "")
+        meta = chunk.get("metadata", {})
+
+        part_lines = [f"[SOURCE {i}]"]
+        part_lines.append(f"Document: {meta.get('source_document', 'unknown')}")
+        part_lines.append(f"Section: {meta.get('parent_heading', chunk.get('chunk_id', 'unknown'))}")
+        part_lines.append(f"Type: {chunk_type}")
+        part_lines.append("")
+
+        if chunk_type == "table":
+            part_lines.append("[TABLE]")
+            part_lines.append(content)
+        elif chunk_type == "figure":
+            part_lines.append("[FIGURE]")
+            part_lines.append(content)
+        elif chunk_type == "form":
+            part_lines.append("[FORM]")
+            part_lines.append(content)
+        else:
+            part_lines.append(content)
+
+        parts.append("\n".join(part_lines))
+
+    return "\n\n".join(parts)
+
+
+# ============================================================================
+# Answer Generation
+# ============================================================================
+def generate_answer(query: str, context: str, citations: List[Dict]) -> Tuple[str, str]:
+    """Generate answer using Claude with retrieved context."""
+    client = get_bedrock_client()
+
+    prompt = (
+        "You are an ECMC bankruptcy student loan document assistant. "
+        "Answer the user\'s question using ONLY the provided context below. "
+        "Be specific and accurate. Cite the source number [SOURCE N] when referencing information. "
+        "If the context does not contain the answer, say so clearly.\n\n"
+        f"{context}\n\n"
+        f"[USER QUESTION]\n{query}\n\n"
+        "[ANSWER]"
+    )
+
+    try:
+        resp = client.converse(
+            modelId=CLAUDE_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 2048, "temperature": 0.0}
+        )
+        answer = resp["output"]["message"]["content"][0]["text"]
+
+        # Assess confidence
+        confidence = assess_confidence(answer, citations)
+
+        return answer, confidence
+
+    except Exception as exc:
+        log.error("Answer generation failed: %s", exc)
+        return "Error generating answer.", "none"
+
+
+def assess_confidence(answer: str, citations: List[Dict]) -> str:
+    """Assess confidence based on answer quality and citations."""
+    if not answer or len(answer) < 20:
+        return "none"
+    if "not found" in answer.lower() or "not contain" in answer.lower():
+        return "low"
+    if len(citations) >= 3:
+        return "high"
+    if len(citations) >= 1:
+        return "medium"
+    return "low"
+
+
+# ============================================================================
+# Main Query Function
+# ============================================================================
+@dataclass
+class QueryResult:
+    query: str
+    answer: str
+    confidence: str
+    sources_used: int
+    citations: List[Dict]
+    latency_ms: float
+    query_type: str = "vector"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query": self.query,
+            "answer": self.answer,
+            "confidence": self.confidence,
+            "sources_used": self.sources_used,
+            "citations": self.citations,
+            "latency_ms": round(self.latency_ms, 2),
+            "query_type": self.query_type
+        }
+
+
+def run_query(query: str, index: Any = None, metadata: List[Dict] = None, index_info: Dict = None) -> Dict[str, Any]:
+    """
+    Main entry point: process query and return answer.
+    Loads index on first call if not provided.
+    """
+    start_time = time.time()
+
+    # Load index if not provided
+    if index is None or metadata is None:
+        index, metadata, index_info = load_faiss_and_metadata(INDEX_DIR)
+
+    log.info("Query: %s", query)
+
+    # Step 1: Embed query
+    embed_start = time.time()
+    query_vector = embed_query(query)
+    embed_time = (time.time() - embed_start) * 1000
+
+    # Step 2: Search FAISS
+    search_start = time.time()
+    retrieved = search_faiss(index, query_vector, metadata, TOP_K)
+    search_time = (time.time() - search_start) * 1000
+
+    if not retrieved:
+        total_time = (time.time() - start_time) * 1000
+        return QueryResult(
+            query=query,
+            answer="No relevant information found in the documents.",
+            confidence="none",
+            sources_used=0,
+            citations=[],
+            latency_ms=total_time
+        ).to_dict()
+
+    # Step 3: Build context
+    context = build_context(retrieved)
+
+    # Step 4: Generate answer
+    gen_start = time.time()
+    answer, confidence = generate_answer(query, context, retrieved)
+    gen_time = (time.time() - gen_start) * 1000
+
+    total_time = (time.time() - start_time) * 1000
+
+    # Build citations
+    citations = []
+    for chunk in retrieved:
+        meta = chunk.get("metadata", {})
+        citations.append({
+            "chunk_id": chunk.get("chunk_id", ""),
+            "chunk_type": chunk.get("chunk_type", ""),
+            "document": meta.get("source_document", "unknown"),
+            "section": meta.get("parent_heading", "unknown"),
+            "distance": chunk.get("_distance", 0)
+        })
+
+    log.info("Answer generated in %.1f ms (embed: %.1f, search: %.1f, gen: %.1f)",
+             total_time, embed_time, search_time, gen_time)
+
+    return QueryResult(
+        query=query,
+        answer=answer,
+        confidence=confidence,
+        sources_used=len(retrieved),
+        citations=citations,
+        latency_ms=total_time
+    ).to_dict()
+
+
+# ============================================================================
+# CLI Entry Point
+# ============================================================================
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
+    # Get query from command line
+    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "What is a T4 letter?"
+
+    result = run_query(query)
+    print(json.dumps(result, indent=2, default=str))
+##############
+"""
 Vector DB Pipeline — Local File Version (No S3)
 ================================================
 Loads chunk embeddings from local file into FAISS index.
