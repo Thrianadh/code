@@ -1,4 +1,228 @@
 """
+Vector DB Pipeline — Local File Version (No S3)
+================================================
+Loads chunk embeddings from local file into FAISS index.
+No S3 access required. Quick workaround for IAM issues.
+
+Input:
+    - chunk_embeddings.json (local file path)
+
+Output:
+    - faiss_index.bin (local file)
+    - chunk_metadata.json (local file)
+
+Usage:
+    python vector_db_pipeline_local.py
+"""
+
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+# ============================================================================
+# Configuration
+# ============================================================================
+INPUT_FILE = os.getenv("INPUT_FILE", "chunk_embeddings.json")  # Local file path
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./vector_db_output")     # Local output directory
+INDEX_TYPE = os.getenv("INDEX_TYPE", "Flat")                   # "Flat" or "IVF"
+METRIC_TYPE = os.getenv("METRIC_TYPE", "L2")                  # "L2" or "IP"
+
+log = logging.getLogger(__name__)
+
+
+# ============================================================================
+# FAISS Index Builder
+# ============================================================================
+def build_faiss_index(vectors: np.ndarray, index_type: str = "Flat", metric_type: str = "L2") -> Any:
+    """Build FAISS index from embedding vectors."""
+    try:
+        import faiss
+    except ImportError:
+        log.error("FAISS not installed. Run: pip install faiss-cpu")
+        raise
+
+    n, d = vectors.shape
+    log.info("Building FAISS index: %d vectors, %d dimensions", n, d)
+
+    # Select metric
+    if metric_type == "IP":
+        metric = faiss.METRIC_INNER_PRODUCT
+    else:
+        metric = faiss.METRIC_L2
+
+    # Build index
+    if index_type == "Flat":
+        if metric_type == "IP":
+            index = faiss.IndexFlatIP(d)
+        else:
+            index = faiss.IndexFlatL2(d)
+        log.info("Using IndexFlat%s (exact search)", metric_type)
+
+    elif index_type == "IVF":
+        nlist = min(100, n // 10)
+        quantizer = faiss.IndexFlatL2(d)
+        if metric_type == "IP":
+            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+        else:
+            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+        log.info("Using IndexIVFFlat with %d clusters", nlist)
+    else:
+        raise ValueError(f"Unknown index type: {index_type}")
+
+    # Add vectors
+    log.info("Adding vectors to index...")
+    if index_type == "IVF":
+        index.train(vectors)
+    index.add(vectors)
+
+    log.info("Index built: %d vectors stored", index.ntotal)
+    return index
+
+
+def save_faiss_index(index: Any, filepath: str):
+    """Save FAISS index to disk."""
+    import faiss
+    faiss.write_index(index, filepath)
+    log.info("FAISS index saved to: %s", filepath)
+
+
+# ============================================================================
+# Main Orchestrator
+# ============================================================================
+def process_vector_db_local() -> Dict[str, Any]:
+    log.info("=" * 60)
+    log.info("Vector DB Pipeline (Local File Mode)")
+    log.info("Input: %s", INPUT_FILE)
+    log.info("Output: %s", OUTPUT_DIR)
+    log.info("Index type: %s | Metric: %s", INDEX_TYPE, METRIC_TYPE)
+    log.info("=" * 60)
+
+    # Check input file exists
+    input_path = Path(INPUT_FILE)
+    if not input_path.exists():
+        log.error("Input file not found: %s", INPUT_FILE)
+        return {"status": "ERROR", "error": f"File not found: {INPUT_FILE}"}
+
+    # Load embedding file
+    log.info("Loading embeddings from: %s", INPUT_FILE)
+    with open(input_path, "r", encoding="utf-8") as f:
+        embed_data = json.load(f)
+
+    chunks = embed_data.get("chunks", [])
+    log.info("Total chunks with embeddings: %d", len(chunks))
+
+    if not chunks:
+        log.error("No chunks in embedding file!")
+        return {"status": "ERROR", "error": "No chunks"}
+
+    # Extract vectors and metadata
+    vectors = []
+    metadata = []
+    skipped = 0
+
+    for i, chunk in enumerate(chunks):
+        embedding = chunk.get("embedding", [])
+
+        if not embedding or len(embedding) == 0:
+            skipped += 1
+            continue
+
+        vectors.append(embedding)
+        metadata.append({
+            "index": i,
+            "chunk_id": chunk["chunk_id"],
+            "chunk_type": chunk["chunk_type"],
+            "content": chunk["content"],
+            "metadata": chunk.get("metadata", {}),
+            "token_count": chunk.get("token_count", 0),
+            "embedding_model": chunk.get("embedding_model", ""),
+            "embedding_dimensions": len(embedding)
+        })
+
+    log.info("Valid vectors: %d | Skipped (empty): %d", len(vectors), skipped)
+
+    if not vectors:
+        log.error("No valid embedding vectors!")
+        return {"status": "ERROR", "error": "No valid vectors"}
+
+    # Convert to numpy array
+    vectors_np = np.array(vectors, dtype=np.float32)
+    n, d = vectors_np.shape
+
+    log.info("Vector array shape: %s", vectors_np.shape)
+
+    # Normalize vectors if using Inner Product
+    if METRIC_TYPE == "IP":
+        log.info("Normalizing vectors for Inner Product metric...")
+        import faiss
+        faiss.normalize_L2(vectors_np)
+
+    # Build FAISS index
+    index = build_faiss_index(vectors_np, INDEX_TYPE, METRIC_TYPE)
+
+    # Create output directory
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save index locally
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    index_path = output_dir / f"faiss_index_{timestamp}.bin"
+    save_faiss_index(index, str(index_path))
+
+    # Save metadata
+    metadata_data = {
+        "pipeline": "vector_db",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "source_embedding_file": str(input_path),
+        "index_type": INDEX_TYPE,
+        "metric_type": METRIC_TYPE,
+        "total_vectors": n,
+        "dimensions": d,
+        "skipped_chunks": skipped,
+        "metadata": metadata
+    }
+
+    meta_path = output_dir / f"chunk_metadata_{timestamp}.json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata_data, f, indent=2, ensure_ascii=False)
+
+    log.info("Metadata saved to: %s", meta_path)
+
+    log.info("=" * 60)
+    log.info("COMPLETE")
+    log.info("Vectors: %d | Dimensions: %d | Skipped: %d", n, d, skipped)
+    log.info("Index: %s", index_path)
+    log.info("Metadata: %s", meta_path)
+    log.info("=" * 60)
+
+    return {
+        "status": "SUCCEEDED",
+        "index_path": str(index_path),
+        "metadata_path": str(meta_path),
+        "total_vectors": n,
+        "dimensions": d,
+        "index_type": INDEX_TYPE,
+        "metric_type": METRIC_TYPE
+    }
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    result = process_vector_db_local()
+    print(json.dumps(result, indent=2, default=str))
+###########################
+"""
 Vector DB Pipeline — Vector RAG Step 4
 ========================================
 Loads chunk embeddings into FAISS Flat (exact) index for similarity search.
