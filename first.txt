@@ -1,3 +1,152 @@
+def extract_terms_from_section(section_title: str, section_text: str) -> List[Dict[str, Any]]:
+    """
+    Ask Claude to extract domain terms from a section.
+    Returns list of {term, aliases, category} dicts.
+    """
+    prompt = (
+        "You are analyzing an ECMC bankruptcy student loan document section. "
+        "Extract all important domain-specific terms that a borrower or agent "
+        "might ask about. Include legal terms, procedures, forms, loan statuses, "
+        "and specific document names or codes.\n\n"
+        "For each term, provide:\n"
+        "- The canonical term name\n"
+        "- Common aliases or abbreviations\n"
+        "- A category: legal, procedure, form, status, or document\n\n"
+        "Return ONLY a JSON array with this exact shape:\n"
+        '[{"term": "Exact Term", "aliases": ["alias1", "alias2"], "category": "legal|procedure|form|status|document"}]\n\n'
+        f"Section title: {section_title}\n"
+        f"Section text:\n{section_text[:3000]}\n\n"
+        "Terms (JSON only):"
+    )
+
+    resp = bedrock_chat(CLAUDE_MODEL_ID, prompt, max_tokens=1024)
+    
+    # === NEW: Use robust parser instead of manual parse ===
+    return robust_json_parse(resp)
+
+
+# === ADD THIS FUNCTION HERE ===
+def robust_json_parse(text: str) -> List[Dict[str, Any]]:
+    """
+    Robustly parse JSON from Claude response.
+    Handles markdown wrappers, preamble, trailing text, and common JSON errors.
+    """
+    if not text or not text.strip():
+        log.warning("Empty response from Claude")
+        return []
+    
+    # Step 1: Extract JSON array from text
+    json_text = extract_json_array(text)
+    
+    if not json_text:
+        log.error("No JSON array found in response. Raw: %s", text[:500])
+        return []
+    
+    # Step 2: Clean common JSON issues
+    json_text = clean_json_text(json_text)
+    
+    # Step 3: Parse
+    try:
+        parsed = json.loads(json_text)
+        if isinstance(parsed, list):
+            return parsed
+        elif isinstance(parsed, dict) and "terms" in parsed:
+            return parsed["terms"]
+        else:
+            log.error("Parsed JSON is not a list. Type: %s", type(parsed))
+            return []
+    except json.JSONDecodeError as e:
+        log.error("JSON parse failed: %s", e)
+        log.error("Cleaned JSON text: %s", json_text[:500])
+        return []
+
+
+def extract_json_array(text: str) -> str:
+    """
+    Extract JSON array from text that may contain markdown, preamble, etc.
+    """
+    text = text.strip()
+    
+    # Remove markdown code blocks: ```json ... ``` or ``` ... ```
+    patterns = [
+        r"```json\s*(.*?)\s*```",
+        r"```\s*(.*?)\s*```",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    
+    # Find raw array between [ and ]
+    start = text.find("[")
+    end = text.rfind("]")
+    
+    if start != -1 and end != -1 and end > start:
+        return text[start:end+1]
+    
+    return ""
+
+
+def clean_json_text(text: str) -> str:
+    """
+    Fix common JSON formatting issues from LLM output.
+    """
+    text = text.strip("\ufeff").strip()
+    
+    # Fix trailing commas before ] or }
+    text = re.sub(r",\s*]", "]", text)
+    text = re.sub(r",\s*}", "}", text)
+    
+    # Fix single quotes to double quotes (only where it looks like JSON delimiters)
+    text = re.sub(r"(?<=[:,\[\{])\s*'", '"', text)
+    text = re.sub(r"'(?=\s*[:,}\]])", '"', text)
+    
+    # Fix unescaped newlines inside strings
+    text = fix_newlines_in_json(text)
+    
+    return text.strip()
+
+
+def fix_newlines_in_json(text: str) -> str:
+    """
+    Replace literal newlines inside JSON string values with \n.
+    """
+    result = []
+    in_string = False
+    escape = False
+    
+    for char in text:
+        if escape:
+            result.append(char)
+            escape = False
+            continue
+            
+        if char == "\\":
+            result.append(char)
+            escape = True
+            continue
+            
+        if char == '"':
+            in_string = not in_string
+            result.append(char)
+            continue
+            
+        if char == "\n" and in_string:
+            result.append("\\n")
+            continue
+            
+        if char == "\r" and in_string:
+            continue
+            
+        result.append(char)
+    
+    return "".join(result)
+
+
+# === YOUR EXISTING merge_term_into_index FUNCTION ===
+def merge_term_into_index(...):
+    ...
+#######
 from json_repair import repair_json
 
 def robust_json_parse(text: str) -> List[Dict[str, Any]]:
