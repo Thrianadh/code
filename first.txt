@@ -1,3 +1,662 @@
+"""
+Chunking Pipeline — Vector RAG Step 2
+======================================
+Converts Textract JSON output into structured chunks for embedding.
+
+Input:
+    - Textract .json files (from Pipeline 1)
+    - Scrapy Markdown files (4 files)
+
+Output:
+    - chunk_objects.json: List of chunks with metadata
+
+Chunk types:
+    - text: 512 tokens, 10% overlap
+    - table: full table <= 1024 tokens (Strategy A)
+    - figure: Nova description (only if NOVA_ENABLED=true)
+    - form: key-value pairs
+
+Design decisions (locked):
+    - Text chunk size: 512 tokens
+    - Text overlap: 10% (50 tokens)
+    - Table chunk max: 1024 tokens
+    - Figures: only if NOVA_ENABLED=true
+    - Sequence preserved from Textract block order
+"""
+
+import json
+import logging
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+import fitz  # PyMuPDF for figure cropping
+
+# ============================================================================
+# Configuration
+# ============================================================================
+REGION = os.getenv("AWS_REGION", "us-east-1")
+INPUT_BUCKET = os.getenv("INPUT_BUCKET", "ecmc-dev-bucket")
+TEXTRACT_JSON_PREFIX = os.getenv("TEXTRACT_JSON_PREFIX", "textract_output/")
+MD_PREFIX = os.getenv("MD_PREFIX", "markdown/")
+PDF_PREFIX = os.getenv("PDF_PREFIX", "pdfs/")
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "ecmc-dev-bucket")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "vector_rag/chunks/")
+NOVA_ENABLED = os.getenv("NOVA_ENABLED", "false").lower() == "true"
+NOVA_MODEL_ID = os.getenv("NOVA_MODEL_ID", "us.amazon.nova-lite-v1:0")
+
+# Chunking constants
+TEXT_CHUNK_SIZE = 512      # tokens
+TEXT_OVERLAP = 50          # tokens (10% of 512)
+TABLE_CHUNK_MAX = 1024     # tokens
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# AWS Clients
+# ============================================================================
+_s3_client = None
+_bedrock_client = None
+
+
+def get_s3_client() -> boto3.client:
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+def get_bedrock_client() -> boto3.client:
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+# ============================================================================
+# S3 Helpers
+# ============================================================================
+def list_json_keys(bucket: str, prefix: str) -> List[str]:
+    """List all .json keys under S3 prefix."""
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            k = obj["Key"]
+            if k.endswith(".json") and not k.endswith("_tables.json"):
+                keys.append(k)
+    return keys
+
+
+def list_md_keys(bucket: str, prefix: str) -> List[str]:
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            k = obj["Key"]
+            if k.lower().endswith((".md", ".markdown")):
+                keys.append(k)
+    return keys
+
+
+def load_s3_json(bucket: str, key: str) -> Dict[str, Any]:
+    s3 = get_s3_client()
+    return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+
+
+def load_s3_text(bucket: str, key: str) -> str:
+    s3 = get_s3_client()
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+
+
+def load_s3_bytes(bucket: str, key: str) -> bytes:
+    s3 = get_s3_client()
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
+def save_s3_json(bucket: str, key: str, data: Dict[str, Any]) -> str:
+    s3 = get_s3_client()
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    return f"s3://{bucket}/{key}"
+
+
+# ============================================================================
+# Token Estimation (Simple)
+# ============================================================================
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for English."""
+    return len(text) // 4
+
+
+# ============================================================================
+# Textract Block Indexing
+# ============================================================================
+def index_blocks(blocks: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {b["Id"]: b for b in blocks}
+
+
+def extract_cell_text(cell: Dict[str, Any], by_id: Dict[str, Dict[str, Any]]) -> str:
+    words = []
+    for rel in cell.get("Relationships", []):
+        if rel["Type"] == "CHILD":
+            for wid in rel["Ids"]:
+                child = by_id.get(wid)
+                if not child:
+                    continue
+                if child["BlockType"] == "WORD":
+                    words.append(child.get("Text", ""))
+                elif child["BlockType"] == "SELECTION_ELEMENT":
+                    words.append("[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(words).strip()
+
+
+def grid_to_markdown(grid: List[List[str]]) -> str:
+    if not grid:
+        return ""
+    lines = ["| " + " | ".join(grid[0]) + " |"]
+    lines.append("|" + "|".join([" --- "] * len(grid[0])) + "|")
+    for row in grid[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+# ============================================================================
+# Nova Figure Analysis (Only if NOVA_ENABLED)
+# ============================================================================
+def bedrock_converse(model_id: str, prompt: str, image_bytes: Optional[bytes] = None, max_tokens: int = 1024) -> str:
+    client = get_bedrock_client()
+    content = [{"text": prompt}]
+    if image_bytes:
+        import base64
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        content.append({
+            "image": {
+                "format": "png",
+                "source": {"bytes": b64_image}
+            }
+        })
+    try:
+        resp = client.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": content}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0}
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        log.error("Bedrock error: %s", exc)
+        return ""
+
+
+def analyze_figure_with_nova(pdf_bytes: bytes, figure: Dict[str, Any], doc_context: str = "") -> str:
+    page_num = figure["page"] - 1
+    bbox = figure["bbox"]
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page = doc[page_num]
+        page_rect = page.rect
+
+        x0 = bbox["Left"] * page_rect.width
+        y0 = bbox["Top"] * page_rect.height
+        x1 = x0 + bbox["Width"] * page_rect.width
+        y1 = y0 + bbox["Height"] * page_rect.height
+
+        clip_rect = fitz.Rect(x0, y0, x1, y1)
+        pix = page.get_pixmap(clip=clip_rect, dpi=200)
+        img_bytes = pix.tobytes("png")
+
+        prompt = (
+            f"You are analyzing a figure from an ECMC bankruptcy document. "
+            f"Document context: {doc_context[:500]}\n\n"
+            f"Analyze this image and describe: "
+            f"1. What type of content is this? "
+            f"2. If UI elements, list them. "
+            f"3. If form/table, extract visible data. "
+            f"4. If flowchart, describe process step-by-step. "
+            f"5. If screenshot, describe user actions."
+        )
+
+        return bedrock_converse(NOVA_MODEL_ID, prompt, image_bytes=img_bytes, max_tokens=2048)
+    finally:
+        doc.close()
+
+
+# ============================================================================
+# Chunk Builders
+# ============================================================================
+@dataclass
+class Chunk:
+    chunk_id: str
+    chunk_type: str
+    content: str
+    metadata: Dict[str, Any]
+    token_count: int = 0
+
+
+def build_text_chunks(text: str, doc_id: str, start_idx: int, metadata_base: Dict[str, Any]) -> List[Chunk]:
+    """Split text into overlapping chunks of ~512 tokens."""
+    # Simple sentence-based splitting
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks = []
+    current_text = ""
+    chunk_idx = 0
+
+    for sent in sentences:
+        if estimate_tokens(current_text + " " + sent) > TEXT_CHUNK_SIZE:
+            # Save current chunk
+            chunks.append(Chunk(
+                chunk_id=f"{doc_id}_text_{start_idx + chunk_idx:04d}",
+                chunk_type="text",
+                content=current_text.strip(),
+                metadata={**metadata_base, "chunk_index": chunk_idx},
+                token_count=estimate_tokens(current_text)
+            ))
+            # Start new chunk with overlap (last ~50 tokens)
+            words = current_text.split()
+            overlap_text = " ".join(words[-TEXT_OVERLAP:]) if len(words) > TEXT_OVERLAP else current_text
+            current_text = overlap_text + " " + sent
+            chunk_idx += 1
+        else:
+            current_text += " " + sent if current_text else sent
+
+    # Final chunk
+    if current_text.strip():
+        chunks.append(Chunk(
+            chunk_id=f"{doc_id}_text_{start_idx + chunk_idx:04d}",
+            chunk_type="text",
+            content=current_text.strip(),
+            metadata={**metadata_base, "chunk_index": chunk_idx},
+            token_count=estimate_tokens(current_text)
+        ))
+
+    return chunks
+
+
+def build_table_chunk(table_data: Dict[str, Any], doc_id: str, chunk_idx: int, metadata_base: Dict[str, Any]) -> Chunk:
+    """Build single table chunk. If exceeds 1024 tokens, will need Strategy B later."""
+    markdown = table_data.get("markdown", "")
+    token_count = estimate_tokens(markdown)
+
+    return Chunk(
+        chunk_id=f"{doc_id}_table_{chunk_idx:04d}",
+        chunk_type="table",
+        content=markdown,
+        metadata={
+            **metadata_base,
+            "row_count": table_data.get("rows", 0),
+            "col_count": table_data.get("cols", 0),
+            "table_id": table_data.get("table_id", ""),
+            "token_count": token_count
+        },
+        token_count=token_count
+    )
+
+
+def build_form_chunk(form_fields: List[Dict[str, Any]], doc_id: str, chunk_idx: int, metadata_base: Dict[str, Any]) -> Chunk:
+    """Build form chunk from key-value pairs."""
+    lines = [f"{f['key']}: {f['value']}" for f in form_fields if f.get("key")]
+    content = "\n".join(lines)
+
+    return Chunk(
+        chunk_id=f"{doc_id}_form_{chunk_idx:04d}",
+        chunk_type="form",
+        content=content,
+        metadata={
+            **metadata_base,
+            "field_count": len(form_fields),
+            "token_count": estimate_tokens(content)
+        },
+        token_count=estimate_tokens(content)
+    )
+
+
+def build_figure_chunk(description: str, figure_data: Dict[str, Any], doc_id: str, chunk_idx: int, metadata_base: Dict[str, Any]) -> Chunk:
+    """Build figure chunk from Nova description."""
+    content = f"[FIGURE: {description}]"
+
+    return Chunk(
+        chunk_id=f"{doc_id}_figure_{chunk_idx:04d}",
+        chunk_type="figure",
+        content=content,
+        metadata={
+            **metadata_base,
+            "figure_id": figure_data.get("figure_id", ""),
+            "page": figure_data.get("page", 1),
+            "nova_analyzed": True,
+            "token_count": estimate_tokens(content)
+        },
+        token_count=estimate_tokens(content)
+    )
+
+
+# ============================================================================
+# Textract JSON Processor
+# ============================================================================
+def process_textract_json(json_key: str, json_data: Dict[str, Any]) -> List[Chunk]:
+    """Process Textract JSON output into chunks."""
+    doc_id = Path(json_key).stem
+    source_key = json_data.get("source_key", json_key)
+    blocks = json_data.get("Blocks", [])
+    sequence = json_data.get("sequence", [])
+
+    log.info("Processing Textract JSON: %s (%d blocks, %d sequence items)",
+             doc_id, len(blocks), len(sequence))
+
+    chunks = []
+    chunk_counter = {"text": 0, "table": 0, "form": 0, "figure": 0}
+
+    # Load PDF bytes for figure analysis if Nova enabled
+    pdf_bytes = None
+    if NOVA_ENABLED:
+        try:
+            pdf_key = json_data.get("source_key", "").replace("s3://" + INPUT_BUCKET + "/", "")
+            if pdf_key:
+                pdf_bytes = load_s3_bytes(INPUT_BUCKET, pdf_key)
+        except Exception as e:
+            log.warning("Could not load PDF for figure analysis: %s", e)
+
+    # Build context from text for Nova
+    doc_context = " ".join([
+        item.get("text", "") for item in sequence
+        if item.get("type") in ("title", "section_header", "paragraph")
+    ])[:1000]
+
+    # Process sequence items in order
+    for item in sequence:
+        item_type = item.get("type", "")
+        page = item.get("page", 1)
+
+        metadata_base = {
+            "source_document": doc_id,
+            "source_key": source_key,
+            "page_number": page,
+            "sequence_position": sequence.index(item)
+        }
+
+        if item_type == "paragraph":
+            text = item.get("text", "")
+            if text:
+                text_chunks = build_text_chunks(
+                    text, doc_id, chunk_counter["text"], metadata_base
+                )
+                chunks.extend(text_chunks)
+                chunk_counter["text"] += len(text_chunks)
+
+        elif item_type == "table":
+            table_data = {
+                "markdown": item.get("markdown", ""),
+                "rows": item.get("rows", 0),
+                "cols": item.get("cols", 0),
+                "table_id": item.get("table_id", "")
+            }
+            chunk = build_table_chunk(table_data, doc_id, chunk_counter["table"], metadata_base)
+            chunks.append(chunk)
+            chunk_counter["table"] += 1
+
+        elif item_type == "key_value":
+            # Group consecutive key_values into form chunks
+            form_fields = [{"key": item.get("key", ""), "value": item.get("value", "")}]
+            chunk = build_form_chunk(form_fields, doc_id, chunk_counter["form"], metadata_base)
+            chunks.append(chunk)
+            chunk_counter["form"] += 1
+
+        elif item_type == "figure":
+            if NOVA_ENABLED and pdf_bytes:
+                try:
+                    description = analyze_figure_with_nova(
+                        pdf_bytes,
+                        {"page": page, "bbox": item.get("bbox", {})},
+                        doc_context
+                    )
+                    chunk = build_figure_chunk(
+                        description, item, doc_id, chunk_counter["figure"], metadata_base
+                    )
+                    chunks.append(chunk)
+                    chunk_counter["figure"] += 1
+                except Exception as e:
+                    log.warning("Figure analysis failed: %s", e)
+            # If NOVA disabled, skip figure entirely (no placeholder)
+
+    log.info("Chunks created: text=%d, table=%d, form=%d, figure=%d",
+             chunk_counter["text"], chunk_counter["table"],
+             chunk_counter["form"], chunk_counter["figure"])
+
+    return chunks
+
+
+# ============================================================================
+# Markdown Processor (Scrapy files)
+# ============================================================================
+def process_markdown(md_key: str, md_text: str) -> List[Chunk]:
+    """Process Scrapy Markdown files into chunks."""
+    doc_id = Path(md_key).stem
+    log.info("Processing Markdown: %s", doc_id)
+
+    chunks = []
+    chunk_counter = 0
+
+    # Extract metadata from HTML comments
+    metadata = {}
+    for match in re.finditer(r"<!--\s*(\w+):\s*(.*?)\s*-->", md_text):
+        metadata[match.group(1).strip().lower()] = match.group(2).strip()
+
+    # Split by headings
+    sections = re.split(r"(\n##\s+.+\n|\n###\s+.+\n)", md_text)
+    current_heading = "Untitled"
+
+    for section in sections:
+        if section.strip().startswith("## ") or section.strip().startswith("### "):
+            current_heading = section.strip().strip("#").strip()
+            continue
+
+        if not section.strip():
+            continue
+
+        # Detect tables in markdown
+        table_pattern = r"(\|.+\|\n)+"
+        tables = re.finditer(table_pattern, section)
+        table_positions = [(m.start(), m.end()) for m in tables]
+
+        # Split section into text and table parts
+        last_end = 0
+        for start, end in table_positions:
+            # Text before table
+            text_before = section[last_end:start]
+            if text_before.strip():
+                text_chunks = build_text_chunks(
+                    text_before, doc_id, chunk_counter,
+                    {
+                        "source_document": doc_id,
+                        "source_key": md_key,
+                        "parent_heading": current_heading,
+                        "page_number": None
+                    }
+                )
+                chunks.extend(text_chunks)
+                chunk_counter += len(text_chunks)
+
+            # Table
+            table_md = section[start:end]
+            table_lines = [l.strip() for l in table_md.strip().split("\n") if l.strip().startswith("|")]
+            if table_lines:
+                # Parse simple table
+                grid = []
+                for line in table_lines:
+                    if "---" in line:
+                        continue
+                    cells = [c.strip() for c in line.strip("|").split("|")]
+                    grid.append(cells)
+
+                if grid:
+                    markdown = grid_to_markdown(grid)
+                    chunk = Chunk(
+                        chunk_id=f"{doc_id}_table_{chunk_counter:04d}",
+                        chunk_type="table",
+                        content=markdown,
+                        metadata={
+                            "source_document": doc_id,
+                            "source_key": md_key,
+                            "parent_heading": current_heading,
+                            "page_number": None,
+                            "row_count": len(grid) - 1,
+                            "col_count": len(grid[0]) if grid else 0
+                        },
+                        token_count=estimate_tokens(markdown)
+                    )
+                    chunks.append(chunk)
+                    chunk_counter += 1
+
+            last_end = end
+
+        # Text after last table
+        text_after = section[last_end:]
+        if text_after.strip():
+            text_chunks = build_text_chunks(
+                text_after, doc_id, chunk_counter,
+                {
+                    "source_document": doc_id,
+                    "source_key": md_key,
+                    "parent_heading": current_heading,
+                    "page_number": None
+                }
+            )
+            chunks.extend(text_chunks)
+            chunk_counter += len(text_chunks)
+
+    log.info("Markdown chunks: %d", len(chunks))
+    return chunks
+
+
+# ============================================================================
+# Main Orchestrator
+# ============================================================================
+def process_all_documents() -> Dict[str, Any]:
+    log.info("=" * 60)
+    log.info("Chunking Pipeline")
+    log.info("NOVA_ENABLED=%s", NOVA_ENABLED)
+    log.info("Text chunk size=%d, overlap=%d", TEXT_CHUNK_SIZE, TEXT_OVERLAP)
+    log.info("Table chunk max=%d", TABLE_CHUNK_MAX)
+    log.info("=" * 60)
+
+    all_chunks = []
+
+    # Process Textract JSON files (9 PDFs)
+    json_keys = list_json_keys(INPUT_BUCKET, TEXTRACT_JSON_PREFIX)
+    log.info("Found %d Textract JSON files", len(json_keys))
+
+    for key in json_keys:
+        try:
+            json_data = load_s3_json(INPUT_BUCKET, key)
+            chunks = process_textract_json(key, json_data)
+            all_chunks.extend(chunks)
+        except Exception as exc:
+            log.exception("Failed to process %s: %s", key, exc)
+
+    # Process Markdown files (4 Scrapy)
+    md_keys = list_md_keys(INPUT_BUCKET, MD_PREFIX)
+    log.info("Found %d Markdown files", len(md_keys))
+
+    for key in md_keys:
+        try:
+            md_text = load_s3_text(INPUT_BUCKET, key)
+            chunks = process_markdown(key, md_text)
+            all_chunks.extend(chunks)
+        except Exception as exc:
+            log.exception("Failed to process %s: %s", key, exc)
+
+    if not all_chunks:
+        log.error("No chunks generated!")
+        return {"status": "ERROR", "error": "No chunks"}
+
+    # Build output
+    output_data = {
+        "pipeline": "chunking",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "nova_enabled": NOVA_ENABLED,
+        "text_chunk_size": TEXT_CHUNK_SIZE,
+        "text_overlap": TEXT_OVERLAP,
+        "table_chunk_max": TABLE_CHUNK_MAX,
+        "total_chunks": len(all_chunks),
+        "chunk_types": {},
+        "chunks": []
+    }
+
+    # Count types
+    type_counts = {}
+    for chunk in all_chunks:
+        type_counts[chunk.chunk_type] = type_counts.get(chunk.chunk_type, 0) + 1
+        output_data["chunks"].append({
+            "chunk_id": chunk.chunk_id,
+            "chunk_type": chunk.chunk_type,
+            "content": chunk.content,
+            "metadata": chunk.metadata,
+            "token_count": chunk.token_count
+        })
+
+    output_data["chunk_types"] = type_counts
+
+    log.info("=" * 60)
+    log.info("COMPLETE: %d chunks", len(all_chunks))
+    for ctype, count in type_counts.items():
+        log.info("  %s: %d", ctype, count)
+    log.info("=" * 60)
+
+    # Save to S3
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_key = f"{OUTPUT_PREFIX.rstrip('/')}/chunk_objects_{timestamp}.json"
+    output_uri = save_s3_json(OUTPUT_BUCKET, output_key, output_data)
+
+    return {
+        "status": "SUCCEEDED",
+        "output_uri": output_uri,
+        "total_chunks": len(all_chunks),
+        "chunk_types": type_counts
+    }
+
+
+# ============================================================================
+# Lambda Handler
+# ============================================================================
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    global REGION, INPUT_BUCKET, TEXTRACT_JSON_PREFIX, MD_PREFIX
+    global PDF_PREFIX, OUTPUT_BUCKET, OUTPUT_PREFIX
+    global NOVA_ENABLED, NOVA_MODEL_ID
+    global _s3_client, _bedrock_client
+
+    REGION = event.get("aws_region", REGION)
+    INPUT_BUCKET = event.get("input_bucket", INPUT_BUCKET)
+    TEXTRACT_JSON_PREFIX = event.get("textract_json_prefix", TEXTRACT_JSON_PREFIX)
+    MD_PREFIX = event.get("md_prefix", MD_PREFIX)
+    PDF_PREFIX = event.get("pdf_prefix", PDF_PREFIX)
+    OUTPUT_BUCKET = event.get("output_bucket", OUTPUT_BUCKET)
+    OUTPUT_PREFIX = event.get("output_prefix", OUTPUT_PREFIX)
+    NOVA_ENABLED = str(event.get("nova_enabled", NOVA_ENABLED)).lower() == "true"
+    NOVA_MODEL_ID = event.get("nova_model_id", NOVA_MODEL_ID)
+
+    _s3_client = None
+    _bedrock_client = None
+
+    return process_all_documents()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    result = process_all_documents()
+    print(json.dumps(result, indent=2, default=str))
+############
 def extract_terms_from_section(section_title: str, section_text: str) -> List[Dict[str, Any]]:
     """
     Ask Claude to extract domain terms from a section.
