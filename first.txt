@@ -324,6 +324,333 @@ if __name__ == "__main__":
     )
     result = process_embeddings()
     print(json.dumps(result, indent=2, default=str))
+############
+"""
+Embeddings Pipeline — Vector RAG Step 3 (Fixed for Titan v2)
+=============================================================
+Generates embeddings for chunks using Amazon Titan Embed Text v2.
+
+Titan v2 API specifics:
+    - Model ID: Use cross-region inference or full ARN
+    - Input: Single string "inputText" (not batch array)
+    - Output: Single embedding vector per call
+    - No batching — process one at a time or use async
+
+Input:
+    - chunk_objects.json (auto-discovered)
+
+Output:
+    - chunk_embeddings.json
+"""
+
+import json
+import logging
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+
+# ============================================================================
+# Configuration
+# ============================================================================
+REGION = os.getenv("AWS_REGION", "us-east-1")
+INPUT_BUCKET = os.getenv("INPUT_BUCKET", "ecmc-dev-bucket")
+CHUNKS_PREFIX = os.getenv("CHUNKS_PREFIX", "")
+OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "ecmc-dev-bucket")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "vector_rag/embeddings/")
+EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))  # Parallel threads for embedding
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# AWS Clients
+# ============================================================================
+_s3_client = None
+_bedrock_client = None
+
+
+def get_s3_client() -> boto3.client:
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+def get_bedrock_client() -> boto3.client:
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_client
+
+
+# ============================================================================
+# S3 Helpers — Auto-Discovery
+# ============================================================================
+def find_chunk_files(bucket: str, prefix: str = "") -> List[str]:
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    matching_keys = []
+    search_prefix = prefix if prefix else ""
+
+    log.info("Searching for chunk files under s3://%s/%s", bucket, search_prefix)
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=search_prefix):
+        for obj in page.get("Contents", []):
+            k = obj["Key"]
+            filename = Path(k).name.lower()
+            if k.endswith(".json") and ("chunk" in filename or "object" in filename):
+                if "embedding" not in filename and "vector" not in filename:
+                    matching_keys.append(k)
+                    log.info("  Found: %s", k)
+
+    matching_keys.sort(reverse=True)
+    return matching_keys
+
+
+def load_s3_json(bucket: str, key: str) -> Dict[str, Any]:
+    s3 = get_s3_client()
+    return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+
+
+def save_s3_json(bucket: str, key: str, data: Dict[str, Any]) -> str:
+    s3 = get_s3_client()
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    return f"s3://{bucket}/{key}"
+
+
+# ============================================================================
+# Embedding — Titan v2 (Single Text per Call)
+# ============================================================================
+def embed_single_text(text: str, model_id: str = EMBED_MODEL_ID) -> List[float]:
+    """
+    Embed a single text using Titan Embed Text v2.
+    Titan v2 expects: {"inputText": "single string"}
+    Returns: embedding vector (1024 dimensions)
+    """
+    client = get_bedrock_client()
+
+    # Titan v2 body format — single string only
+    body = {
+        "inputText": text,  # Must be a single string, not array
+        "dimensions": 1024,
+        "normalize": True
+    }
+
+    try:
+        resp = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json"
+        )
+        result = json.loads(resp["body"].read())
+
+        # Titan v2 response format
+        embedding = result.get("embedding", [])
+
+        if not embedding:
+            log.warning("Empty embedding returned for text: %s...", text[:50])
+            return []
+
+        return embedding
+
+    except Exception as exc:
+        log.error("Embedding failed: %s", exc)
+        log.error("Text preview: %s...", text[:100])
+        return []
+
+
+def embed_chunk(chunk: Dict[str, Any], model_id: str = EMBED_MODEL_ID) -> Dict[str, Any]:
+    """
+    Embed a single chunk and return enriched chunk with embedding.
+    """
+    content = chunk.get("content", "")
+    chunk_type = chunk.get("chunk_type", "text")
+    metadata = chunk.get("metadata", {})
+
+    # Build rich embedding text
+    parts = []
+    if chunk_type == "table":
+        parts.append(f"Table: {metadata.get('parent_heading', '')}")
+        parts.append(content)
+    elif chunk_type == "figure":
+        parts.append(f"Figure: {content}")
+    elif chunk_type == "form":
+        parts.append(f"Form: {metadata.get('parent_heading', '')}")
+        parts.append(content)
+    else:
+        parts.append(content)
+
+    embedding_text = " ".join(parts)
+
+    # Call embedding
+    embedding = embed_single_text(embedding_text, model_id)
+
+    return {
+        "chunk_id": chunk["chunk_id"],
+        "chunk_type": chunk_type,
+        "content": content,
+        "metadata": metadata,
+        "token_count": chunk.get("token_count", 0),
+        "embedding": embedding,
+        "embedding_model": model_id,
+        "embedding_dimensions": len(embedding) if embedding else 0
+    }
+
+
+# ============================================================================
+# Main Orchestrator
+# ============================================================================
+def process_embeddings() -> Dict[str, Any]:
+    log.info("=" * 60)
+    log.info("Embeddings Pipeline (Titan v2 — Single Text)")
+    log.info("Model: %s", EMBED_MODEL_ID)
+    log.info("Max workers: %d", MAX_WORKERS)
+    log.info("=" * 60)
+
+    # Auto-discover chunk files
+    chunk_keys = find_chunk_files(INPUT_BUCKET, CHUNKS_PREFIX)
+
+    if not chunk_keys:
+        log.error("No chunk files found anywhere in s3://%s/", INPUT_BUCKET)
+        return {"status": "ERROR", "error": "No chunk files found"}
+
+    log.info("Found %d potential chunk files", len(chunk_keys))
+
+    # Try loading each until we find one with valid chunks
+    chunk_data = None
+    loaded_key = None
+
+    for key in chunk_keys:
+        try:
+            log.info("Attempting to load: s3://%s/%s", INPUT_BUCKET, key)
+            data = load_s3_json(INPUT_BUCKET, key)
+
+            if "chunks" in data and isinstance(data["chunks"], list) and len(data["chunks"]) > 0:
+                chunk_data = data
+                loaded_key = key
+                log.info("✓ Successfully loaded: %s (%d chunks)", key, len(data["chunks"]))
+                break
+            else:
+                log.warning("  File has no valid chunks: %s", key)
+        except Exception as exc:
+            log.warning("  Failed to load %s: %s", key, exc)
+            continue
+
+    if not chunk_data:
+        log.error("Could not load any valid chunk file!")
+        return {"status": "ERROR", "error": "No valid chunk files could be loaded"}
+
+    chunks = chunk_data["chunks"]
+    total = len(chunks)
+    log.info("Total chunks to embed: %d", total)
+
+    # Process chunks in parallel using ThreadPoolExecutor
+    embedded_chunks = []
+    completed = 0
+    failed = 0
+
+    log.info("Starting parallel embedding with %d workers...", MAX_WORKERS)
+    start_time = time.time()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_chunk = {
+            executor.submit(embed_chunk, chunk): chunk 
+            for chunk in chunks
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_chunk):
+            try:
+                result = future.result()
+                embedded_chunks.append(result)
+                completed += 1
+
+                if completed % 100 == 0:
+                    elapsed = time.time() - start_time
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    log.info("  Progress: %d/%d chunks (%.1f chunks/sec)", 
+                             completed, total, rate)
+
+            except Exception as exc:
+                failed += 1
+                log.error("Chunk embedding failed: %s", exc)
+
+    total_time = time.time() - start_time
+    log.info("Embedding complete: %d succeeded, %d failed in %.1f seconds", 
+             completed, failed, total_time)
+
+    # Build output
+    output_data = {
+        "pipeline": "embeddings",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "source_chunk_file": loaded_key,
+        "embedding_model": EMBED_MODEL_ID,
+        "total_chunks": len(embedded_chunks),
+        "dimensions": 1024,
+        "chunks": embedded_chunks
+    }
+
+    # Save to S3
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_key = f"{OUTPUT_PREFIX.rstrip('/')}/chunk_embeddings_{timestamp}.json"
+    output_uri = save_s3_json(OUTPUT_BUCKET, output_key, output_data)
+
+    log.info("=" * 60)
+    log.info("COMPLETE: %d chunks embedded", len(embedded_chunks))
+    log.info("Source: s3://%s/%s", INPUT_BUCKET, loaded_key)
+    log.info("Output: %s", output_uri)
+    log.info("Avg rate: %.1f chunks/sec", total / total_time if total_time > 0 else 0)
+    log.info("=" * 60)
+
+    return {
+        "status": "SUCCEEDED",
+        "output_uri": output_uri,
+        "source_file": loaded_key,
+        "total_chunks": len(embedded_chunks),
+        "embedding_model": EMBED_MODEL_ID,
+        "dimensions": 1024
+    }
+
+
+# ============================================================================
+# Lambda Handler
+# ============================================================================
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    global REGION, INPUT_BUCKET, CHUNKS_PREFIX, OUTPUT_BUCKET, OUTPUT_PREFIX, EMBED_MODEL_ID, MAX_WORKERS
+    global _s3_client, _bedrock_client
+
+    REGION = event.get("aws_region", REGION)
+    INPUT_BUCKET = event.get("input_bucket", INPUT_BUCKET)
+    CHUNKS_PREFIX = event.get("chunks_prefix", CHUNKS_PREFIX)
+    OUTPUT_BUCKET = event.get("output_bucket", OUTPUT_BUCKET)
+    OUTPUT_PREFIX = event.get("output_prefix", OUTPUT_PREFIX)
+    EMBED_MODEL_ID = event.get("embed_model_id", EMBED_MODEL_ID)
+    MAX_WORKERS = int(event.get("max_workers", MAX_WORKERS))
+
+    _s3_client = None
+    _bedrock_client = None
+
+    return process_embeddings()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    result = process_embeddings()
+    print(json.dumps(result, indent=2, default=str))
 ###########
 """
 Embeddings Pipeline — Vector RAG Step 3 (Fixed)
