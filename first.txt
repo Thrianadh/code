@@ -1,4 +1,558 @@
 import json
+import os
+import re
+from pathlib import Path
+from collections import OrderedDict
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION — UPDATE THESE PATHS TO MATCH YOUR WINDOWS SETUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CONFIG = {
+    # Input folders — update these to your actual paths
+    "onenote_dir": r"D:\users\ntrinadh\Downloads\docling\OneNote_data",
+    "website_dir": r"D:\users\ntrinadh\Downloads\docling\ecmc_org",
+
+    # Output directory
+    "output_dir": r"D:\users\ntrinadh\Downloads\docling\toc_output",
+    "toc_index_file": r"D:\users\ntrinadh\Downloads\docling\toc_output\toc_index.json",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: Markdown Header Extractor
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MarkdownHeaderExtractor:
+    """Extract headers (#, ##, ###, ####) from markdown files."""
+
+    HEADER_PATTERN = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
+
+    def extract(self, file_path):
+        """
+        Extract all headers from a markdown file.
+
+        Returns:
+            list of dicts: [{"level": 1, "text": "Title", "line": 5}, ...]
+        """
+        headers = []
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.rstrip('\n')
+                    match = self.HEADER_PATTERN.match(line)
+                    if match:
+                        hashes = match.group(1)
+                        text = match.group(2).strip()
+                        level = len(hashes)
+                        headers.append({
+                            "level": level,
+                            "text": text,
+                            "line": line_num,
+                        })
+        except Exception as e:
+            print(f"    ⚠️  Error reading {file_path}: {e}")
+
+        return headers
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: Path Builder from Headers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PathBuilder:
+    """Build tree path from extracted markdown headers."""
+
+    def build_path(self, headers):
+        """
+        Build path from markdown headers.
+
+        Expected structure:
+            # Level 1 (Notebook / Category)
+            ## Level 2 (Section Group / Subcategory)
+            ### Level 3 (Section / Page)
+            #### Level 4 (Page / Subtopic)
+
+        Returns:
+            {"parent_path": [...], "title": "leaf title", "depth": N, "all_headers": [...]}
+        """
+        if not headers:
+            return {"parent_path": [], "title": "[No Headers]", "depth": 0, "all_headers": []}
+
+        # Sort by line number to maintain order
+        headers = sorted(headers, key=lambda h: h["line"])
+
+        # Build path from all headers
+        path_parts = []
+        for h in headers:
+            level = h["level"]
+            text = h["text"]
+
+            # Map level to path position (1-based index)
+            idx = level - 1
+            if idx >= len(path_parts):
+                path_parts.append(text)
+            else:
+                path_parts[idx] = text
+
+            # Trim any deeper levels that might exist from earlier headers
+            path_parts = path_parts[:level]
+
+        # Parent path = all except last
+        # Leaf title = last header (deepest level)
+        if len(path_parts) >= 2:
+            parent_path = path_parts[:-1]
+            title = path_parts[-1]
+        elif len(path_parts) == 1:
+            parent_path = []
+            title = path_parts[0]
+        else:
+            parent_path = []
+            title = "[Empty]"
+
+        return {
+            "parent_path": parent_path,
+            "title": title,
+            "depth": len(path_parts),
+            "all_headers": [h["text"] for h in headers],
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: PDF Attachment Detector
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PDFAttachmentDetector:
+    """Detect PDF links referenced in markdown files."""
+
+    PDF_LINK_PATTERN = re.compile(
+        r'\[([^\]]+)\]\(([^)]+\.pdf)\)',
+        re.IGNORECASE
+    )
+    PDF_URL_PATTERN = re.compile(
+        r'(https?://[^\s]+\.pdf)',
+        re.IGNORECASE
+    )
+
+    def detect(self, file_path):
+        """
+        Find all PDF references in a markdown file.
+
+        Returns:
+            list of dicts: [{"title": "PDF Title", "url": "..."}, ...]
+        """
+        attachments = []
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # Match [Title](path/to/file.pdf)
+            for match in self.PDF_LINK_PATTERN.finditer(content):
+                title = match.group(1).strip()
+                url = match.group(2).strip()
+                attachments.append({
+                    "title": title,
+                    "url": url,
+                    "type": "pdf_attachment",
+                })
+
+            # Match bare PDF URLs
+            for match in self.PDF_URL_PATTERN.finditer(content):
+                url = match.group(1).strip()
+                # Extract filename as title
+                title = os.path.basename(url).replace('.pdf', '').replace('-', ' ').replace('_', ' ').title()
+                attachments.append({
+                    "title": title,
+                    "url": url,
+                    "type": "pdf_attachment",
+                })
+
+        except Exception as e:
+            print(f"    ⚠️  Error scanning PDF links in {file_path}: {e}")
+
+        return attachments
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: File Iterator
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MarkdownFileIterator:
+    """Iterate markdown files from source folders."""
+
+    def __init__(self, onenote_dir, website_dir):
+        self.onenote_dir = Path(onenote_dir)
+        self.website_dir = Path(website_dir)
+
+    def iterate_onenote(self):
+        """Yield (file_path, source_label) for OneNote files."""
+        if not self.onenote_dir.exists():
+            print(f"⚠️  OneNote directory not found: {self.onenote_dir}")
+            return
+
+        md_files = sorted(self.onenote_dir.rglob("*.md"))
+        print(f"  Found {len(md_files)} markdown files in OneNote_data/")
+
+        for md_file in md_files:
+            yield md_file, "OneNote"
+
+    def iterate_website(self):
+        """Yield (file_path, source_label) for Website files."""
+        if not self.website_dir.exists():
+            print(f"⚠️  Website directory not found: {self.website_dir}")
+            return
+
+        md_files = sorted(self.website_dir.rglob("*.md"))
+        print(f"  Found {len(md_files)} markdown files in ecmc_org/")
+
+        for md_file in md_files:
+            yield md_file, "Website"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: Result Processor (Deduplication)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ResultProcessor:
+    """Process, deduplicate, and merge TOC entries."""
+
+    def deduplicate(self, entries):
+        """
+        Remove duplicate entries based on (source + parent_path + title).
+        If same title exists under different paths, both are kept.
+        """
+        seen = OrderedDict()
+        unique = []
+
+        for entry in entries:
+            # Deduplication key: source + full path + title
+            path_tuple = tuple(entry.get("parent_path", []))
+            key = (entry["source"], path_tuple, entry["title"])
+
+            if key not in seen:
+                seen[key] = entry
+                unique.append(entry)
+            else:
+                # Same entry from different file — merge file paths
+                existing = seen[key]
+                if "duplicate_files" not in existing:
+                    existing["duplicate_files"] = []
+                existing["duplicate_files"].append(entry.get("file_path", ""))
+
+        return unique
+
+    def sort_entries(self, entries):
+        """Sort entries for consistent tree rendering."""
+        return sorted(entries, key=lambda e: (
+            e["source"],
+            tuple(e.get("parent_path", [])),
+            e["title"],
+        ))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: Tree Renderer (ASCII + JSON + Markdown)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TreeRenderer:
+    """Render TOC entries as ASCII tree, JSON, and Markdown."""
+
+    def build_tree_dict(self, entries):
+        """
+        Build nested dictionary from flat entries list.
+
+        Structure:
+        {
+            "ROOT": {
+                "OneNote": {
+                    "Borrower Call Playbook": {
+                        "Payments During Bankruptcy": {
+                            "Setting Up Payments": {"_meta": {...}}
+                        }
+                    }
+                },
+                "Website (ecmc.org)": {...}
+            }
+        }
+        """
+        tree = {"ROOT": {}}
+
+        for entry in entries:
+            source = entry["source"]
+            parent_path = entry.get("parent_path", [])
+            title = entry["title"]
+
+            # Determine branch name
+            if source == "OneNote":
+                branch = "OneNote"
+            else:
+                branch = "Website (ecmc.org)"
+
+            # Initialize branch
+            if branch not in tree["ROOT"]:
+                tree["ROOT"][branch] = {}
+
+            # Navigate/create path
+            current = tree["ROOT"][branch]
+            for level in parent_path:
+                if level not in current:
+                    current[level] = {}
+                current = current[level]
+
+            # Add leaf with metadata
+            display_title = title
+            if entry.get("type") == "pdf_attachment":
+                display_title = f"[PDF] {title}"
+
+            current[display_title] = {
+                "_file_path": entry.get("file_path", ""),
+                "_type": entry.get("type", "page"),
+                "_headers": entry.get("all_headers", []),
+            }
+
+            # Add PDF attachments as children
+            for attachment in entry.get("pdf_attachments", []):
+                attach_title = f"[PDF] {attachment['title']}"
+                current[attach_title] = {
+                    "_url": attachment["url"],
+                    "_type": "pdf_attachment",
+                }
+
+        return tree
+
+    def render_ascii(self, tree):
+        """Render nested dict as ASCII tree."""
+        lines = ["ROOT"]
+        root_children = tree.get("ROOT", {})
+
+        items = list(root_children.items())
+        for i, (key, value) in enumerate(items):
+            is_last = (i == len(items) - 1)
+            connector = "└─ " if is_last else "├─ "
+            lines.append(connector + key)
+            child_prefix = "   " if is_last else "│  "
+            self._render_ascii_node(lines, value, child_prefix)
+
+        return "\n".join(lines)
+
+    def _render_ascii_node(self, lines, node, prefix):
+        """Recursively render ASCII tree nodes."""
+        # Separate branch children from leaf metadata
+        children = []
+        for k, v in node.items():
+            if k.startswith("_"):
+                continue
+            # Check if v has non-metadata children (is a branch)
+            is_branch = isinstance(v, dict) and any(not sk.startswith("_") for sk in v.keys())
+            children.append((k, v, is_branch))
+
+        for i, (key, value, is_branch) in enumerate(children):
+            is_last = (i == len(children) - 1)
+            connector = "└─ " if is_last else "├─ "
+            lines.append(prefix + connector + key)
+
+            if is_branch:
+                new_prefix = prefix + ("   " if is_last else "│  ")
+                self._render_ascii_node(lines, value, new_prefix)
+
+    def render_json(self, tree):
+        """Render as pretty-printed JSON."""
+        return json.dumps(tree, indent=2, ensure_ascii=False)
+
+    def render_markdown(self, entries):
+        """Render as Markdown document with headers."""
+        lines = [
+            "# Table of Contents — ECMC Knowledge Base",
+            "",
+            "Generated from OneNote and Website (ecmc.org) markdown files.",
+            "",
+        ]
+
+        # Group by source
+        by_source = {}
+        for entry in entries:
+            source = entry["source"]
+            if source not in by_source:
+                by_source[source] = []
+            by_source[source].append(entry)
+
+        for source, source_entries in by_source.items():
+            branch_name = "OneNote" if source == "OneNote" else "Website (ecmc.org)"
+            lines.append(f"## {branch_name}")
+            lines.append("")
+
+            # Sort by path depth
+            source_entries.sort(key=lambda e: (tuple(e.get("parent_path", [])), e["title"]))
+
+            for entry in source_entries:
+                depth = len(entry.get("parent_path", [])) + 2  # ## = level 0
+                hashes = "#" * min(depth, 6)
+                title = entry["title"]
+                if entry.get("type") == "pdf_attachment":
+                    title = f"[PDF] {title}"
+
+                lines.append(f"{hashes} {title}")
+                lines.append(f"- **File:** `{entry.get('file_path', '')}`")
+                lines.append(f"- **Headers:** {', '.join(entry.get('all_headers', [])[:3])}")
+                lines.append("")
+
+                # Add PDF attachments
+                for attachment in entry.get("pdf_attachments", []):
+                    lines.append(f"- **[PDF]** {attachment['title']} — `{attachment['url']}`")
+
+                if entry.get("pdf_attachments"):
+                    lines.append("")
+
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7: Main Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TOCPipeline:
+    """Main pipeline — orchestrates the entire TOC building process."""
+
+    def __init__(self, config):
+        self.config = config
+        self.extractor = MarkdownHeaderExtractor()
+        self.path_builder = PathBuilder()
+        self.pdf_detector = PDFAttachmentDetector()
+        self.file_iterator = MarkdownFileIterator(
+            config["onenote_dir"],
+            config["website_dir"],
+        )
+        self.processor = ResultProcessor()
+        self.renderer = TreeRenderer()
+
+    def run(self):
+        """Execute the full pipeline."""
+        print("=" * 70)
+        print("ECMC TOC BUILDER — Local Markdown Parser")
+        print("=" * 70)
+
+        all_entries = []
+
+        # Process OneNote files
+        print("\n[OneNote] Scanning markdown files...")
+        onenote_count = 0
+        for file_path, source in self.file_iterator.iterate_onenote():
+            onenote_count += 1
+            print(f"  [{onenote_count}] {file_path.name}")
+
+            headers = self.extractor.extract(file_path)
+            path_info = self.path_builder.build_path(headers)
+            pdf_attachments = self.pdf_detector.detect(file_path)
+
+            entry = {
+                "source": source,
+                "file_path": str(file_path),
+                "title": path_info["title"],
+                "parent_path": path_info["parent_path"],
+                "depth": path_info["depth"],
+                "all_headers": path_info["all_headers"],
+                "type": "page",
+                "pdf_attachments": pdf_attachments,
+            }
+            all_entries.append(entry)
+            path_str = " > ".join(path_info["parent_path"]) if path_info["parent_path"] else "[root]"
+            print(f"      → {path_str} > {path_info['title']}")
+
+        # Process Website files
+        print("\n[Website] Scanning markdown files...")
+        website_count = 0
+        for file_path, source in self.file_iterator.iterate_website():
+            website_count += 1
+            print(f"  [{website_count}] {file_path.name}")
+
+            headers = self.extractor.extract(file_path)
+            path_info = self.path_builder.build_path(headers)
+            pdf_attachments = self.pdf_detector.detect(file_path)
+
+            entry = {
+                "source": source,
+                "file_path": str(file_path),
+                "title": path_info["title"],
+                "parent_path": path_info["parent_path"],
+                "depth": path_info["depth"],
+                "all_headers": path_info["all_headers"],
+                "type": "page",
+                "pdf_attachments": pdf_attachments,
+            }
+            all_entries.append(entry)
+            path_str = " > ".join(path_info["parent_path"]) if path_info["parent_path"] else "[root]"
+            print(f"      → {path_str} > {path_info['title']}")
+
+        if not all_entries:
+            print("\n❌ No markdown files found. Check your paths.")
+            return
+
+        # Deduplicate and sort
+        print("\n[Process] Deduplicating entries...")
+        all_entries = self.processor.deduplicate(all_entries)
+        all_entries = self.processor.sort_entries(all_entries)
+        print(f"  {len(all_entries)} unique entries")
+
+        # Build tree
+        print("\n[Render] Building tree structures...")
+        tree = self.renderer.build_tree_dict(all_entries)
+
+        # Create output directory
+        output_dir = Path(self.config["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # ASCII tree
+        ascii_tree = self.renderer.render_ascii(tree)
+        ascii_path = output_dir / "toc_tree.txt"
+        with open(ascii_path, 'w', encoding='utf-8') as f:
+            f.write(ascii_tree)
+        print(f"  ✓ {ascii_path}")
+
+        # JSON tree
+        json_tree = self.renderer.render_json(tree)
+        json_path = output_dir / "toc_tree.json"
+        with open(json_path, 'w', encoding='utf-8') as f:
+            f.write(json_tree)
+        print(f"  ✓ {json_path}")
+
+        # Markdown
+        md_tree = self.renderer.render_markdown(all_entries)
+        md_path = output_dir / "toc_tree.md"
+        with open(md_path, 'w', encoding='utf-8') as f:
+            f.write(md_tree)
+        print(f"  ✓ {md_path}")
+
+        # Index JSON
+        index_path = Path(self.config["toc_index_file"])
+        with open(index_path, 'w', encoding='utf-8') as f:
+            json.dump(all_entries, f, indent=2, ensure_ascii=False)
+        print(f"  ✓ {index_path}")
+
+        # Summary
+        print("\n" + "=" * 70)
+        print("PIPELINE COMPLETE")
+        print("=" * 70)
+        print(f"  OneNote files:  {onenote_count}")
+        print(f"  Website files:  {website_count}")
+        print(f"  Total entries:  {len(all_entries)}")
+        print(f"  Output dir:     {self.config['output_dir']}")
+        print("\n  Preview of ASCII tree:")
+        print("-" * 70)
+        print(ascii_tree[:2000])
+        if len(ascii_tree) > 2000:
+            print("...")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    pipeline = TOCPipeline(CONFIG)
+    pipeline.run()
+##########
+import json
 import time
 from pathlib import Path
 
