@@ -1,5 +1,476 @@
 #!/usr/bin/env python3
 """
+toc_builder_pymupdf4llm.py — Build TOC from PDFs using pymupdf4llm conversion.
+
+Steps:
+1. Find all PDFs in OneNote_data/ and ecmc_org/
+2. Convert each PDF to markdown using pymupdf4llm.to_markdown()
+3. Extract headers (#, ##, ###) from converted markdown
+4. Build unified TOC tree with ALL header levels as nodes
+
+Requirements:
+    pip install pymupdf4llm
+
+Folder Structure Expected:
+    D:\users\ntrinadh\Downloads\docling\OneNote_data\     ← OneNote PDFs
+    D:\users\ntrinadh\Downloads\docling\ecmc_org\          ← Website PDFs
+    D:\users\ntrinadh\Downloads\docling\toc_output\        ← Output directory
+    D:\users\ntrinadh\Downloads\docling\converted_md\      ← Temp markdown output
+
+Usage:
+    python toc_builder_pymupdf4llm.py
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+from collections import OrderedDict
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CONFIG = {
+    # Input folders containing ORIGINAL PDFs
+    "onenote_dir": r"D:\users\ntrinadh\Downloads\docling\OneNote_data",
+    "website_dir": r"D:\users\ntrinadh\Downloads\docling\ecmc_org",
+
+    # Output directories
+    "output_dir": r"D:\users\ntrinadh\Downloads\docling\toc_output",
+    "converted_dir": r"D:\users\ntrinadh\Downloads\docling\converted_md",
+    "toc_index_file": r"D:\users\ntrinadh\Downloads\docling\toc_output\toc_index.json",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: PDF Scanner
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PDFScanner:
+    """Scan folders for PDF files."""
+
+    def __init__(self, onenote_dir, website_dir):
+        self.onenote_dir = Path(onenote_dir)
+        self.website_dir = Path(website_dir)
+
+    def scan_onenote(self):
+        if not self.onenote_dir.exists():
+            print(f"⚠️  OneNote directory not found: {self.onenote_dir}")
+            return
+        files = sorted(self.onenote_dir.rglob("*.pdf"))
+        print(f"  Found {len(files)} PDF files in OneNote_data/")
+        for f in files:
+            yield f, "OneNote"
+
+    def scan_website(self):
+        if not self.website_dir.exists():
+            print(f"⚠️  Website directory not found: {self.website_dir}")
+            return
+        files = sorted(self.website_dir.rglob("*.pdf"))
+        print(f"  Found {len(files)} PDF files in ecmc_org/")
+        for f in files:
+            yield f, "Website"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: pymupdf4llm Converter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PyMuPDF4LLMConverter:
+    """Convert PDFs to markdown using pymupdf4llm."""
+
+    def __init__(self, output_dir):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import pymupdf4llm
+            self.pymupdf4llm = pymupdf4llm
+            self.available = True
+        except ImportError:
+            print("❌ pymupdf4llm not installed. Run: pip install pymupdf4llm")
+            self.available = False
+
+    def convert(self, pdf_path, source):
+        """Convert a single PDF to markdown using pymupdf4llm."""
+        if not self.available:
+            return None
+
+        try:
+            md_filename = pdf_path.stem + ".md"
+            md_path = self.output_dir / source / md_filename
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+
+            print(f"      📄 Converting: {pdf_path.name}")
+
+            # Convert using pymupdf4llm
+            markdown_text = self.pymupdf4llm.to_markdown(str(pdf_path))
+
+            # Save converted markdown
+            md_path.write_bytes(markdown_text.encode("utf-8"))
+
+            print(f"      ✅ Saved: {md_path}")
+            return md_path
+
+        except Exception as e:
+            print(f"      ❌ Conversion failed: {e}")
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: Header Extractor
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HeaderExtractor:
+    """Extract markdown headers from converted markdown files."""
+
+    HEADER_PATTERN = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
+
+    def extract(self, md_file_path):
+        """Extract all headers from a markdown file."""
+        headers = []
+        try:
+            with open(md_file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.rstrip('\n')
+                    match = self.HEADER_PATTERN.match(line)
+                    if match:
+                        hashes = match.group(1)
+                        text = match.group(2).strip()
+                        level = len(hashes)
+                        headers.append({"level": level, "text": text})
+        except Exception as e:
+            print(f"    ⚠️  Error reading {md_file_path}: {e}")
+        return headers
+
+    def build_header_tree(self, headers):
+        """Build hierarchical header structure from flat list."""
+        if not headers:
+            return []
+
+        tree = []
+        stack = []
+
+        for h in headers:
+            level = h["level"]
+            node = {
+                "level": level,
+                "text": h["text"],
+                "children": [],
+                "is_leaf": True,
+            }
+
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+
+            if stack:
+                parent = stack[-1][1]
+                parent["children"].append(node)
+                parent["is_leaf"] = False
+            else:
+                tree.append(node)
+
+            stack.append((level, node))
+
+        return tree
+
+    def flatten_to_path(self, header_tree):
+        """Convert header tree to flat path representation."""
+        result = []
+
+        def traverse(node, path_so_far):
+            current_path = path_so_far + [{
+                "level": node["level"],
+                "text": node["text"],
+                "is_leaf": node["is_leaf"] and not node["children"],
+            }]
+
+            if not node["children"]:
+                result.append(current_path)
+            else:
+                for child in node["children"]:
+                    traverse(child, current_path)
+
+        for root in header_tree:
+            traverse(root, [])
+
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: Tree Builder
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TreeBuilder:
+    """Build nested tree dictionary from header paths."""
+
+    def build(self, entries):
+        tree = {"ROOT": {}}
+
+        for entry in entries:
+            source = entry["source"]
+            headers = entry.get("headers", [])
+            pdf_path = entry.get("pdf_path", "")
+
+            if not headers:
+                continue
+
+            branch = "OneNote" if source == "OneNote" else "Website (ecmc.org)"
+            if branch not in tree["ROOT"]:
+                tree["ROOT"][branch] = {}
+
+            current = tree["ROOT"][branch]
+
+            for i, header in enumerate(headers):
+                text = header["text"]
+                is_leaf = header.get("is_leaf", (i == len(headers) - 1))
+
+                if is_leaf:
+                    if text not in current:
+                        current[text] = {"_pdf_path": pdf_path, "_type": "page"}
+                else:
+                    if text not in current:
+                        current[text] = {}
+                    current = current[text]
+
+        return tree
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: Tree Renderer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TreeRenderer:
+    """Render tree as ASCII, JSON, and Markdown."""
+
+    def render_ascii(self, tree):
+        lines = ["ROOT"]
+        root_children = tree.get("ROOT", {})
+
+        items = list(root_children.items())
+        for i, (key, value) in enumerate(items):
+            is_last = (i == len(items) - 1)
+            connector = "└─ " if is_last else "├─ "
+            lines.append(connector + key)
+            child_prefix = "   " if is_last else "│  "
+            self._render_ascii_node(lines, value, child_prefix)
+
+        return "\n".join(lines)
+
+    def _render_ascii_node(self, lines, node, prefix):
+        children = []
+        for k, v in node.items():
+            if k.startswith("_"):
+                continue
+            is_branch = isinstance(v, dict) and any(not sk.startswith("_") for sk in v.keys())
+            children.append((k, v, is_branch))
+
+        for i, (key, value, is_branch) in enumerate(children):
+            is_last = (i == len(children) - 1)
+            connector = "└─ " if is_last else "├─ "
+            lines.append(prefix + connector + key)
+
+            if is_branch:
+                new_prefix = prefix + ("   " if is_last else "│  ")
+                self._render_ascii_node(lines, value, new_prefix)
+
+    def render_json(self, tree):
+        return json.dumps(tree, indent=2, ensure_ascii=False)
+
+    def render_markdown(self, entries):
+        lines = [
+            "# Table of Contents — ECMC Knowledge Base",
+            "",
+            "Generated from PDFs via pymupdf4llm conversion.",
+            "",
+        ]
+
+        by_source = {}
+        for entry in entries:
+            source = entry["source"]
+            if source not in by_source:
+                by_source[source] = []
+            by_source[source].append(entry)
+
+        for source, source_entries in by_source.items():
+            branch_name = "OneNote" if source == "OneNote" else "Website (ecmc.org)"
+            lines.append(f"## {branch_name}")
+            lines.append("")
+
+            for entry in source_entries:
+                headers = entry.get("headers", [])
+                if not headers:
+                    continue
+
+                for i, header in enumerate(headers):
+                    depth = i + 2
+                    hashes = "#" * min(depth, 6)
+                    text = header["text"]
+                    if header.get("is_leaf", False):
+                        lines.append(f"{hashes} {text} (leaf)")
+                    else:
+                        lines.append(f"{hashes} {text}")
+
+                lines.append(f"- **PDF:** `{entry.get('pdf_path', '')}`")
+                lines.append("")
+
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: Main Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TOCPipeline:
+    """Main pipeline: PDF → pymupdf4llm → headers → TOC tree."""
+
+    def __init__(self, config):
+        self.config = config
+        self.scanner = PDFScanner(config["onenote_dir"], config["website_dir"])
+        self.converter = PyMuPDF4LLMConverter(config["converted_dir"])
+        self.extractor = HeaderExtractor()
+        self.tree_builder = TreeBuilder()
+        self.renderer = TreeRenderer()
+
+    def run(self):
+        print("=" * 70)
+        print("ECMC TOC BUILDER — PyMuPDF4LLM PDF to TOC")
+        print("=" * 70)
+
+        if not self.converter.available:
+            print("\n❌ pymupdf4llm not installed. Run: pip install pymupdf4llm")
+            return
+
+        all_entries = []
+
+        # Process OneNote PDFs
+        print("\n[OneNote] Converting PDFs to markdown...")
+        for pdf_path, source in self.scanner.scan_onenote():
+            print(f"\n  📄 {pdf_path.name}")
+
+            md_path = self.converter.convert(pdf_path, source)
+            if not md_path:
+                print(f"      ⚠️  Skipping (conversion failed)")
+                continue
+
+            headers = self.extractor.extract(md_path)
+            print(f"      Found {len(headers)} headers")
+
+            if not headers:
+                print(f"      ⚠️  No headers found — using filename as title")
+                headers = [{"level": 1, "text": pdf_path.stem.replace("_", " ").title(), "is_leaf": True}]
+
+            header_tree = self.extractor.build_header_tree(headers)
+            paths = self.extractor.flatten_to_path(header_tree)
+
+            if paths:
+                best_path = max(paths, key=len)
+                entry = {
+                    "source": source,
+                    "pdf_path": str(pdf_path),
+                    "md_path": str(md_path),
+                    "headers": best_path,
+                }
+                all_entries.append(entry)
+                path_str = " > ".join(h["text"] for h in best_path)
+                print(f"      → Path: {path_str}")
+
+        # Process Website PDFs
+        print("\n[Website] Converting PDFs to markdown...")
+        for pdf_path, source in self.scanner.scan_website():
+            print(f"\n  📄 {pdf_path.name}")
+
+            md_path = self.converter.convert(pdf_path, source)
+            if not md_path:
+                print(f"      ⚠️  Skipping (conversion failed)")
+                continue
+
+            headers = self.extractor.extract(md_path)
+            print(f"      Found {len(headers)} headers")
+
+            if not headers:
+                print(f"      ⚠️  No headers found — using filename as title")
+                headers = [{"level": 1, "text": pdf_path.stem.replace("_", " ").title(), "is_leaf": True}]
+
+            header_tree = self.extractor.build_header_tree(headers)
+            paths = self.extractor.flatten_to_path(header_tree)
+
+            if paths:
+                best_path = max(paths, key=len)
+                entry = {
+                    "source": source,
+                    "pdf_path": str(pdf_path),
+                    "md_path": str(md_path),
+                    "headers": best_path,
+                }
+                all_entries.append(entry)
+                path_str = " > ".join(h["text"] for h in best_path)
+                print(f"      → Path: {path_str}")
+
+        if not all_entries:
+            print("\n❌ No entries to process.")
+            return
+
+        # Build tree
+        print(f"\n[Build] Building TOC tree from {len(all_entries)} entries...")
+        tree = self.tree_builder.build(all_entries)
+
+        # Create output directory
+        output_dir = Path(self.config["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save ASCII tree
+        ascii_tree = self.renderer.render_ascii(tree)
+        ascii_path = output_dir / "toc_tree.txt"
+        with open(ascii_path, 'w', encoding='utf-8') as f:
+            f.write(ascii_tree)
+        print(f"  ✓ {ascii_path}")
+
+        # Save JSON tree
+        json_tree = self.renderer.render_json(tree)
+        json_path = output_dir / "toc_tree.json"
+        with open(json_path, 'w', encoding='utf-8') as f:
+            f.write(json_tree)
+        print(f"  ✓ {json_path}")
+
+        # Save Markdown
+        md_tree = self.renderer.render_markdown(all_entries)
+        md_path = output_dir / "toc_tree.md"
+        with open(md_path, 'w', encoding='utf-8') as f:
+            f.write(md_tree)
+        print(f"  ✓ {md_path}")
+
+        # Save index
+        index_path = Path(self.config["toc_index_file"])
+        with open(index_path, 'w', encoding='utf-8') as f:
+            json.dump(all_entries, f, indent=2, ensure_ascii=False)
+        print(f"  ✓ {index_path}")
+
+        # Summary
+        print("\n" + "=" * 70)
+        print("PIPELINE COMPLETE")
+        print("=" * 70)
+        print(f"  Total PDFs processed: {len(all_entries)}")
+        print(f"  Output directory:     {self.config['output_dir']}")
+        print("\n  Preview of ASCII tree:")
+        print("-" * 70)
+        print(ascii_tree[:2000])
+        if len(ascii_tree) > 2000:
+            print("...")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    pipeline = TOCPipeline(CONFIG)
+    pipeline.run()
+##########
+#!/usr/bin/env python3
+"""
 toc_builder_nova.py — Build unified Table of Contents from local markdown files using Amazon Nova.
 
 Renders ALL headers as tree nodes (H1, H2, H3, H4 all visible).
