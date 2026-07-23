@@ -1,43 +1,42 @@
 """
-Embeddings Pipeline — Vector RAG Step 3 (Fixed for Titan v2)
-=============================================================
-Generates embeddings for chunks using Amazon Titan Embed Text v2.
-
-Titan v2 API specifics:
-    - Model ID: Use cross-region inference or full ARN
-    - Input: Single string "inputText" (not batch array)
-    - Output: Single embedding vector per call
-    - No batching — process one at a time or use async
+Vector DB Pipeline — Vector RAG Step 4
+========================================
+Loads chunk embeddings into FAISS Flat (exact) index for similarity search.
 
 Input:
-    - chunk_objects.json (auto-discovered)
+    - chunk_embeddings.json (from Pipeline 3)
 
 Output:
-    - chunk_embeddings.json
+    - faiss_index.bin: FAISS index file
+    - chunk_metadata.json: Metadata mapped to index positions
+
+Design:
+    - FAISS Flat (exact) — no approximation, exact nearest neighbor
+    - L2 distance metric (can switch to Inner Product for normalized vectors)
+    - Metadata stored separately, mapped by FAISS index position
 """
 
 import json
 import logging
 import os
 import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
+import numpy as np
 
 # ============================================================================
 # Configuration
 # ============================================================================
 REGION = os.getenv("AWS_REGION", "us-east-1")
 INPUT_BUCKET = os.getenv("INPUT_BUCKET", "ecmc-dev-bucket")
-CHUNKS_PREFIX = os.getenv("CHUNKS_PREFIX", "")
+EMBEDDINGS_PREFIX = os.getenv("EMBEDDINGS_PREFIX", "")
 OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "ecmc-dev-bucket")
-OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "vector_rag/embeddings/")
-EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))  # Parallel threads for embedding
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "vector_rag/vector_db/")
+INDEX_TYPE = os.getenv("INDEX_TYPE", "Flat")  # "Flat" or "IVF"
+METRIC_TYPE = os.getenv("METRIC_TYPE", "L2")  # "L2" or "IP" (Inner Product)
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +44,6 @@ log = logging.getLogger(__name__)
 # AWS Clients
 # ============================================================================
 _s3_client = None
-_bedrock_client = None
 
 
 def get_s3_client() -> boto3.client:
@@ -55,32 +53,24 @@ def get_s3_client() -> boto3.client:
     return _s3_client
 
 
-def get_bedrock_client() -> boto3.client:
-    global _bedrock_client
-    if _bedrock_client is None:
-        _bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
-    return _bedrock_client
-
-
 # ============================================================================
-# S3 Helpers — Auto-Discovery
+# S3 Helpers
 # ============================================================================
-def find_chunk_files(bucket: str, prefix: str = "") -> List[str]:
+def find_embedding_files(bucket: str, prefix: str = "") -> List[str]:
     s3 = get_s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     matching_keys = []
     search_prefix = prefix if prefix else ""
 
-    log.info("Searching for chunk files under s3://%s/%s", bucket, search_prefix)
+    log.info("Searching for embedding files under s3://%s/%s", bucket, search_prefix)
 
     for page in paginator.paginate(Bucket=bucket, Prefix=search_prefix):
         for obj in page.get("Contents", []):
             k = obj["Key"]
             filename = Path(k).name.lower()
-            if k.endswith(".json") and ("chunk" in filename or "object" in filename):
-                if "embedding" not in filename and "vector" not in filename:
-                    matching_keys.append(k)
-                    log.info("  Found: %s", k)
+            if k.endswith(".json") and "embedding" in filename:
+                matching_keys.append(k)
+                log.info("  Found: %s", k)
 
     matching_keys.sort(reverse=True)
     return matching_keys
@@ -98,199 +88,205 @@ def save_s3_json(bucket: str, key: str, data: Dict[str, Any]) -> str:
     return f"s3://{bucket}/{key}"
 
 
-# ============================================================================
-# Embedding — Titan v2 (Single Text per Call)
-# ============================================================================
-def embed_single_text(text: str, model_id: str = EMBED_MODEL_ID) -> List[float]:
-    """
-    Embed a single text using Titan Embed Text v2.
-    Titan v2 expects: {"inputText": "single string"}
-    Returns: embedding vector (1024 dimensions)
-    """
-    client = get_bedrock_client()
+def save_s3_bytes(bucket: str, key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
+    s3 = get_s3_client()
+    s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
+    return f"s3://{bucket}/{key}"
 
-    # Titan v2 body format — single string only
-    body = {
-        "inputText": text,  # Must be a single string, not array
-        "dimensions": 1024,
-        "normalize": True
-    }
 
+# ============================================================================
+# FAISS Index Builder
+# ============================================================================
+def build_faiss_index(vectors: np.ndarray, index_type: str = "Flat", metric_type: str = "L2") -> Any:
+    """
+    Build FAISS index from embedding vectors.
+
+    Args:
+        vectors: numpy array of shape (n, d) — n vectors of d dimensions
+        index_type: "Flat" for exact, "IVF" for approximate
+        metric_type: "L2" for Euclidean, "IP" for Inner Product
+
+    Returns:
+        FAISS index object
+    """
     try:
-        resp = client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(body),
-            contentType="application/json",
-            accept="application/json"
-        )
-        result = json.loads(resp["body"].read())
+        import faiss
+    except ImportError:
+        log.error("FAISS not installed. Run: pip install faiss-cpu")
+        raise
 
-        # Titan v2 response format
-        embedding = result.get("embedding", [])
+    n, d = vectors.shape
+    log.info("Building FAISS index: %d vectors, %d dimensions", n, d)
 
-        if not embedding:
-            log.warning("Empty embedding returned for text: %s...", text[:50])
-            return []
-
-        return embedding
-
-    except Exception as exc:
-        log.error("Embedding failed: %s", exc)
-        log.error("Text preview: %s...", text[:100])
-        return []
-
-
-def embed_chunk(chunk: Dict[str, Any], model_id: str = EMBED_MODEL_ID) -> Dict[str, Any]:
-    """
-    Embed a single chunk and return enriched chunk with embedding.
-    """
-    content = chunk.get("content", "")
-    chunk_type = chunk.get("chunk_type", "text")
-    metadata = chunk.get("metadata", {})
-
-    # Build rich embedding text
-    parts = []
-    if chunk_type == "table":
-        parts.append(f"Table: {metadata.get('parent_heading', '')}")
-        parts.append(content)
-    elif chunk_type == "figure":
-        parts.append(f"Figure: {content}")
-    elif chunk_type == "form":
-        parts.append(f"Form: {metadata.get('parent_heading', '')}")
-        parts.append(content)
+    # Select metric
+    if metric_type == "IP":
+        metric = faiss.METRIC_INNER_PRODUCT
     else:
-        parts.append(content)
+        metric = faiss.METRIC_L2
 
-    embedding_text = " ".join(parts)
+    # Build index
+    if index_type == "Flat":
+        # Exact search — simple and accurate
+        if metric_type == "IP":
+            index = faiss.IndexFlatIP(d)
+        else:
+            index = faiss.IndexFlatL2(d)
+        log.info("Using IndexFlat%s (exact search)", metric_type)
 
-    # Call embedding
-    embedding = embed_single_text(embedding_text, model_id)
+    elif index_type == "IVF":
+        # Approximate search — faster for large datasets
+        nlist = min(100, n // 10)  # Number of clusters
+        quantizer = faiss.IndexFlatL2(d)
+        if metric_type == "IP":
+            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+        else:
+            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+        log.info("Using IndexIVFFlat with %d clusters", nlist)
 
-    return {
-        "chunk_id": chunk["chunk_id"],
-        "chunk_type": chunk_type,
-        "content": content,
-        "metadata": metadata,
-        "token_count": chunk.get("token_count", 0),
-        "embedding": embedding,
-        "embedding_model": model_id,
-        "embedding_dimensions": len(embedding) if embedding else 0
-    }
+    else:
+        raise ValueError(f"Unknown index type: {index_type}")
+
+    # Add vectors
+    log.info("Adding vectors to index...")
+    if index_type == "IVF":
+        index.train(vectors)
+    index.add(vectors)
+
+    log.info("Index built: %d vectors stored", index.ntotal)
+    return index
+
+
+def save_faiss_index(index: Any, filepath: str):
+    """Save FAISS index to disk."""
+    import faiss
+    faiss.write_index(index, filepath)
+    log.info("FAISS index saved to: %s", filepath)
+
+
+def load_faiss_index(filepath: str) -> Any:
+    """Load FAISS index from disk."""
+    import faiss
+    return faiss.read_index(filepath)
 
 
 # ============================================================================
 # Main Orchestrator
 # ============================================================================
-def process_embeddings() -> Dict[str, Any]:
+def process_vector_db() -> Dict[str, Any]:
     log.info("=" * 60)
-    log.info("Embeddings Pipeline (Titan v2 — Single Text)")
-    log.info("Model: %s", EMBED_MODEL_ID)
-    log.info("Max workers: %d", MAX_WORKERS)
+    log.info("Vector DB Pipeline (FAISS)")
+    log.info("Index type: %s | Metric: %s", INDEX_TYPE, METRIC_TYPE)
     log.info("=" * 60)
 
-    # Auto-discover chunk files
-    chunk_keys = find_chunk_files(INPUT_BUCKET, CHUNKS_PREFIX)
+    # Auto-discover embedding files
+    embed_keys = find_embedding_files(INPUT_BUCKET, EMBEDDINGS_PREFIX)
 
-    if not chunk_keys:
-        log.error("No chunk files found anywhere in s3://%s/", INPUT_BUCKET)
-        return {"status": "ERROR", "error": "No chunk files found"}
+    if not embed_keys:
+        log.error("No embedding files found in s3://%s/", INPUT_BUCKET)
+        return {"status": "ERROR", "error": "No embedding files found"}
 
-    log.info("Found %d potential chunk files", len(chunk_keys))
+    log.info("Found %d embedding files", len(embed_keys))
 
-    # Try loading each until we find one with valid chunks
-    chunk_data = None
-    loaded_key = None
+    # Load latest embedding file
+    latest_key = embed_keys[0]
+    log.info("Loading: s3://%s/%s", INPUT_BUCKET, latest_key)
 
-    for key in chunk_keys:
-        try:
-            log.info("Attempting to load: s3://%s/%s", INPUT_BUCKET, key)
-            data = load_s3_json(INPUT_BUCKET, key)
+    embed_data = load_s3_json(INPUT_BUCKET, latest_key)
+    chunks = embed_data.get("chunks", [])
 
-            if "chunks" in data and isinstance(data["chunks"], list) and len(data["chunks"]) > 0:
-                chunk_data = data
-                loaded_key = key
-                log.info("✓ Successfully loaded: %s (%d chunks)", key, len(data["chunks"]))
-                break
-            else:
-                log.warning("  File has no valid chunks: %s", key)
-        except Exception as exc:
-            log.warning("  Failed to load %s: %s", key, exc)
+    log.info("Total chunks with embeddings: %d", len(chunks))
+
+    if not chunks:
+        log.error("No chunks in embedding file!")
+        return {"status": "ERROR", "error": "No chunks"}
+
+    # Extract vectors and metadata
+    vectors = []
+    metadata = []
+    skipped = 0
+
+    for i, chunk in enumerate(chunks):
+        embedding = chunk.get("embedding", [])
+
+        if not embedding or len(embedding) == 0:
+            skipped += 1
             continue
 
-    if not chunk_data:
-        log.error("Could not load any valid chunk file!")
-        return {"status": "ERROR", "error": "No valid chunk files could be loaded"}
+        vectors.append(embedding)
+        metadata.append({
+            "index": i,
+            "chunk_id": chunk["chunk_id"],
+            "chunk_type": chunk["chunk_type"],
+            "content": chunk["content"],
+            "metadata": chunk.get("metadata", {}),
+            "token_count": chunk.get("token_count", 0),
+            "embedding_model": chunk.get("embedding_model", ""),
+            "embedding_dimensions": len(embedding)
+        })
 
-    chunks = chunk_data["chunks"]
-    total = len(chunks)
-    log.info("Total chunks to embed: %d", total)
+    log.info("Valid vectors: %d | Skipped (empty): %d", len(vectors), skipped)
 
-    # Process chunks in parallel using ThreadPoolExecutor
-    embedded_chunks = []
-    completed = 0
-    failed = 0
+    if not vectors:
+        log.error("No valid embedding vectors!")
+        return {"status": "ERROR", "error": "No valid vectors"}
 
-    log.info("Starting parallel embedding with %d workers...", MAX_WORKERS)
-    start_time = time.time()
+    # Convert to numpy array
+    vectors_np = np.array(vectors, dtype=np.float32)
+    n, d = vectors_np.shape
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all tasks
-        future_to_chunk = {
-            executor.submit(embed_chunk, chunk): chunk 
-            for chunk in chunks
-        }
+    log.info("Vector array shape: %s", vectors_np.shape)
 
-        # Collect results as they complete
-        for future in as_completed(future_to_chunk):
-            try:
-                result = future.result()
-                embedded_chunks.append(result)
-                completed += 1
+    # Normalize vectors if using Inner Product (for cosine similarity)
+    if METRIC_TYPE == "IP":
+        log.info("Normalizing vectors for Inner Product metric...")
+        faiss.normalize_L2(vectors_np)
 
-                if completed % 100 == 0:
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    log.info("  Progress: %d/%d chunks (%.1f chunks/sec)", 
-                             completed, total, rate)
+    # Build FAISS index
+    index = build_faiss_index(vectors_np, INDEX_TYPE, METRIC_TYPE)
 
-            except Exception as exc:
-                failed += 1
-                log.error("Chunk embedding failed: %s", exc)
+    # Save index locally first
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    local_index_path = f"/tmp/faiss_index_{timestamp}.bin"
+    save_faiss_index(index, local_index_path)
 
-    total_time = time.time() - start_time
-    log.info("Embedding complete: %d succeeded, %d failed in %.1f seconds", 
-             completed, failed, total_time)
+    # Read file and upload to S3
+    with open(local_index_path, "rb") as f:
+        index_bytes = f.read()
 
-    # Build output
-    output_data = {
-        "pipeline": "embeddings",
+    index_key = f"{OUTPUT_PREFIX.rstrip('/')}/faiss_index_{timestamp}.bin"
+    index_uri = save_s3_bytes(OUTPUT_BUCKET, index_key, index_bytes, "application/octet-stream")
+
+    # Save metadata
+    metadata_data = {
+        "pipeline": "vector_db",
         "processed_at": datetime.now(timezone.utc).isoformat(),
-        "source_chunk_file": loaded_key,
-        "embedding_model": EMBED_MODEL_ID,
-        "total_chunks": len(embedded_chunks),
-        "dimensions": 1024,
-        "chunks": embedded_chunks
+        "source_embedding_file": latest_key,
+        "index_type": INDEX_TYPE,
+        "metric_type": METRIC_TYPE,
+        "total_vectors": n,
+        "dimensions": d,
+        "skipped_chunks": skipped,
+        "metadata": metadata
     }
 
-    # Save to S3
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_key = f"{OUTPUT_PREFIX.rstrip('/')}/chunk_embeddings_{timestamp}.json"
-    output_uri = save_s3_json(OUTPUT_BUCKET, output_key, output_data)
+    meta_key = f"{OUTPUT_PREFIX.rstrip('/')}/chunk_metadata_{timestamp}.json"
+    meta_uri = save_s3_json(OUTPUT_BUCKET, meta_key, metadata_data)
 
     log.info("=" * 60)
-    log.info("COMPLETE: %d chunks embedded", len(embedded_chunks))
-    log.info("Source: s3://%s/%s", INPUT_BUCKET, loaded_key)
-    log.info("Output: %s", output_uri)
-    log.info("Avg rate: %.1f chunks/sec", total / total_time if total_time > 0 else 0)
+    log.info("COMPLETE")
+    log.info("Vectors: %d | Dimensions: %d | Skipped: %d", n, d, skipped)
+    log.info("Index: %s", index_uri)
+    log.info("Metadata: %s", meta_uri)
     log.info("=" * 60)
 
     return {
         "status": "SUCCEEDED",
-        "output_uri": output_uri,
-        "source_file": loaded_key,
-        "total_chunks": len(embedded_chunks),
-        "embedding_model": EMBED_MODEL_ID,
-        "dimensions": 1024
+        "index_uri": index_uri,
+        "metadata_uri": meta_uri,
+        "total_vectors": n,
+        "dimensions": d,
+        "index_type": INDEX_TYPE,
+        "metric_type": METRIC_TYPE
     }
 
 
@@ -298,21 +294,21 @@ def process_embeddings() -> Dict[str, Any]:
 # Lambda Handler
 # ============================================================================
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    global REGION, INPUT_BUCKET, CHUNKS_PREFIX, OUTPUT_BUCKET, OUTPUT_PREFIX, EMBED_MODEL_ID, MAX_WORKERS
-    global _s3_client, _bedrock_client
+    global REGION, INPUT_BUCKET, EMBEDDINGS_PREFIX, OUTPUT_BUCKET, OUTPUT_PREFIX
+    global INDEX_TYPE, METRIC_TYPE
+    global _s3_client
 
     REGION = event.get("aws_region", REGION)
     INPUT_BUCKET = event.get("input_bucket", INPUT_BUCKET)
-    CHUNKS_PREFIX = event.get("chunks_prefix", CHUNKS_PREFIX)
+    EMBEDDINGS_PREFIX = event.get("embeddings_prefix", EMBEDDINGS_PREFIX)
     OUTPUT_BUCKET = event.get("output_bucket", OUTPUT_BUCKET)
     OUTPUT_PREFIX = event.get("output_prefix", OUTPUT_PREFIX)
-    EMBED_MODEL_ID = event.get("embed_model_id", EMBED_MODEL_ID)
-    MAX_WORKERS = int(event.get("max_workers", MAX_WORKERS))
+    INDEX_TYPE = event.get("index_type", INDEX_TYPE)
+    METRIC_TYPE = event.get("metric_type", METRIC_TYPE)
 
     _s3_client = None
-    _bedrock_client = None
 
-    return process_embeddings()
+    return process_vector_db()
 
 
 if __name__ == "__main__":
@@ -322,7 +318,7 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)]
     )
-    result = process_embeddings()
+    result = process_vector_db()
     print(json.dumps(result, indent=2, default=str))
 ############
 """
