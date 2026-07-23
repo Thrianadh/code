@@ -1,3 +1,69 @@
+import json
+import time
+from pathlib import Path
+
+import pandas as pd
+
+# Import run_query from retrieval pipeline
+from retrieval_pipeline import run_query
+
+# ============================================================================
+# Configuration — edit these paths
+# ============================================================================
+OUTPUT_XLSX = Path("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/Untitled Folder/vector_rag/demo/vector_query_results.xlsx")
+
+# ============================================================================
+# Test Questions
+# ============================================================================
+queries = [
+    "what are my options and timelines to restore federal student aid eligibility? (title IV)",
+    "what is loan consolidation and how does it work? (title IV touches on this)",
+    "How do i start a rehabilitation process? (title IV / payment)",
+    "will bankruptcy completion change my situation (title IV)",
+    "What is a T4 letter?",
+    "How do I make payments during Chapter 13 bankruptcy?",
+    "Explain automatic stay and how it affects student loans",
+    "What documents do I need to regain Title IV eligibility after default?",
+    "Can my employer make voluntary payments on my behalf?",
+]
+
+# ============================================================================
+# Run Queries
+# ============================================================================
+rows = []
+
+for q in queries:
+    print(f"\nQuery: {q}")
+
+    start = time.time()
+    result = run_query(q)
+    elapsed_ms = (time.time() - start) * 1000
+
+    answer = result.get("answer", "")
+    confidence = result.get("confidence", "none")
+    sources_used = result.get("sources_used", 0)
+
+    print(f"  Answer: {answer[:120]}...")
+    print(f"  Confidence: {confidence} | Sources: {sources_used} | Latency: {elapsed_ms:.1f} ms")
+
+    rows.append({
+        "query": q,
+        "vector_rag_answer": answer,
+        "vector_rag_ms": round(elapsed_ms, 2),
+        "confidence": confidence,
+        "sources_used": sources_used,
+    })
+
+# ============================================================================
+# Save to Excel
+# ============================================================================
+df = pd.DataFrame(rows)
+
+# Ensure output directory exists
+OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
+df.to_excel(OUTPUT_XLSX, index=False)
+
+#################
 """
 Retrieval + Generation Pipeline — Vector RAG Step 5
 =====================================================
