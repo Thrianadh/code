@@ -1,3 +1,33 @@
+from json_repair import repair_json
+
+def robust_json_parse(text: str) -> List[Dict[str, Any]]:
+    # Extract JSON array first
+    json_text = extract_json_array(text)
+    if not json_text:
+        return []
+    
+    # Use json_repair to fix common issues
+    fixed = repair_json(json_text)
+    
+    try:
+        parsed = json.loads(fixed)
+        return parsed if isinstance(parsed, list) else []
+    except Exception as e:
+        log.error("Even json_repair failed: %s", e)
+        return []
+
+prompt = (
+    "You are analyzing an ECMC bankruptcy student loan document section. "
+    "Extract all important domain-specific terms.\n\n"
+    "Return ONLY a JSON array. No markdown code blocks. No explanation. "
+    "No text before or after. Just raw JSON starting with [ and ending with ].\n\n"
+    "Example format:\n"
+    '[{"term": "Example Term", "aliases": ["alias1"], "category": "legal"}]\n\n'
+    f"Section title: {section_title}\n"
+    f"Section text:\n{section_text[:3000]}\n\n"
+    "JSON:"
+)
+###########
 queries = [
     "what are my options and timelines to restore federal student aid eligibility? (title IV)",
     "what is loan consolidation and how does it work? (title IV touches on this)",
