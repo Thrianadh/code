@@ -1,3 +1,48 @@
+def bedrock_converse(model_id: str, prompt: str, image_bytes: Optional[bytes] = None, max_tokens: int = 1024) -> str:
+    client = get_bedrock_client()
+    
+    # Build content list
+    content = []
+    
+    # Add text
+    if prompt:
+        content.append({"text": prompt})
+    
+    # Add image - Nova expects image as bytes with proper format
+    if image_bytes:
+        import base64
+        
+        # Encode image to base64
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        
+        # For Nova models, image must be in specific format
+        # The 'bytes' field should contain the raw base64 string
+        content.append({
+            "image": {
+                "format": "png",  # or "jpeg" depending on your image
+                "source": {
+                    "bytes": b64_image
+                }
+            }
+        })
+    
+    try:
+        resp = client.converse(
+            modelId=model_id,
+            messages=[{
+                "role": "user",
+                "content": content
+            }],
+            inferenceConfig={
+                "maxTokens": max_tokens,
+                "temperature": 0.0
+            }
+        )
+        return resp["output"]["message"]["content"][0]["text"]
+    except Exception as exc:
+        log.error("Bedrock error: %s", exc)
+        return ""
+##########
 """
 Chunking Pipeline — Vector RAG Step 2
 ======================================
