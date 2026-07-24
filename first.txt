@@ -1,1336 +1,395 @@
-#!/usr/bin/env python3
 """
-toc_builder_pymupdf4llm.py — Build TOC from PDFs using pymupdf4llm conversion.
+session_memory.py — Sliding window conversation memory for ECMC RAG chatbot.
 
-Steps:
-1. Find all PDFs in OneNote_data/ and ecmc_org/
-2. Convert each PDF to markdown using pymupdf4llm.to_markdown()
-3. Extract headers (#, ##, ###) from converted markdown
-4. Build unified TOC tree with ALL header levels as nodes
-
-Requirements:
-    pip install pymupdf4llm
-
-Folder Structure Expected:
-    D:\users\ntrinadh\Downloads\docling\OneNote_data\     ← OneNote PDFs
-    D:\users\ntrinadh\Downloads\docling\ecmc_org\          ← Website PDFs
-    D:\users\ntrinadh\Downloads\docling\toc_output\        ← Output directory
-    D:\users\ntrinadh\Downloads\docling\converted_md\      ← Temp markdown output
+Simple in-memory dict storage. Lost on process restart.
+For persistence across restarts, replace dict with Redis later.
 
 Usage:
-    python toc_builder_pymupdf4llm.py
+    from session_memory import create_session, get_history, add_exchange, format_history_for_prompt
+
+    session_id = create_session()
+    history = format_history_for_prompt(session_id)
+    add_exchange(session_id, question, answer)
 """
 
-import json
-import os
-import re
-from pathlib import Path
-from collections import OrderedDict
+import uuid
+from collections import deque
+from typing import List, Dict, Optional
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CONFIG = {
-    # Input folders containing ORIGINAL PDFs
-    "onenote_dir": r"D:\users\ntrinadh\Downloads\docling\OneNote_data",
-    "website_dir": r"D:\users\ntrinadh\Downloads\docling\ecmc_org",
-
-    # Output directories
-    "output_dir": r"D:\users\ntrinadh\Downloads\docling\toc_output",
-    "converted_dir": r"D:\users\ntrinadh\Downloads\docling\converted_md",
-    "toc_index_file": r"D:\users\ntrinadh\Downloads\docling\toc_output\toc_index.json",
-}
+MAX_MESSAGES = 10   # 5 Q&A pairs (user + assistant = 2 messages per turn)
+MAX_PAIRS = 5       # Convenience: 5 turns of conversation
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: PDF Scanner
+# GLOBAL SESSION STORE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class PDFScanner:
-    """Scan folders for PDF files."""
-
-    def __init__(self, onenote_dir, website_dir):
-        self.onenote_dir = Path(onenote_dir)
-        self.website_dir = Path(website_dir)
-
-    def scan_onenote(self):
-        if not self.onenote_dir.exists():
-            print(f"⚠️  OneNote directory not found: {self.onenote_dir}")
-            return
-        files = sorted(self.onenote_dir.rglob("*.pdf"))
-        print(f"  Found {len(files)} PDF files in OneNote_data/")
-        for f in files:
-            yield f, "OneNote"
-
-    def scan_website(self):
-        if not self.website_dir.exists():
-            print(f"⚠️  Website directory not found: {self.website_dir}")
-            return
-        files = sorted(self.website_dir.rglob("*.pdf"))
-        print(f"  Found {len(files)} PDF files in ecmc_org/")
-        for f in files:
-            yield f, "Website"
+# session_id -> deque of message dicts
+# Each message: {"role": "user"|"assistant", "content": str}
+_session_store: Dict[str, deque] = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2: pymupdf4llm Converter
+# PUBLIC API
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class PyMuPDF4LLMConverter:
-    """Convert PDFs to markdown using pymupdf4llm."""
-
-    def __init__(self, output_dir):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            import pymupdf4llm
-            self.pymupdf4llm = pymupdf4llm
-            self.available = True
-        except ImportError:
-            print("❌ pymupdf4llm not installed. Run: pip install pymupdf4llm")
-            self.available = False
-
-    def convert(self, pdf_path, source):
-        """Convert a single PDF to markdown using pymupdf4llm."""
-        if not self.available:
-            return None
-
-        try:
-            md_filename = pdf_path.stem + ".md"
-            md_path = self.output_dir / source / md_filename
-            md_path.parent.mkdir(parents=True, exist_ok=True)
-
-            print(f"      📄 Converting: {pdf_path.name}")
-
-            # Convert using pymupdf4llm
-            markdown_text = self.pymupdf4llm.to_markdown(str(pdf_path))
-
-            # Save converted markdown
-            md_path.write_bytes(markdown_text.encode("utf-8"))
-
-            print(f"      ✅ Saved: {md_path}")
-            return md_path
-
-        except Exception as e:
-            print(f"      ❌ Conversion failed: {e}")
-            return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3: Header Extractor
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class HeaderExtractor:
-    """Extract markdown headers from converted markdown files."""
-
-    HEADER_PATTERN = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
-
-    def extract(self, md_file_path):
-        """Extract all headers from a markdown file."""
-        headers = []
-        try:
-            with open(md_file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.rstrip('\n')
-                    match = self.HEADER_PATTERN.match(line)
-                    if match:
-                        hashes = match.group(1)
-                        text = match.group(2).strip()
-                        level = len(hashes)
-                        headers.append({"level": level, "text": text})
-        except Exception as e:
-            print(f"    ⚠️  Error reading {md_file_path}: {e}")
-        return headers
-
-    def build_header_tree(self, headers):
-        """Build hierarchical header structure from flat list."""
-        if not headers:
-            return []
-
-        tree = []
-        stack = []
-
-        for h in headers:
-            level = h["level"]
-            node = {
-                "level": level,
-                "text": h["text"],
-                "children": [],
-                "is_leaf": True,
-            }
-
-            while stack and stack[-1][0] >= level:
-                stack.pop()
-
-            if stack:
-                parent = stack[-1][1]
-                parent["children"].append(node)
-                parent["is_leaf"] = False
-            else:
-                tree.append(node)
-
-            stack.append((level, node))
-
-        return tree
-
-    def flatten_to_path(self, header_tree):
-        """Convert header tree to flat path representation."""
-        result = []
+def create_session() -> str:
+    """
+    Generate a new session ID and initialize empty history.
+
+    Returns:
+        str: 8-character session ID (e.g., "a3f7b2d1")
+    """
+    session_id = str(uuid.uuid4())[:8]
+    _session_store[session_id] = deque(maxlen=MAX_MESSAGES)
+    return session_id
 
-        def traverse(node, path_so_far):
-            current_path = path_so_far + [{
-                "level": node["level"],
-                "text": node["text"],
-                "is_leaf": node["is_leaf"] and not node["children"],
-            }]
-
-            if not node["children"]:
-                result.append(current_path)
-            else:
-                for child in node["children"]:
-                    traverse(child, current_path)
-
-        for root in header_tree:
-            traverse(root, [])
-
-        return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 4: Tree Builder
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TreeBuilder:
-    """Build nested tree dictionary from header paths."""
-
-    def build(self, entries):
-        tree = {"ROOT": {}}
-
-        for entry in entries:
-            source = entry["source"]
-            headers = entry.get("headers", [])
-            pdf_path = entry.get("pdf_path", "")
-
-            if not headers:
-                continue
-
-            branch = "OneNote" if source == "OneNote" else "Website (ecmc.org)"
-            if branch not in tree["ROOT"]:
-                tree["ROOT"][branch] = {}
-
-            current = tree["ROOT"][branch]
-
-            for i, header in enumerate(headers):
-                text = header["text"]
-                is_leaf = header.get("is_leaf", (i == len(headers) - 1))
-
-                if is_leaf:
-                    if text not in current:
-                        current[text] = {"_pdf_path": pdf_path, "_type": "page"}
-                else:
-                    if text not in current:
-                        current[text] = {}
-                    current = current[text]
-
-        return tree
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 5: Tree Renderer
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TreeRenderer:
-    """Render tree as ASCII, JSON, and Markdown."""
-
-    def render_ascii(self, tree):
-        lines = ["ROOT"]
-        root_children = tree.get("ROOT", {})
-
-        items = list(root_children.items())
-        for i, (key, value) in enumerate(items):
-            is_last = (i == len(items) - 1)
-            connector = "└─ " if is_last else "├─ "
-            lines.append(connector + key)
-            child_prefix = "   " if is_last else "│  "
-            self._render_ascii_node(lines, value, child_prefix)
-
-        return "\n".join(lines)
-
-    def _render_ascii_node(self, lines, node, prefix):
-        children = []
-        for k, v in node.items():
-            if k.startswith("_"):
-                continue
-            is_branch = isinstance(v, dict) and any(not sk.startswith("_") for sk in v.keys())
-            children.append((k, v, is_branch))
-
-        for i, (key, value, is_branch) in enumerate(children):
-            is_last = (i == len(children) - 1)
-            connector = "└─ " if is_last else "├─ "
-            lines.append(prefix + connector + key)
-
-            if is_branch:
-                new_prefix = prefix + ("   " if is_last else "│  ")
-                self._render_ascii_node(lines, value, new_prefix)
-
-    def render_json(self, tree):
-        return json.dumps(tree, indent=2, ensure_ascii=False)
-
-    def render_markdown(self, entries):
-        lines = [
-            "# Table of Contents — ECMC Knowledge Base",
-            "",
-            "Generated from PDFs via pymupdf4llm conversion.",
-            "",
-        ]
-
-        by_source = {}
-        for entry in entries:
-            source = entry["source"]
-            if source not in by_source:
-                by_source[source] = []
-            by_source[source].append(entry)
-
-        for source, source_entries in by_source.items():
-            branch_name = "OneNote" if source == "OneNote" else "Website (ecmc.org)"
-            lines.append(f"## {branch_name}")
-            lines.append("")
-
-            for entry in source_entries:
-                headers = entry.get("headers", [])
-                if not headers:
-                    continue
-
-                for i, header in enumerate(headers):
-                    depth = i + 2
-                    hashes = "#" * min(depth, 6)
-                    text = header["text"]
-                    if header.get("is_leaf", False):
-                        lines.append(f"{hashes} {text} (leaf)")
-                    else:
-                        lines.append(f"{hashes} {text}")
-
-                lines.append(f"- **PDF:** `{entry.get('pdf_path', '')}`")
-                lines.append("")
-
-        return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 6: Main Pipeline
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TOCPipeline:
-    """Main pipeline: PDF → pymupdf4llm → headers → TOC tree."""
-
-    def __init__(self, config):
-        self.config = config
-        self.scanner = PDFScanner(config["onenote_dir"], config["website_dir"])
-        self.converter = PyMuPDF4LLMConverter(config["converted_dir"])
-        self.extractor = HeaderExtractor()
-        self.tree_builder = TreeBuilder()
-        self.renderer = TreeRenderer()
-
-    def run(self):
-        print("=" * 70)
-        print("ECMC TOC BUILDER — PyMuPDF4LLM PDF to TOC")
-        print("=" * 70)
-
-        if not self.converter.available:
-            print("\n❌ pymupdf4llm not installed. Run: pip install pymupdf4llm")
-            return
-
-        all_entries = []
-
-        # Process OneNote PDFs
-        print("\n[OneNote] Converting PDFs to markdown...")
-        for pdf_path, source in self.scanner.scan_onenote():
-            print(f"\n  📄 {pdf_path.name}")
-
-            md_path = self.converter.convert(pdf_path, source)
-            if not md_path:
-                print(f"      ⚠️  Skipping (conversion failed)")
-                continue
-
-            headers = self.extractor.extract(md_path)
-            print(f"      Found {len(headers)} headers")
-
-            if not headers:
-                print(f"      ⚠️  No headers found — using filename as title")
-                headers = [{"level": 1, "text": pdf_path.stem.replace("_", " ").title(), "is_leaf": True}]
-
-            header_tree = self.extractor.build_header_tree(headers)
-            paths = self.extractor.flatten_to_path(header_tree)
-
-            if paths:
-                best_path = max(paths, key=len)
-                entry = {
-                    "source": source,
-                    "pdf_path": str(pdf_path),
-                    "md_path": str(md_path),
-                    "headers": best_path,
-                }
-                all_entries.append(entry)
-                path_str = " > ".join(h["text"] for h in best_path)
-                print(f"      → Path: {path_str}")
-
-        # Process Website PDFs
-        print("\n[Website] Converting PDFs to markdown...")
-        for pdf_path, source in self.scanner.scan_website():
-            print(f"\n  📄 {pdf_path.name}")
-
-            md_path = self.converter.convert(pdf_path, source)
-            if not md_path:
-                print(f"      ⚠️  Skipping (conversion failed)")
-                continue
-
-            headers = self.extractor.extract(md_path)
-            print(f"      Found {len(headers)} headers")
-
-            if not headers:
-                print(f"      ⚠️  No headers found — using filename as title")
-                headers = [{"level": 1, "text": pdf_path.stem.replace("_", " ").title(), "is_leaf": True}]
-
-            header_tree = self.extractor.build_header_tree(headers)
-            paths = self.extractor.flatten_to_path(header_tree)
-
-            if paths:
-                best_path = max(paths, key=len)
-                entry = {
-                    "source": source,
-                    "pdf_path": str(pdf_path),
-                    "md_path": str(md_path),
-                    "headers": best_path,
-                }
-                all_entries.append(entry)
-                path_str = " > ".join(h["text"] for h in best_path)
-                print(f"      → Path: {path_str}")
-
-        if not all_entries:
-            print("\n❌ No entries to process.")
-            return
-
-        # Build tree
-        print(f"\n[Build] Building TOC tree from {len(all_entries)} entries...")
-        tree = self.tree_builder.build(all_entries)
-
-        # Create output directory
-        output_dir = Path(self.config["output_dir"])
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save ASCII tree
-        ascii_tree = self.renderer.render_ascii(tree)
-        ascii_path = output_dir / "toc_tree.txt"
-        with open(ascii_path, 'w', encoding='utf-8') as f:
-            f.write(ascii_tree)
-        print(f"  ✓ {ascii_path}")
-
-        # Save JSON tree
-        json_tree = self.renderer.render_json(tree)
-        json_path = output_dir / "toc_tree.json"
-        with open(json_path, 'w', encoding='utf-8') as f:
-            f.write(json_tree)
-        print(f"  ✓ {json_path}")
-
-        # Save Markdown
-        md_tree = self.renderer.render_markdown(all_entries)
-        md_path = output_dir / "toc_tree.md"
-        with open(md_path, 'w', encoding='utf-8') as f:
-            f.write(md_tree)
-        print(f"  ✓ {md_path}")
-
-        # Save index
-        index_path = Path(self.config["toc_index_file"])
-        with open(index_path, 'w', encoding='utf-8') as f:
-            json.dump(all_entries, f, indent=2, ensure_ascii=False)
-        print(f"  ✓ {index_path}")
-
-        # Summary
-        print("\n" + "=" * 70)
-        print("PIPELINE COMPLETE")
-        print("=" * 70)
-        print(f"  Total PDFs processed: {len(all_entries)}")
-        print(f"  Output directory:     {self.config['output_dir']}")
-        print("\n  Preview of ASCII tree:")
-        print("-" * 70)
-        print(ascii_tree[:2000])
-        if len(ascii_tree) > 2000:
-            print("...")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    pipeline = TOCPipeline(CONFIG)
-    pipeline.run()
-##########
-#!/usr/bin/env python3
+
+def get_history(session_id: str) -> List[Dict[str, str]]:
+    """
+    Retrieve conversation history for a session.
+
+    Args:
+        session_id: The session ID returned by create_session()
+
+    Returns:
+        List of message dicts: [{"role": "user", "content": "..."}, ...]
+        Empty list if session not found.
+    """
+    if session_id not in _session_store:
+        _session_store[session_id] = deque(maxlen=MAX_MESSAGES)
+    return list(_session_store[session_id])
+
+
+def add_exchange(session_id: str, question: str, answer: str) -> None:
+    """
+    Append a Q&A pair to session history.
+    Automatically trims to MAX_MESSAGES via deque.
+
+    Args:
+        session_id: Session ID
+        question: User question
+        answer: Assistant answer
+    """
+    if session_id not in _session_store:
+        _session_store[session_id] = deque(maxlen=MAX_MESSAGES)
+
+    _session_store[session_id].append({"role": "user", "content": question})
+    _session_store[session_id].append({"role": "assistant", "content": answer})
+
+
+def get_history_length(session_id: str) -> int:
+    """
+    Return number of messages in session history.
+
+    Args:
+        session_id: Session ID
+
+    Returns:
+        int: Number of messages (0 if session not found)
+    """
+    if session_id not in _session_store:
+        return 0
+    return len(_session_store[session_id])
+
+
+def get_history_pairs(session_id: str) -> int:
+    """
+    Return number of Q&A pairs in session history.
+
+    Args:
+        session_id: Session ID
+
+    Returns:
+        int: Number of complete pairs (messages // 2)
+    """
+    return get_history_length(session_id) // 2
+
+
+def clear_session(session_id: str) -> None:
+    """
+    Remove a session from memory entirely.
+
+    Args:
+        session_id: Session ID to remove
+    """
+    _session_store.pop(session_id, None)
+
+
+def format_history_for_prompt(session_id: str) -> str:
+    """
+    Format history as string for LLM prompt.
+    Returns empty string if no history.
+
+    Args:
+        session_id: Session ID
+
+    Returns:
+        str: Formatted history block or empty string
+    """
+    history = get_history(session_id)
+    if not history:
+        return ""
+
+    lines = ["[CONVERSATION HISTORY]"]
+    for msg in history:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        # Truncate long messages for prompt brevity
+        content = msg["content"]
+        if len(content) > 300:
+            content = content[:300] + "..."
+        lines.append(f"{role}: {content}")
+
+    return "\n".join(lines)
+
+
+def list_active_sessions() -> List[str]:
+    """
+    Return list of all active session IDs.
+    Useful for debugging and monitoring.
+
+    Returns:
+        List[str]: All session IDs in memory
+    """
+    return list(_session_store.keys())
+
+
+def get_session_stats() -> Dict[str, any]:
+    """
+    Return statistics about all sessions.
+    Useful for debugging memory usage.
+
+    Returns:
+        Dict: {"total_sessions": int, "total_messages": int, "avg_messages_per_session": float}
+    """
+    total_sessions = len(_session_store)
+    total_messages = sum(len(d) for d in _session_store.values())
+    avg = total_messages / total_sessions if total_sessions > 0 else 0
+
+    return {
+        "total_sessions": total_sessions,
+        "total_messages": total_messages,
+        "avg_messages_per_session": round(avg, 2),
+    }
+
+############
 """
-toc_builder_nova.py — Build unified Table of Contents from local markdown files using Amazon Nova.
+vector_rag_memory_test.py — Test Vector RAG with sliding window memory
 
-Renders ALL headers as tree nodes (H1, H2, H3, H4 all visible).
-Handles Textract output: malformed headers, tables, orphan numbers, large files via chunking.
-
-Folder Structure Expected:
-    D:\users\ntrinadh\Downloads\docling\OneNote_data\     ← OneNote markdown files
-    D:\users\ntrinadh\Downloads\docling\ecmc_org\          ← Website markdown files
-    D:\users\ntrinadh\Downloads\docling\toc_output\        ← Output directory (auto-created)
-
-Requirements:
-    pip install boto3
-
-AWS Setup:
-    - AWS credentials configured (aws configure, or env vars, or IAM role)
-    - Bedrock access with Nova Lite model enabled in your region
+Tests Vector RAG with follow-up questions to verify conversation memory works.
+Each session maintains its own history. Sessions are isolated from each other.
 
 Usage:
-    python toc_builder_nova.py
+    python vector_rag_memory_test.py
 """
 
-import json
-import os
-import re
+import time
 from pathlib import Path
-from collections import OrderedDict
-import boto3
+import pandas as pd
+
+# Import your vector RAG query function (must accept session_id parameter)
+# Modify this import path to match your project structure
+from query_engine import run_query  # or: from vector_rag import run_query
+
+# Import session memory (for creating sessions manually if needed)
+from session_memory import create_session
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION — Update these to match your environment
+# CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CONFIG = {
-    # Input folders — your local Windows paths
-    "onenote_dir": r"D:\users\ntrinadh\Downloads\docling\OneNote_data",
-    "website_dir": r"D:\users\ntrinadh\Downloads\docling\ecmc_org",
-
-    # Output directory
-    "output_dir": r"D:\users\ntrinadh\Downloads\docling\toc_output",
-    "toc_index_file": r"D:\users\ntrinadh\Downloads\docling\toc_output\toc_index.json",
-    "review_queue_file": r"D:\users\ntrinadh\Downloads\docling\toc_output\review_queue.json",
-
-    # AWS Bedrock
-    "bedrock_region": "us-east-1",
-    "nova_model_id": "amazon.nova-lite-v1:0",  # or "amazon.nova-pro-v1:0"
-
-    # Nova prompt settings
-    "content_max_chars": 3500,       # Total chars across 3 chunks
-    "nova_max_tokens": 800,          # Increased for headers array
-    "nova_temperature": 0.1,
-
-    # Confidence thresholds
-    "auto_accept_threshold": 0.70,   # ≥ this: auto-accept
-    "review_threshold": 0.40,        # ≥ this: flag for review
-                                     # < this: reject (manual mapping needed)
-}
+OUTPUT_XLSX = Path("/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/vector_rag/memory_test_results.xlsx")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: File Scanner — Iterate local markdown folders
+# TEST SESSIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class MarkdownFileScanner:
-    """Scan local folders for markdown files."""
+test_sessions = [
+    # Session 1: Fresh session, single question (baseline — no memory needed)
+    {
+        "session_id": None,
+        "questions": [
+            "What is loan rehabilitation?",
+        ],
+        "note": "Baseline — single question, no memory",
+    },
 
-    def __init__(self, onenote_dir, website_dir):
-        self.onenote_dir = Path(onenote_dir)
-        self.website_dir = Path(website_dir)
+    # Session 2: Follow-up chain (memory critical — pronoun resolution)
+    {
+        "session_id": None,
+        "questions": [
+            "What is loan rehabilitation?",
+            "How long does the process take?",                    # "process" = rehabilitation
+            "What happens if I miss a payment during it?",         # "it" = rehabilitation
+            "Can I do this for multiple loans at the same time?",  # "this" = rehabilitation
+            "What are the benefits of completing it?",             # "it" = rehabilitation
+            "Is there a deadline to start?",                       # implied: start rehabilitation
+        ],
+        "note": "Follow-up chain 6 turns — tests pronoun resolution and context retention",
+    },
 
-    def scan_onenote(self):
-        """Yield (file_path, source_label) for all .md files in OneNote_data."""
-        if not self.onenote_dir.exists():
-            print(f"⚠️  OneNote directory not found: {self.onenote_dir}")
-            return
+    # Session 3: Topic switch (memory should NOT confuse topics)
+    {
+        "session_id": None,
+        "questions": [
+            "What is loan rehabilitation?",
+            "How do I make payments during Chapter 13 bankruptcy?",  # Switch topic
+            "Will bankruptcy affect my Title IV eligibility?",       # Follow bankruptcy
+            "What is a T4 letter?",                                  # Switch to Title IV
+            "How do I request one?",                                 # "one" = T4 letter
+        ],
+        "note": "Topic switches — tests memory isolation and context tracking",
+    },
 
-        files = sorted(self.onenote_dir.rglob("*.md"))
-        print(f"  Found {len(files)} markdown files in OneNote_data/")
-        for f in files:
-            yield f, "OneNote"
+    # Session 4: Title IV deep dive (context retention across 5 turns)
+    {
+        "session_id": None,
+        "questions": [
+            "What are my options to restore federal student aid eligibility?",
+            "What is a Title IV eligibility letter?",
+            "How do I request a T4 letter?",
+            "What documents do I need to regain Title IV eligibility after default?",
+            "Can I regain eligibility while in bankruptcy?",
+        ],
+        "note": "Title IV thread — tests deep context retention",
+    },
 
-    def scan_website(self):
-        """Yield (file_path, source_label) for all .md files in ecmc_org."""
-        if not self.website_dir.exists():
-            print(f"⚠️  Website directory not found: {self.website_dir}")
-            return
+    # Session 5: Bankruptcy deep dive (cross-topic memory)
+    {
+        "session_id": None,
+        "questions": [
+            "Explain automatic stay and how it affects student loans",
+            "Can I make voluntary payments during Chapter 13?",
+            "What happens to my loans after bankruptcy discharge?",
+            "Will bankruptcy completion change my Title IV situation?",
+            "Can I consolidate loans during active bankruptcy?",
+        ],
+        "note": "Bankruptcy thread — tests cross-topic memory (Title IV + bankruptcy)",
+    },
 
-        files = sorted(self.website_dir.rglob("*.md"))
-        print(f"  Found {len(files)} markdown files in ecmc_org/")
-        for f in files:
-            yield f, "Website"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2: Content Extractor — Three-chunk extraction for large files
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class ContentExtractor:
-    """Extract content from markdown file using 3-chunk strategy for large files."""
-
-    def extract_chunks(self, file_path, max_total=3500):
-        """
-        Extract 3 chunks from file: beginning, middle, end.
-
-        For large files, hierarchy clues are usually at top,
-        but sub-sections might be in middle or end.
-
-        Returns:
-            str: Formatted string with [BEGINNING], [MIDDLE], [END] sections
-        """
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            total_len = len(content)
-
-            # If file is small, just return it all
-            if total_len <= max_total:
-                return content.strip()
-
-            # Calculate chunk sizes
-            chunk_size = max_total // 3
-
-            # Chunk 1: Beginning (usually has title, main headers)
-            beginning = content[:chunk_size].strip()
-
-            # Chunk 2: Middle (catches sub-sections)
-            middle_start = total_len // 2 - chunk_size // 2
-            middle = content[middle_start:middle_start + chunk_size].strip()
-
-            # Chunk 3: End (usually has conclusion, footer, references)
-            end = content[-chunk_size:].strip()
-
-            # Combine with markers
-            combined = f"""[BEGINNING - first {len(beginning)} chars]
-{beginning}
-
-[MIDDLE - sample from ~50% position, {len(middle)} chars]
-{middle}
-
-[END - last {len(end)} chars]
-{end}"""
-
-            return combined
-
-        except Exception as e:
-            return f"[ERROR reading file: {str(e)}]"
+    # Session 6: Edge case — very short follow-ups
+    {
+        "session_id": None,
+        "questions": [
+            "What is administrative wage garnishment?",
+            "How much can they take?",
+            "Can I stop it?",
+            "How?",
+        ],
+        "note": "Short follow-ups — tests minimal context inference",
+    },
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3: Nova Prompt Builder — Headers array output
+# MAIN EXECUTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class NovaPromptBuilder:
-    """Build structured prompts with headers array output for Nova."""
+def main():
+    print("=" * 70)
+    print("VECTOR RAG MEMORY TEST — Sliding Window (5-6 turns)")
+    print("=" * 70)
+    print(f"Output: {OUTPUT_XLSX}")
+    print(f"Total test sessions: {len(test_sessions)}")
+    print()
 
-    SYSTEM_INSTRUCTION = """You are a document hierarchy analyzer for ECMC (Educational Credit Management Corporation).
-Your task is to analyze a markdown file and extract ALL headers to build a complete Table of Contents tree.
+    rows = []
 
-CRITICAL: EVERY header level must appear in the tree. Do not skip intermediate levels.
+    for session_idx, session in enumerate(test_sessions, 1):
+        session_id = session["session_id"]
+        note = session["note"]
 
-RULES:
-1. Return ONLY a valid JSON object. No markdown, no explanations outside JSON.
-2. Extract ALL meaningful headers from the document as a "headers" array.
-3. Each header must have: level (1-4), text (exact header text), is_leaf (true only for deepest/most specific header).
-4. Level 1 = top category (notebook for OneNote, top category for Website).
-5. Level 2 = sub-category (section_group for OneNote, subcategory for Website).
-6. Level 3 = section/page.
-7. Level 4 = sub-page/topic.
-8. The DEEPEST header (last in array) must have is_leaf = true. All others is_leaf = false.
-9. "type" must be "page" for content pages, "pdf_attachment" only if the markdown is ABOUT a PDF form/notice.
-10. Confidence must be honest: 0.95 if headers are clear, 0.70 if inferred from text, 0.50 if guessed from filename only.
-11. If completely ambiguous, set confidence below 0.40 and headers to [].
+        print(f"\n{'='*70}")
+        print(f"SESSION {session_idx}: {session_id or 'NEW'} | {note}")
+        print(f"{'='*70}")
 
-TEXTRACT OUTPUT HANDLING — CRITICAL:
-- Headers may appear as "#Title" or "##Title" WITHOUT a space after #. Treat "#Title" the same as "# Title" — it IS a header.
-- Ignore table artifacts (lines with | pipes) unless they contain meaningful hierarchy info.
-- Ignore orphan numbers (single digits on their own line) — they are page numbers or artifacts.
-- Ignore lines that are just "1", "2", "3" etc. standing alone.
-- Focus on SEMANTIC structure, not markdown syntax perfection.
-- If content has [BEGINNING], [MIDDLE], [END] markers, analyze ALL sections for headers.
-- The true title is usually in the first meaningful header or the first sentence after headers.
+        for turn, q in enumerate(session["questions"], 1):
+            print(f"\n  Turn {turn}: {q}")
 
-VALID PATHS (use as reference, but extract actual headers from content):
-OneNote:
-- Borrower Call Playbook > Payments During Bankruptcy > Setting Up Payments
-- Borrower Call Playbook > Title IV - Returning to School > What Is a Title IV Letter
-- Borrower Call Playbook > Deferment and Forbearance > Auto Stay and Student Loans
-- Borrower Call Playbook > Getting Out of Default > Consolidation vs Rehabilitation
-- Borrower Call Playbook > Default Dispute > Determining the Default (DF) Date
-- Federal Loan Unit Playbook > Title IV Eligibility (Federal) > Determining Additional Aid Eligibility
-- Federal Loan Unit Playbook > Resolving Default - Rehabilitation > Rehabilitation During Bankruptcy
-- Federal Loan Unit Playbook > Making Payments - Payoff (Federal) > Balance and Payoff Rules
+            start = time.time()
 
-Website:
-- Understand Bankruptcy > Bankruptcy and Student Loans
-- Understand Bankruptcy > During Bankruptcy > Regaining Title IV Eligibility While in Bankruptcy
-- Understand Bankruptcy > After Bankruptcy > Borrower's Authorization to Disclose Information
+            # Call run_query with session_id
+            # run_query must accept session_id and return it in result
+            result = run_query(q, session_id=session_id)
 
-OUTPUT FORMAT (strict JSON):
-{
-  "source": "OneNote"|"Website",
-  "headers": [
-    {"level": 1, "text": "Borrower Call Playbook", "is_leaf": false},
-    {"level": 2, "text": "Payments During Bankruptcy", "is_leaf": false},
-    {"level": 3, "text": "Setting Up Payments - Payment Arrangements", "is_leaf": true}
-  ],
-  "type": "page"|"pdf_attachment",
-  "confidence": 0.0-1.0,
-  "reasoning": "brief explanation"
-}"""
+            elapsed_ms = (time.time() - start) * 1000
 
-    ONE_SHOT_INPUT = """--- FILE METADATA ---
-Source folder: OneNote_data/
-Filename: setting_up_payments.md
+            # Capture returned session_id for next turn in same session
+            session_id = result.get("session_id", session_id)
 
---- CONTENT ---
-[BEGINNING - first 1200 chars]
-# Borrower Call Playbook
-## Payments During Bankruptcy
-### Setting Up Payments - Payment Arrangements
+            answer = result.get("answer", "")
+            history_len = result.get("history_length", 0)
+            sources = result.get("sources_used", 0)
 
-This guide covers how borrowers can set up payment arrangements during bankruptcy proceedings.
-Payment address: ECMC Lockbox, PO Box 419200, St. Louis, MO 63141-9200
-Payment methods: check, money order, online payment at www.ecmc.org
-Contact: 1-888-363-3032
+            print(f"      Answer: {answer[:100]}...")
+            print(f"      Latency: {elapsed_ms:.1f}ms | History: {history_len} msgs | Sources: {sources}")
 
-Borrowers may make payments during bankruptcy in several ways..."""
+            rows.append({
+                "session_idx": session_idx,
+                "session_id": session_id,
+                "note": note,
+                "turn": turn,
+                "query": q,
+                "answer": answer,
+                "latency_ms": round(elapsed_ms, 2),
+                "history_length": history_len,
+                "sources_used": sources,
+            })
 
-    ONE_SHOT_OUTPUT = """{"source": "OneNote", "headers": [{"level": 1, "text": "Borrower Call Playbook", "is_leaf": false}, {"level": 2, "text": "Payments During Bankruptcy", "is_leaf": false}, {"level": 3, "text": "Setting Up Payments - Payment Arrangements", "is_leaf": true}], "type": "page", "confidence": 0.95, "reasoning": "Clear markdown headers at 3 levels. H1=notebook, H2=section_group, H3=page title. All levels must appear in tree."}"""
+    # Save results
+    save_results(rows)
 
-    FEW_SHOT_EXAMPLES = [
-        {
-            "input": """--- FILE METADATA ---
-Source folder: OneNote_data/
-Filename: title_iv_letter.md
+    # Print summary
+    print_summary(rows)
 
---- CONTENT ---
-[BEGINNING - first 1200 chars]
-# Borrower Call Playbook
-## Title IV - Returning to School
-### What Is a Title IV Letter
 
-A Title IV Eligibility Letter is required for students who have defaulted on federal student loans and wish to return to school. The letter confirms eligibility for federal financial aid...""",
-            "output": """{"source": "OneNote", "headers": [{"level": 1, "text": "Borrower Call Playbook", "is_leaf": false}, {"level": 2, "text": "Title IV - Returning to School", "is_leaf": false}, {"level": 3, "text": "What Is a Title IV Letter", "is_leaf": true}], "type": "page", "confidence": 0.94, "reasoning": "Three clear header levels. H1=notebook, H2=section_group, H3=page. All levels must appear in tree."}"""
-        },
-        {
-            "input": """--- FILE METADATA ---
-Source folder: ecmc_org/
-Filename: during_bankruptcy.md
+def save_results(rows):
+    """Save test results to Excel."""
+    df = pd.DataFrame(rows)
+    OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(OUTPUT_XLSX, index=False)
+    print(f"\n{'='*70}")
+    print(f"✅ Results saved to: {OUTPUT_XLSX}")
 
---- CONTENT ---
-[BEGINNING - first 1200 chars]
-# During Bankruptcy
 
-If you have filed for bankruptcy, you may have questions about how this affects your student loans. This page provides information about managing your student loans during an active bankruptcy case.
+def print_summary(rows):
+    """Print test summary statistics."""
+    df = pd.DataFrame(rows)
 
-## Automatic Stay
-When you file for bankruptcy, an automatic stay goes into effect...
+    print(f"\n{'='*70}")
+    print("SUMMARY")
+    print(f"{'='*70}")
+    print(f"Total sessions:     {df['session_id'].nunique()}")
+    print(f"Total queries:      {len(df)}")
+    print(f"Avg latency:        {df['latency_ms'].mean():.1f} ms")
+    print(f"Max latency:        {df['latency_ms'].max():.1f} ms")
+    print(f"Min latency:        {df['latency_ms'].min():.1f} ms")
 
-## Making Payments
-You can continue making payments during bankruptcy...""",
-            "output": """{"source": "Website", "headers": [{"level": 1, "text": "During Bankruptcy", "is_leaf": true}], "type": "page", "confidence": 0.82, "reasoning": "Single # header indicates top-level page. Sub-sections (## Automatic Stay, ## Making Payments) are content sections, not tree hierarchy levels. Page stands alone under Website branch."}"""
-        },
-        {
-            "input": """--- FILE METADATA ---
-Source folder: ecmc_org/
-Filename: understand_bankruptcy.md
+    print(f"\nHistory growth per session:")
+    history_summary = df.groupby("session_id").agg({
+        "history_length": "max",
+        "turn": "count",
+        "note": "first",
+    }).rename(columns={"turn": "queries"})
+    print(history_summary.to_string())
 
---- CONTENT ---
-[BEGINNING - first 1200 chars]
-# Understand Bankruptcy
-
-Overview of bankruptcy and student loans.
-
-## Bankruptcy and Student Loans
-Information about how bankruptcy affects student loans.
-
-## During Bankruptcy
-Managing loans during active bankruptcy.
-
-### Regaining Title IV Eligibility While in Bankruptcy
-Detailed guide on Title IV eligibility during bankruptcy...""",
-            "output": """{"source": "Website", "headers": [{"level": 1, "text": "Understand Bankruptcy", "is_leaf": false}, {"level": 2, "text": "During Bankruptcy", "is_leaf": false}, {"level": 3, "text": "Regaining Title IV Eligibility While in Bankruptcy", "is_leaf": true}], "type": "page", "confidence": 0.88, "reasoning": "H1=top category, H2=subcategory, H3=specific page. ## Bankruptcy and Student Loans is sibling category, not parent. This file focuses on During Bankruptcy > Regaining Title IV."}"""
-        },
-        {
-            "input": """--- FILE METADATA ---
-Source folder: ecmc_org/
-Filename: notice_of_default.md
-
---- CONTENT ---
-[BEGINNING - first 1200 chars]
-NOTICE OF DEFAULT
-
-You have failed to make payments as required by your promissory note(s).
-This notice is provided pursuant to 34 CFR 682.200.
-
-Borrower Name: _______________________
-Loan Number: _______________________
-Default Date: _______________________
-
-You must take immediate action to resolve this default...""",
-            "output": """{"source": "Website", "headers": [{"level": 1, "text": "Notice of Default", "is_leaf": true}], "type": "pdf_attachment", "confidence": 0.75, "reasoning": "Content is a form/notice, not narrative. No markdown headers. Title inferred from content. Placed as PDF attachment under appropriate category."}"""
-        },
-        {
-            "input": """--- FILE METADATA ---
-Source folder: OneNote_data/
-Filename: 1098_e_tax_statement.md
-
---- CONTENT ---
-[BEGINNING - first 1200 chars]
-##Borrowers Who Paid Less Than $600 in Student Loan Interest
-
-A 1098-E statement will not be mailed.
-
-The interest paid amount can be found:
-In EPIC comments
-Under the 1098-E History drop-down menu in EPIC
-
-#Borrower Online Access
-
-| Guarantor | 1098-E Available Online? |
-| ECMC | Yes |
-| ASA | Yes |
-| College Assist | No |
-
-1
-
-#Common Borrower Questions
-
-## Why didn't I receive a 1098-E?
-
-You may not receive a 1098-E if...""",
-            "output": """{"source": "OneNote", "headers": [{"level": 1, "text": "1098-E Tax Statement", "is_leaf": true}], "type": "page", "confidence": 0.65, "reasoning": "Malformed headers (#Borrower without space). Content is about 1098-E tax statements. Table artifacts present (| pipes). Orphan number '1' ignored. No clear multi-level hierarchy — treated as single page."}"""
-        },
-        {
-            "input": """--- FILE METADATA ---
-Source folder: OneNote_data/
-Filename: rehab_during_bk.md
-
---- CONTENT ---
-[BEGINNING - first 1200 chars]
-[Image-heavy document with minimal extractable text]
-[Scanned document - OCR quality low]
-Federal Loan Unit Playbook
-Resolving Default - Rehabilitation
-Rehabilitation During Bankruptcy
-
-[Table: Payment schedule, contact info, requirements]""",
-            "output": """{"source": "OneNote", "headers": [{"level": 1, "text": "Federal Loan Unit Playbook", "is_leaf": false}, {"level": 2, "text": "Resolving Default - Rehabilitation", "is_leaf": false}, {"level": 3, "text": "Rehabilitation During Bankruptcy", "is_leaf": true}], "type": "page", "confidence": 0.65, "reasoning": "No clear markdown headers. Text mentions notebook and section names at top. Inferred 3-level hierarchy from text structure. Low confidence due to poor OCR quality."}"""
-        }
-    ]
-
-    def build_prompt(self, file_path, source, content):
-        """Build complete Nova prompt for a single file."""
-        filename = file_path.name
-
-        # Build few-shot section
-        few_shot_text = ""
-        for i, example in enumerate(self.FEW_SHOT_EXAMPLES, 1):
-            few_shot_text += f"\n\n--- FEW-SHOT EXAMPLE {i} ---\n{example['input']}\n\n--- OUTPUT {i} ---\n{example['output']}"
-
-        # Assemble prompt
-        prompt = f"""{self.SYSTEM_INSTRUCTION}
-
---- ONE-SHOT EXAMPLE ---
-{self.ONE_SHOT_INPUT}
-
---- OUTPUT ---
-{self.ONE_SHOT_OUTPUT}
-{few_shot_text}
-
---- ACTUAL INPUT ---
---- FILE METADATA ---
-Source folder: {source}_data/
-Filename: {filename}
-
---- CONTENT ---
-{content}
-
---- YOUR OUTPUT ---
-Return ONLY the JSON object. No other text. Do NOT wrap in ```json or ``` blocks.
-Ensure "headers" array includes EVERY level from H1 to deepest header."""
-
-        return prompt
+    print(f"\n{'='*70}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 4: Nova Analyzer — Bedrock Converse API caller
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class NovaAnalyzer:
-    """Send analysis requests to Amazon Nova via Bedrock Converse API."""
-
-    def __init__(self, model_id, region="us-east-1"):
-        self.bedrock = boto3.client("bedrock-runtime", region_name=region)
-        self.model_id = model_id
-
-    def analyze(self, prompt, max_tokens=800, temperature=0.1):
-        """Send prompt to Nova and parse JSON response."""
-        try:
-            response = self.bedrock.converse(
-                modelId=self.model_id,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [{"text": prompt}]
-                    }
-                ],
-                inferenceConfig={
-                    "maxTokens": max_tokens,
-                    "temperature": temperature,
-                    "topP": 0.9,
-                }
-            )
-
-            # Extract text response
-            content = response["output"]["message"]["content"]
-            text = content[0]["text"] if content else ""
-
-            # Parse JSON
-            result = self._extract_json(text)
-            return result
-
-        except Exception as e:
-            return {
-                "source": "Unknown",
-                "headers": [],
-                "type": "page",
-                "confidence": 0.0,
-                "reasoning": f"Nova API error: {str(e)}",
-                "error": True,
-            }
-
-    def _extract_json(self, text):
-        """Extract and parse JSON from Nova response."""
-        text = text.strip()
-
-        # Remove markdown code blocks if present
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-
-        text = text.strip()
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Try regex fallback
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group())
-                except json.JSONDecodeError:
-                    pass
-
-            return {
-                "source": "Unknown",
-                "headers": [],
-                "type": "page",
-                "confidence": 0.0,
-                "reasoning": f"Failed to parse JSON. Raw: {text[:200]}",
-                "error": True,
-            }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 5: Result Processor — Confidence filter + Deduplication
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class ResultProcessor:
-    """Filter by confidence, deduplicate, and sort results."""
-
-    def __init__(self, auto_threshold=0.70, review_threshold=0.40):
-        self.auto_threshold = auto_threshold
-        self.review_threshold = review_threshold
-
-    def classify(self, nova_result, file_path, source):
-        """Classify Nova result into approved, review, or rejected."""
-        confidence = nova_result.get("confidence", 0)
-        headers = nova_result.get("headers", [])
-
-        # Derive tree path from headers
-        if headers:
-            parent_path = [h["text"] for h in headers[:-1]]  # All except last
-            title = headers[-1]["text"] if headers else "Untitled"
-            depth = len(headers)
-        else:
-            parent_path = []
-            title = "Untitled"
-            depth = 0
-
-        entry = {
-            "file_path": str(file_path),
-            "filename": file_path.name,
-            "source": nova_result.get("source", source),
-            "title": title,
-            "parent_path": parent_path,
-            "headers": headers,
-            "depth": depth,
-            "type": nova_result.get("type", "page"),
-            "confidence": confidence,
-            "reasoning": nova_result.get("reasoning", ""),
-            "nova_raw": nova_result,
-        }
-
-        if confidence >= self.auto_threshold:
-            return "approved", entry
-        elif confidence >= self.review_threshold:
-            return "review", entry
-        else:
-            return "rejected", entry
-
-    def deduplicate(self, approved_list):
-        """Remove duplicates based on (source + full header path)."""
-        seen = OrderedDict()
-        unique = []
-
-        for entry in approved_list:
-            # Deduplication key: source + all header texts
-            headers_tuple = tuple(h["text"] for h in entry.get("headers", []))
-            key = (entry["source"], headers_tuple)
-
-            if key not in seen:
-                seen[key] = entry
-                unique.append(entry)
-            else:
-                existing = seen[key]
-                if "duplicate_files" not in existing:
-                    existing["duplicate_files"] = []
-                existing["duplicate_files"].append(entry["file_path"])
-
-        return unique
-
-    def sort(self, entries):
-        """Sort by source, then by header hierarchy."""
-        return sorted(entries, key=lambda e: (
-            e["source"],
-            tuple(h["text"] for h in e.get("headers", [])),
-        ))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 6: Tree Renderer — ALL headers as nodes (ASCII + JSON + Markdown)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TreeRenderer:
-    """Render TOC entries as ASCII tree, JSON, and Markdown — ALL headers are nodes."""
-
-    def build_tree_dict(self, entries):
-        """
-        Build nested dictionary from entries with headers arrays.
-        EVERY header level becomes a node in the tree.
-
-        Multiple files can contribute to the same branch — nodes are merged.
-        """
-        tree = {"ROOT": {}}
-
-        for entry in entries:
-            source = entry["source"]
-            headers = entry.get("headers", [])
-            doc_type = entry.get("type", "page")
-
-            if not headers:
-                continue
-
-            # Determine branch name
-            branch = "OneNote" if source == "OneNote" else "Website (ecmc.org)"
-
-            if branch not in tree["ROOT"]:
-                tree["ROOT"][branch] = {}
-
-            # Navigate/create path for each header level
-            current = tree["ROOT"][branch]
-
-            for i, header in enumerate(headers):
-                text = header["text"]
-                is_leaf = header.get("is_leaf", (i == len(headers) - 1))
-
-                if is_leaf:
-                    # Leaf node — add with metadata
-                    if text not in current:
-                        current[text] = {
-                            "_file_path": entry.get("file_path", ""),
-                            "_type": doc_type,
-                            "_confidence": entry.get("confidence", 0),
-                        }
-                    else:
-                        # Leaf already exists — merge file info
-                        existing = current[text]
-                        if "_duplicate_files" not in existing:
-                            existing["_duplicate_files"] = []
-                        existing["_duplicate_files"].append(entry.get("file_path", ""))
-                else:
-                    # Branch node — create if not exists, then navigate deeper
-                    if text not in current:
-                        current[text] = {}
-                    current = current[text]
-
-        return tree
-
-    def render_ascii(self, tree):
-        """Render nested dict as ASCII tree."""
-        lines = ["ROOT"]
-        root_children = tree.get("ROOT", {})
-
-        items = list(root_children.items())
-        for i, (key, value) in enumerate(items):
-            is_last = (i == len(items) - 1)
-            connector = "└─ " if is_last else "├─ "
-            lines.append(connector + key)
-            child_prefix = "   " if is_last else "│  "
-            self._render_ascii_node(lines, value, child_prefix)
-
-        return "\n".join(lines)
-
-    def _render_ascii_node(self, lines, node, prefix):
-        """Recursively render ASCII tree nodes."""
-        # Separate branch children from leaf metadata
-        children = []
-        for k, v in node.items():
-            if k.startswith("_"):
-                continue
-            # Check if v has non-metadata children (is a branch)
-            is_branch = isinstance(v, dict) and any(not sk.startswith("_") for sk in v.keys())
-            children.append((k, v, is_branch))
-
-        for i, (key, value, is_branch) in enumerate(children):
-            is_last = (i == len(children) - 1)
-            connector = "└─ " if is_last else "├─ "
-            lines.append(prefix + connector + key)
-
-            if is_branch:
-                new_prefix = prefix + ("   " if is_last else "│  ")
-                self._render_ascii_node(lines, value, new_prefix)
-
-    def render_json(self, tree):
-        """Render as pretty-printed JSON."""
-        return json.dumps(tree, indent=2, ensure_ascii=False)
-
-    def render_markdown(self, entries):
-        """Render as Markdown document with ALL header levels."""
-        lines = [
-            "# Table of Contents — ECMC Knowledge Base",
-            "",
-            "Generated from OneNote and Website (ecmc.org) markdown files via Nova analysis.",
-            "ALL header levels are rendered as tree nodes.",
-            "",
-        ]
-
-        # Group by source
-        by_source = {}
-        for entry in entries:
-            source = entry["source"]
-            if source not in by_source:
-                by_source[source] = []
-            by_source[source].append(entry)
-
-        for source, source_entries in by_source.items():
-            branch_name = "OneNote" if source == "OneNote" else "Website (ecmc.org)"
-            lines.append(f"## {branch_name}")
-            lines.append("")
-
-            # Sort by header hierarchy
-            source_entries.sort(key=lambda e: tuple(h["text"] for h in e.get("headers", [])))
-
-            for entry in source_entries:
-                headers = entry.get("headers", [])
-                if not headers:
-                    continue
-
-                # Render each header level with appropriate depth
-                for i, header in enumerate(headers):
-                    depth = i + 2  # ## = level 0 (branch), ### = level 1, etc.
-                    hashes = "#" * min(depth, 6)
-                    text = header["text"]
-
-                    # Mark leaf
-                    if header.get("is_leaf", (i == len(headers) - 1)):
-                        if entry.get("type") == "pdf_attachment":
-                            text = f"[PDF] {text}"
-                        lines.append(f"{hashes} {text} (leaf)")
-                    else:
-                        lines.append(f"{hashes} {text}")
-
-                # Add metadata after leaf
-                lines.append(f"- **File:** `{entry.get('file_path', '')}`")
-                lines.append(f"- **Confidence:** {entry.get('confidence', 0)}")
-                lines.append(f"- **Reasoning:** {entry.get('reasoning', '')}")
-                lines.append("")
-
-        return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 7: Main Pipeline — Orchestrates everything
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TOCPipeline:
-    """Main pipeline — Nova-based TOC builder with ALL headers as tree nodes."""
-
-    def __init__(self, config):
-        self.config = config
-        self.scanner = MarkdownFileScanner(config["onenote_dir"], config["website_dir"])
-        self.extractor = ContentExtractor()
-        self.prompt_builder = NovaPromptBuilder()
-        self.nova = NovaAnalyzer(config["nova_model_id"], config["bedrock_region"])
-        self.processor = ResultProcessor(config["auto_accept_threshold"], config["review_threshold"])
-        self.renderer = TreeRenderer()
-
-    def run(self):
-        """Execute the full Nova-based pipeline."""
-        print("=" * 70)
-        print("ECMC TOC BUILDER — Nova-Powered with Full Header Tree")
-        print("=" * 70)
-        print(f"Model: {self.config['nova_model_id']}")
-        print(f"Region: {self.config['bedrock_region']}")
-        print(f"Chunking: 3-chunk (beginning + middle + end)")
-        print(f"Auto-accept threshold: {self.config['auto_accept_threshold']}")
-        print(f"Review threshold: {self.config['review_threshold']}")
-        print("ALL header levels (H1, H2, H3, H4) will appear as tree nodes.")
-
-        all_files = []
-        approved = []
-        review = []
-        rejected = []
-
-        # Collect all files
-        print("\n[Scan] Collecting markdown files...")
-        for file_path, source in self.scanner.scan_onenote():
-            all_files.append((file_path, source))
-        for file_path, source in self.scanner.scan_website():
-            all_files.append((file_path, source))
-
-        if not all_files:
-            print("\n❌ No markdown files found. Check your paths.")
-            return
-
-        print(f"\nTotal files to process: {len(all_files)}")
-
-        # Process each file with Nova
-        print("\n[Nova] Analyzing files...")
-        for i, (file_path, source) in enumerate(all_files, 1):
-            print(f"\n  [{i}/{len(all_files)}] {file_path.name}")
-            print(f"      Source: {source}")
-
-            # Extract content with chunking
-            content = self.extractor.extract_chunks(file_path, self.config["content_max_chars"])
-            print(f"      Content: {len(content)} chars (3-chunk)")
-
-            # Build prompt
-            prompt = self.prompt_builder.build_prompt(file_path, source, content)
-
-            # Call Nova
-            print(f"      🤖 Calling Nova...")
-            result = self.nova.analyze(
-                prompt,
-                max_tokens=self.config["nova_max_tokens"],
-                temperature=self.config["nova_temperature"],
-            )
-
-            if result.get("error"):
-                print(f"      ❌ Nova error: {result.get('reasoning', 'Unknown')}")
-                rejected.append({"file": file_path, "result": result})
-                continue
-
-            # Display headers found
-            headers = result.get("headers", [])
-            header_path = " > ".join(h["text"] for h in headers) if headers else "[no headers]"
-            print(f"      ✅ Headers: {header_path}")
-            print(f"      📊 Confidence: {result.get('confidence')}")
-
-            # Classify
-            status, entry = self.processor.classify(result, file_path, source)
-
-            if status == "approved":
-                print(f"      ✓ Auto-approved")
-                approved.append(entry)
-            elif status == "review":
-                print(f"      ⚠️  Flagged for review")
-                review.append(entry)
-            else:
-                print(f"      ❌ Rejected (confidence too low)")
-                rejected.append(entry)
-
-        # Deduplicate and sort approved
-        print("\n[Process] Deduplicating approved entries...")
-        approved = self.processor.deduplicate(approved)
-        approved = self.processor.sort(approved)
-        print(f"  {len(approved)} unique approved entries")
-        print(f"  {len(review)} flagged for review")
-        print(f"  {len(rejected)} rejected")
-
-        # Build tree
-        print("\n[Render] Building tree structures...")
-        tree = self.renderer.build_tree_dict(approved)
-
-        # Create output directory
-        output_dir = Path(self.config["output_dir"])
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save ASCII tree
-        ascii_tree = self.renderer.render_ascii(tree)
-        ascii_path = output_dir / "toc_tree.txt"
-        with open(ascii_path, 'w', encoding='utf-8') as f:
-            f.write(ascii_tree)
-        print(f"  ✓ {ascii_path}")
-
-        # Save JSON tree
-        json_tree = self.renderer.render_json(tree)
-        json_path = output_dir / "toc_tree.json"
-        with open(json_path, 'w', encoding='utf-8') as f:
-            f.write(json_tree)
-        print(f"  ✓ {json_path}")
-
-        # Save Markdown
-        md_tree = self.renderer.render_markdown(approved)
-        md_path = output_dir / "toc_tree.md"
-        with open(md_path, 'w', encoding='utf-8') as f:
-            f.write(md_tree)
-        print(f"  ✓ {md_path}")
-
-        # Save index
-        index_path = Path(self.config["toc_index_file"])
-        with open(index_path, 'w', encoding='utf-8') as f:
-            json.dump({"approved": approved, "review": review, "rejected": rejected}, f, indent=2, ensure_ascii=False)
-        print(f"  ✓ {index_path}")
-
-        # Save review queue
-        review_path = Path(self.config["review_queue_file"])
-        with open(review_path, 'w', encoding='utf-8') as f:
-            json.dump(review, f, indent=2, ensure_ascii=False)
-        print(f"  ✓ {review_path}")
-
-        # Summary
-        print("\n" + "=" * 70)
-        print("PIPELINE COMPLETE")
-        print("=" * 70)
-        print(f"  Total files:      {len(all_files)}")
-        print(f"  Approved:         {len(approved)}")
-        print(f"  Review queue:     {len(review)}")
-        print(f"  Rejected:         {len(rejected)}")
-        print(f"  Output directory: {self.config['output_dir']}")
-        print("\n  Preview of ASCII tree:")
-        print("-" * 70)
-        print(ascii_tree[:2000])
-        if len(ascii_tree) > 2000:
-            print("...")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN ENTRY POINT
+# ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    pipeline = TOCPipeline(CONFIG)
-    pipeline.run()
+    main()
+###############
 ################
 #!/usr/bin/env python3
 """
