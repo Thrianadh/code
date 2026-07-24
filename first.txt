@@ -1,3 +1,41 @@
+from retrieval_pipeline import run_query
+
+# ========== START CONVERSATION ==========
+print("=" * 50)
+print("STARTING NEW CONVERSATION")
+print("=" * 50)
+
+result = run_query("What is loan rehabilitation?")
+session_id = result["session_id"]
+
+print(f"\n[Turn 1] You: What is loan rehabilitation?")
+print(f"[Turn 1] Bot: {result['answer'][:100]}...")
+print(f"[Session: {session_id} | History: {result['history_length']}]")
+
+# ========== CONTINUE CONVERSATION ==========
+follow_ups = [
+    "How long does the process take?",
+    "What if I miss a payment during it?",
+    "Can I do this for multiple loans?",
+]
+
+for i, question in enumerate(follow_ups, 2):
+    result = run_query(question, session_id=session_id)
+    
+    print(f"\n[Turn {i}] You: {question}")
+    print(f"[Turn {i}] Bot: {result['answer'][:100]}...")
+    print(f"[History: {result['history_length']} messages]")
+
+# ========== NEW CONVERSATION (NO MEMORY) ==========
+print(f"\n{'='*50}")
+print("STARTING FRESH CONVERSATION (NO MEMORY)")
+print(f"{'='*50}")
+
+result2 = run_query("What is loan rehabilitation?")  # No session_id = new session
+print(f"\n[Fresh] You: What is loan rehabilitation?")
+print(f"[Fresh] Bot: {result2['answer'][:100]}...")
+print(f"[Session: {result2['session_id']} | History: {result2['history_length']}]")
+######
 #!/usr/bin/env python3
 """
 retrieval_pipeline.py — Vector RAG with sliding window conversation memory.
