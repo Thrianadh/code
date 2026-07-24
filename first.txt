@@ -1,3 +1,209 @@
+#!/usr/bin/env python3
+"""
+retrieval_pipeline.py — Vector RAG with sliding window conversation memory.
+
+Modified to support session_id parameter for multi-turn chat.
+"""
+
+import json
+import time
+from typing import Any, List, Dict
+from dataclasses import dataclass, asdict
+
+# Import session memory module
+from session_memory import (
+    create_session,
+    format_history_for_prompt,
+    add_exchange,
+    get_history_length,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA CLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class QueryResult:
+    """Result container for RAG queries."""
+    query: str
+    answer: str
+    confidence: float
+    sources_used: int
+    citations: list
+    latency_ms: float
+    session_id: str = None          # NEW: session ID for memory
+    history_length: int = 0         # NEW: number of messages in memory
+
+    def to_dict(self):
+        return asdict(self)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INDEX LOADING (at import time)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Load index and metadata when module imports
+# Adjust these to match your actual loading logic
+
+def _load_index():
+    """Load FAISS index and metadata. Called once at module import."""
+    # Replace with your actual index loading code
+    # Example:
+    # import faiss
+    # index = faiss.read_index("/path/to/index.faiss")
+    # with open("/path/to/metadata.json") as f:
+    #     metadata = json.load(f)
+    # return index, metadata, {"index_type": "faiss", "dim": 1536}
+
+    # Placeholder — replace with your actual code
+    return None, [], {}
+
+# Global index and metadata (loaded once)
+INDEX, METADATA, INDEX_INFO = _load_index()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROMPT BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT = """You are an ECMC customer service agent specializing in student loans, bankruptcy, and default resolution.
+
+Answer based on the provided context. If the answer is not in the context, say "I don't have that information."
+Be concise, accurate, and cite sources where possible."""
+
+
+def build_prompt(system: str, chunks: List[str], history: str, question: str) -> str:
+    """
+    Build LLM prompt with system instruction, retrieved context, conversation history, and current question.
+
+    Args:
+        system: System instruction
+        chunks: Retrieved document chunks
+        history: Formatted conversation history string (or empty)
+        question: Current user question
+
+    Returns:
+        str: Complete prompt for LLM
+    """
+    parts = [system]
+
+    # Retrieved context
+    parts.append("\n[RETRIEVED CONTEXT]")
+    for i, chunk in enumerate(chunks, 1):
+        parts.append(f"Source {i}: {chunk}")
+
+    # Conversation history (if any)
+    if history:
+        parts.append(history)
+
+    # Current question
+    parts.append(f"\n[CURRENT QUESTION]\nUser: {question}\nAssistant:")
+
+    return "\n\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN QUERY FUNCTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_query(
+    query: str,
+    index: Any = None,
+    metadata: List[Dict] = None,
+    index_info: Dict = None,
+    session_id: str = None
+) -> Dict:
+    """
+    Execute vector RAG query with optional conversation memory.
+
+    Args:
+        query: User question
+        index: FAISS index (optional, uses global INDEX if not provided)
+        metadata: Chunk metadata (optional, uses global METADATA if not provided)
+        index_info: Index configuration (optional, uses global INDEX_INFO if not provided)
+        session_id: Conversation session ID (optional, creates new if not provided)
+
+    Returns:
+        Dict: QueryResult as dictionary with answer, session_id, history_length, etc.
+    """
+    start_time = time.time()
+
+    # ── SESSION HANDLING ──
+    if session_id is None:
+        session_id = create_session()
+
+    # Get conversation history for prompt
+    history_str = format_history_for_prompt(session_id)
+
+    # ── USE GLOBAL INDEX IF NOT PROVIDED ──
+    if index is None:
+        index = INDEX
+    if metadata is None:
+        metadata = METADATA
+    if index_info is None:
+        index_info = INDEX_INFO
+
+    # ── YOUR EXISTING: EMBED QUERY ──
+    # Replace with your actual embedding code
+    embed_start = time.time()
+    # query_embedding = your_embedding_function(query)
+    embed_time = (time.time() - embed_start) * 1000
+
+    # ── YOUR EXISTING: RETRIEVE CHUNKS ──
+    # Replace with your actual retrieval code
+    search_start = time.time()
+    # retrieved = search_index(index, query_embedding, k=5)
+    # chunks = [metadata[i]["text"] for i in retrieved]
+    # For now, placeholder:
+    retrieved = []
+    chunks = []
+    search_time = (time.time() - search_start) * 1000
+
+    # ── BUILD PROMPT WITH HISTORY ──
+    prompt = build_prompt(SYSTEM_PROMPT, chunks, history_str, query)
+
+    # ── YOUR EXISTING: CALL LLM ──
+    gen_start = time.time()
+    # Replace with your actual LLM call
+    # answer = call_bedrock(prompt)
+    # For now, placeholder:
+    answer = f"[Placeholder answer for: {query}]"
+    confidence = 0.85
+    citations = []
+    gen_time = (time.time() - gen_start) * 1000
+
+    # ── STORE IN MEMORY ──
+    add_exchange(session_id, query, answer)
+    history_len = get_history_length(session_id)
+
+    # ── TIMING ──
+    total_time = (time.time() - start_time) * 1000
+
+    # ── RETURN RESULT ──
+    return QueryResult(
+        query=query,
+        answer=answer,
+        confidence=confidence,
+        sources_used=len(retrieved),
+        citations=citations,
+        latency_ms=total_time,
+        session_id=session_id,
+        history_length=history_len,
+    ).to_dict()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BACKWARD COMPATIBILITY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_query_legacy(query: str) -> Dict:
+    """
+    Legacy wrapper for backward compatibility.
+    Calls run_query without session_id (no memory).
+    """
+    return run_query(query)
+############################
 from retrieval_pipeline import run_query
 
 # ========== START CONVERSATION ==========
