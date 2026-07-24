@@ -1,5 +1,345 @@
 #!/usr/bin/env python3
 """
+chat_with_memory.py — Chatbot wrapper with memory for existing Vector RAG
+
+Usage:
+    python chat_with_memory.py
+
+Requirements:
+    - retrieval_pipeline.py (your original, unmodified)
+    - session_memory.py (provided earlier)
+"""
+
+import sys
+from pathlib import Path
+
+# Add your vector_rag folder to path (adjust if needed)
+sys.path.insert(0, "/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/vector_rag")
+
+from retrieval_pipeline import run_query  # Your ORIGINAL, unmodified
+from session_memory import (
+    create_session,
+    get_history,
+    add_exchange,
+    get_history_length,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROMPT BUILDER WITH HISTORY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_prompt_with_history(history_messages, current_question):
+    """
+    Build a prompt string from conversation history + current question.
+    
+    Args:
+        history_messages: List of dicts from session_memory
+                         [{"role": "user", "content": "..."}, ...]
+        current_question: Current user question string
+    
+    Returns:
+        str: Formatted prompt for LLM
+    """
+    parts = []
+    
+    # System instruction
+    parts.append(
+        "You are an ECMC customer service agent specializing in student loans, "
+        "bankruptcy, and default resolution. Answer based on provided context. "
+        "Be concise and accurate."
+    )
+    
+    # Conversation history
+    if history_messages:
+        parts.append("[CONVERSATION HISTORY]")
+        for msg in history_messages:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            # Truncate long messages for prompt brevity
+            content = msg["content"]
+            if len(content) > 300:
+                content = content[:300] + "..."
+            parts.append(f"{role}: {content}")
+    
+    # Current question
+    parts.append(f"[CURRENT QUESTION]\nUser: {current_question}\nAssistant:")
+    
+    return "\n\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WRAPPER: run_query WITH MEMORY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_query_with_memory(question, session_id=None):
+    """
+    Wrapper around your original run_query() that adds conversation memory.
+    
+    Args:
+        question: User question
+        session_id: Optional session ID (creates new if None)
+    
+    Returns:
+        dict: Result with answer, session_id, history_length
+    """
+    # Create or use session
+    if session_id is None:
+        session_id = create_session()
+    
+    # Get current history BEFORE this question
+    history = get_history(session_id)
+    
+    # Build enhanced question with history context
+    # This gets injected into the prompt that your run_query() will use
+    enhanced_question = build_prompt_with_history(history, question)
+    
+    # Call YOUR ORIGINAL run_query() with enhanced question
+    # Your run_query() handles: embed → retrieve → LLM → answer
+    result = run_query(enhanced_question)
+    
+    # Store this exchange in memory (AFTER getting answer)
+    answer = result.get("answer", "")
+    add_exchange(session_id, question, answer)
+    
+    # Return original result + memory metadata
+    return {
+        "answer": answer,
+        "session_id": session_id,
+        "history_length": get_history_length(session_id),
+        "sources_used": result.get("sources_used", 0),
+        "confidence": result.get("confidence", 0),
+        "latency_ms": result.get("latency_ms", 0),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTERACTIVE CHAT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 60)
+    print("ECMC CHATBOT — Vector RAG with Memory")
+    print("=" * 60)
+    print("Commands: 'new' = fresh chat | 'exit' = quit")
+    print("-" * 60)
+    
+    session_id = None
+    
+    while True:
+        print()
+        user_input = input("You: ").strip()
+        
+        if user_input.lower() == "exit":
+            print("Goodbye!")
+            break
+        
+        if user_input.lower() == "new":
+            session_id = None
+            print("[New conversation started]")
+            continue
+        
+        if not user_input:
+            continue
+        
+        print("  [Thinking...]")
+        
+        # Call wrapper with memory
+        result = run_query_with_memory(user_input, session_id=session_id)
+        
+        # Capture session for next turn
+        session_id = result["session_id"]
+        
+        # Display
+        print(f"Bot: {result['answer']}")
+        print(f"     [Session: {session_id} | History: {result['history_length']} messages]")
+
+
+if __name__ == "__main__":
+    main()
+#########
+# session_memory.py
+
+"""
+session_memory.py — Sliding window conversation memory for ECMC RAG chatbot.
+
+Simple in-memory dict storage. Lost on process restart.
+For persistence across restarts, replace dict with Redis later.
+
+Usage:
+    from session_memory import create_session, get_history, add_exchange, format_history_for_prompt
+
+    session_id = create_session()
+    history = format_history_for_prompt(session_id)
+    add_exchange(session_id, question, answer)
+"""
+
+import uuid
+from collections import deque
+from typing import List, Dict, Optional
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MAX_MESSAGES = 10   # 5 Q&A pairs (user + assistant = 2 messages per turn)
+MAX_PAIRS = 5       # Convenience: 5 turns of conversation
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GLOBAL SESSION STORE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# session_id -> deque of message dicts
+# Each message: {"role": "user"|"assistant", "content": str}
+_session_store: Dict[str, deque] = {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUBLIC API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def create_session() -> str:
+    """
+    Generate a new session ID and initialize empty history.
+
+    Returns:
+        str: 8-character session ID (e.g., "a3f7b2d1")
+    """
+    session_id = str(uuid.uuid4())[:8]
+    _session_store[session_id] = deque(maxlen=MAX_MESSAGES)
+    return session_id
+
+
+def get_history(session_id: str) -> List[Dict[str, str]]:
+    """
+    Retrieve conversation history for a session.
+
+    Args:
+        session_id: The session ID returned by create_session()
+
+    Returns:
+        List of message dicts: [{"role": "user", "content": "..."}, ...]
+        Empty list if session not found.
+    """
+    if session_id not in _session_store:
+        _session_store[session_id] = deque(maxlen=MAX_MESSAGES)
+    return list(_session_store[session_id])
+
+
+def add_exchange(session_id: str, question: str, answer: str) -> None:
+    """
+    Append a Q&A pair to session history.
+    Automatically trims to MAX_MESSAGES via deque.
+
+    Args:
+        session_id: Session ID
+        question: User question
+        answer: Assistant answer
+    """
+    if session_id not in _session_store:
+        _session_store[session_id] = deque(maxlen=MAX_MESSAGES)
+
+    _session_store[session_id].append({"role": "user", "content": question})
+    _session_store[session_id].append({"role": "assistant", "content": answer})
+
+
+def get_history_length(session_id: str) -> int:
+    """
+    Return number of messages in session history.
+
+    Args:
+        session_id: Session ID
+
+    Returns:
+        int: Number of messages (0 if session not found)
+    """
+    if session_id not in _session_store:
+        return 0
+    return len(_session_store[session_id])
+
+
+def get_history_pairs(session_id: str) -> int:
+    """
+    Return number of Q&A pairs in session history.
+
+    Args:
+        session_id: Session ID
+
+    Returns:
+        int: Number of complete pairs (messages // 2)
+    """
+    return get_history_length(session_id) // 2
+
+
+def clear_session(session_id: str) -> None:
+    """
+    Remove a session from memory entirely.
+
+    Args:
+        session_id: Session ID to remove
+    """
+    _session_store.pop(session_id, None)
+
+
+def format_history_for_prompt(session_id: str) -> str:
+    """
+    Format history as string for LLM prompt.
+    Returns empty string if no history.
+
+    Args:
+        session_id: Session ID
+
+    Returns:
+        str: Formatted history block or empty string
+    """
+    history = get_history(session_id)
+    if not history:
+        return ""
+
+    lines = ["[CONVERSATION HISTORY]"]
+    for msg in history:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        # Truncate long messages for prompt brevity
+        content = msg["content"]
+        if len(content) > 300:
+            content = content[:300] + "..."
+        lines.append(f"{role}: {content}")
+
+    return "\n".join(lines)
+
+
+def list_active_sessions() -> List[str]:
+    """
+    Return list of all active session IDs.
+    Useful for debugging and monitoring.
+
+    Returns:
+        List[str]: All session IDs in memory
+    """
+    return list(_session_store.keys())
+
+
+def get_session_stats() -> Dict[str, any]:
+    """
+    Return statistics about all sessions.
+    Useful for debugging memory usage.
+
+    Returns:
+        Dict: {"total_sessions": int, "total_messages": int, "avg_messages_per_session": float}
+    """
+    total_sessions = len(_session_store)
+    total_messages = sum(len(d) for d in _session_store.values())
+    avg = total_messages / total_sessions if total_sessions > 0 else 0
+
+    return {
+        "total_sessions": total_sessions,
+        "total_messages": total_messages,
+        "avg_messages_per_session": round(avg, 2),
+    }
+#############
+#!/usr/bin/env python3
+"""
 chat_test.py — Interactive chat test for Vector RAG with memory
 
 Type your question and press Enter. Type 'exit' to quit.
