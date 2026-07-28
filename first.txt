@@ -1,3 +1,333 @@
+"""
+Reusable utilities for S3, Textract, logging, and document processing.
+"""
+
+import os
+import logging
+import time
+from typing import Dict, List, Optional, Any, Tuple
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
+
+# Import Config from config.py
+from config import Config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+class S3Manager:
+    """Handles all S3 operations (upload, download, list, validate)."""
+
+    def __init__(self, bucket_name: str, region: str = Config.AWS_REGION):
+        """Initialize S3 client."""
+        self.bucket_name = bucket_name
+        self.s3_client = boto3.client("s3", region_name=region)
+
+    def upload_file(
+        self,
+        local_file_path: str,
+        s3_key: str,
+        extra_args: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Upload a file to S3.
+
+        Args:
+            local_file_path: Local path of the file to upload.
+            s3_key: S3 key (path) where the file will be stored.
+            extra_args: Additional arguments (e.g., ACL, ContentType).
+
+        Returns:
+            bool: True if upload succeeded, False otherwise.
+        """
+        try:
+            self.s3_client.upload_file(
+                local_file_path,
+                self.bucket_name,
+                s3_key,
+                ExtraArgs=extra_args or {},
+            )
+            logger.info(f"Uploaded {local_file_path} to s3://{self.bucket_name}/{s3_key}")
+            return True
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to upload {local_file_path}: {e}")
+            return False
+
+    def download_file(self, s3_key: str, local_file_path: str) -> bool:
+        """
+        Download a file from S3.
+
+        Args:
+            s3_key: S3 key (path) of the file to download.
+            local_file_path: Local path to save the file.
+
+        Returns:
+            bool: True if download succeeded, False otherwise.
+        """
+        try:
+            self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
+            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} to {local_file_path}")
+            return True
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to download {s3_key}: {e}")
+            return False
+
+    def list_objects(self, prefix: str = "") -> List[str]:
+        """
+        List all objects under a prefix in the S3 bucket.
+
+        Args:
+            prefix: S3 prefix to filter objects.
+
+        Returns:
+            List[str]: List of S3 keys (paths).
+        """
+        try:
+            paginator = self.s3_client.get_paginator("list_objects_v2")
+            objects = []
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
+                objects.extend([obj["Key"] for obj in page.get("Contents", [])])
+            return objects
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to list objects: {e}")
+            return []
+
+    def validate_path(self, s3_key: str) -> bool:
+        """
+        Validate if an S3 object exists.
+
+        Args:
+            s3_key: S3 key (path) to validate.
+
+        Returns:
+            bool: True if the object exists, False otherwise.
+        """
+        try:
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            return True
+        except (ClientError, BotoCoreError):
+            return False
+
+class TextractManager:
+    """Handles Amazon Textract operations (job management, result parsing)."""
+
+    def __init__(self, region: str = Config.AWS_REGION):
+        """Initialize Textract client."""
+        self.textract_client = boto3.client("textract", region_name=region)
+
+    def start_document_analysis(
+        self,
+        s3_key: str,
+        features: List[str] = Config.TEXTRACT_FEATURES,
+    ) -> str:
+        """
+        Start a Textract document analysis job.
+
+        Args:
+            s3_key: S3 key of the document to analyze.
+            features: List of Textract features to enable (e.g., ["FORMS", "TABLES"]).
+
+        Returns:
+            str: Job ID for tracking the analysis.
+        """
+        try:
+            response = self.textract_client.start_document_analysis(
+                DocumentLocation={
+                    "S3Object": {
+                        "Bucket": Config.S3_CONFIG["bucket_name"],
+                        "Name": s3_key,
+                    }
+                },
+                FeatureTypes=features,
+            )
+            job_id = response["JobId"]
+            logger.info(f"Started Textract job {job_id} for {s3_key}")
+            return job_id
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to start Textract job for {s3_key}: {e}")
+            raise
+
+    def get_job_status(self, job_id: str) -> str:
+        """
+        Get the status of a Textract job.
+
+        Args:
+            job_id: Textract job ID.
+
+        Returns:
+            str: Job status (e.g., "SUCCEEDED", "FAILED", "IN_PROGRESS").
+        """
+        try:
+            response = self.textract_client.get_document_analysis(JobId=job_id)
+            return response["JobStatus"]
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to get job status for {job_id}: {e}")
+            raise
+
+    def wait_for_job_completion(self, job_id: str, max_retries: int = 30, delay: int = 5) -> bool:
+        """
+        Poll Textract job status until completion.
+
+        Args:
+            job_id: Textract job ID.
+            max_retries: Maximum number of retries.
+            delay: Delay between retries in seconds.
+
+        Returns:
+            bool: True if job succeeded, False otherwise.
+        """
+        for _ in range(max_retries):
+            status = self.get_job_status(job_id)
+            if status == "SUCCEEDED":
+                logger.info(f"Textract job {job_id} succeeded.")
+                return True
+            elif status == "FAILED":
+                logger.error(f"Textract job {job_id} failed.")
+                return False
+            logger.info(f"Job {job_id} status: {status}. Retrying in {delay} seconds...")
+            time.sleep(delay)
+        logger.error(f"Textract job {job_id} timed out after {max_retries * delay} seconds.")
+        return False
+
+    def get_job_results(self, job_id: str) -> Dict[str, Any]:
+        """
+        Retrieve results from a completed Textract job.
+
+        Args:
+            job_id: Textract job ID.
+
+        Returns:
+            Dict[str, Any]: Parsed Textract response.
+        """
+        try:
+            response = self.textract_client.get_document_analysis(JobId=job_id)
+            return response
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to get results for job {job_id}: {e}")
+            raise
+
+    @staticmethod
+    def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[str, str]:
+        """
+        Parse Textract blocks into plain text and Markdown.
+        Preserves reading order, headings, tables, and lists.
+
+        Args:
+            blocks: List of Textract blocks.
+
+        Returns:
+            Tuple[str, str]: (plain_text, markdown_text)
+        """
+        plain_text = []
+        markdown_text = []
+
+        # Sort blocks by their position (top to bottom, left to right)
+        sorted_blocks = sorted(
+            blocks,
+            key=lambda x: (
+                x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0),
+                x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0),
+            ),
+        )
+
+        for block in sorted_blocks:
+            block_type = block["BlockType"]
+            text = block.get("Text", "")
+
+            if block_type == "LINE" or block_type == "WORD":
+                plain_text.append(text)
+                markdown_text.append(text)
+            elif block_type == "TABLE":
+                # Placeholder: Extract table as Markdown (simplified)
+                table_md = TextractManager._parse_table(block, sorted_blocks)
+                plain_text.append("[TABLE]")
+                markdown_text.append(table_md)
+            elif block_type == "KEY_VALUE_SET":
+                # Placeholder: Format key-value pairs
+                key = block.get("Key", {}).get("Text", "")
+                value = block.get("Value", {}).get("Text", "")
+                plain_text.append(f"{key}: {value}")
+                markdown_text.append(f"**{key}**: {value}")
+            elif block_type == "SELECTION_ELEMENT":
+                # Placeholder: Format selection elements (e.g., checkboxes)
+                if block.get("SelectionStatus") == "SELECTED":
+                    plain_text.append(f"[x] {text}")
+                    markdown_text.append(f"- [x] {text}")
+                else:
+                    plain_text.append(f"[ ] {text}")
+                    markdown_text.append(f"- [ ] {text}")
+
+        return "\n".join(plain_text), "\n".join(markdown_text)
+
+    @staticmethod
+    def _parse_table(table_block: Dict[str, Any], all_blocks: List[Dict[str, Any]]) -> str:
+        """
+        Parse a Textract TABLE block into Markdown.
+
+        Args:
+            table_block: Textract TABLE block.
+            all_blocks: All blocks in the document (for resolving relationships).
+
+        Returns:
+            str: Markdown-formatted table.
+        """
+        # Find all cells in the table
+        cells = []
+        for rel in table_block.get("Relationships", []):
+            if rel["Type"] == "CHILD":
+                for cell_id in rel["Ids"]:
+                    cell = next((b for b in all_blocks if b["Id"] == cell_id), None)
+                    if cell:
+                        cells.append(cell)
+
+        # Sort cells by row and column indices
+        cells.sort(key=lambda x: (x.get("RowIndex", 0), x.get("ColumnIndex", 0)))
+
+        # Extract text from each cell
+        rows = []
+        current_row = []
+        prev_row_index = None
+        for cell in cells:
+            row_index = cell.get("RowIndex", 0)
+            if row_index != prev_row_index and current_row:
+                rows.append(current_row)
+                current_row = []
+            prev_row_index = row_index
+
+            # Get cell text (from child blocks)
+            cell_text = []
+            for rel in cell.get("Relationships", []):
+                if rel["Type"] == "CHILD":
+                    for content_id in rel["Ids"]:
+                        content_block = next(
+                            (b for b in all_blocks if b["Id"] == content_id), None
+                        )
+                        if content_block and content_block["BlockType"] in ["LINE", "WORD"]:
+                            cell_text.append(content_block.get("Text", ""))
+            current_row.append(" | ".join(cell_text))
+        if current_row:
+            rows.append(current_row)
+
+        # Format as Markdown table
+        if not rows:
+            return ""
+
+        markdown_table = []
+        markdown_table.append("| " + " | ".join(rows[0]) + " |")
+        markdown_table.append("|" + "|".join(["---"] * len(rows[0])) + "|")
+        for row in rows[1:]:
+            markdown_table.append("| " + " | ".join(row) + " |")
+
+        return "\n".join(markdown_table)
+
+
+
+
+#################
 # AWS Configuration 📄 1. .env (Environment Variables)
 AWS_REGION=us-east-1
 S3_BUCKET_NAME=bankrupcy-data-bkt
