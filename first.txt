@@ -1,3 +1,50 @@
+def process_pdf(self, s3_key: str) -> None:
+    """
+    Process a single PDF file from S3.
+    Extracts content using Textract, generates Markdown and text outputs,
+    and saves them to the correct S3 path.
+    """
+    logger.info(f"Processing PDF: {s3_key}")
+
+    # Step 1: Start Textract job
+    job_id = self.textract_manager.start_document_analysis(s3_key)
+    if not self.textract_manager.wait_for_job_completion(job_id):
+        logger.error(f"Textract job {job_id} failed or timed out for {s3_key}")
+        return
+
+    # Step 2: Retrieve and parse results
+    results = self.textract_manager.get_job_results(job_id)
+    blocks = results.get("Blocks", [])
+    plain_text, markdown = TextractManager.parse_blocks(blocks)
+
+    # Step 3: Generate output filenames
+    base_name = os.path.splitext(os.path.basename(s3_key))[0]
+
+    # ✅ FIX: Use the full textract_output path (remove s3://bucket_name/ prefix)
+    textract_output_path = Config.S3_CONFIG["textract_output"].replace(
+        f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
+    )
+    output_key_base = f"{textract_output_path}{base_name}"
+
+    # Step 4: Save outputs to S3
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as txt_file:
+        txt_file.write(plain_text)
+        txt_file_path = txt_file.name
+
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".md", delete=False) as md_file:
+        md_file.write(markdown)
+        md_file_path = md_file.name
+
+    # Upload to S3 with the correct full path
+    self.s3_manager.upload_file(txt_file_path, f"{output_key_base}.txt")
+    self.s3_manager.upload_file(md_file_path, f"{output_key_base}.md")
+
+    # Clean up temp files
+    os.unlink(txt_file_path)
+    os.unlink(md_file_path)
+
+    logger.info(f"Successfully processed and saved outputs to {output_key_base}")
+#########
 """
 Reusable utilities for S3, Textract, logging, and document processing.
 """
