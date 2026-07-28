@@ -1,3 +1,150 @@
+from typing import List, Dict, Optional
+from Embedding_Pipeline import generate_embedding  # Your existing embedding function
+import faiss
+import faiss
+import os
+import json
+import numpy as np
+
+class SessionManager:
+    """
+    Manages sliding window session memory for a chatbot.
+   
+    Attributes:
+        window_size (int): Maximum number of interactions to retain (default: 5).
+        history (List[Dict[str, str]]): List of past interactions in the format:
+            [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+    """
+   
+    def __init__(self, window_size: int = 5):
+        """Initialize the session manager with a fixed window size."""
+        self.window_size = window_size
+        self.history: List[Dict[str, str]] = []
+   
+    def add_interaction(self, role: str, content: str) -> None:
+        """
+        Add a user or assistant interaction to the sliding window.
+        Trims the history to the last `window_size` interactions.
+       
+        Args:
+            role (str): Either "user" or "assistant".
+            content (str): The text content of the interaction.
+        """
+        self.history.append({"role": role, "content": content})
+        # Trim to the last `window_size` interactions
+        if len(self.history) > self.window_size:
+            self.history = self.history[-self.window_size:]
+   
+    def get_contextual_query(self, current_query: str) -> str:
+        """
+        Prepend the session history to the current query for context.
+       
+        Args:
+            current_query (str): The current user query.
+           
+        Returns:
+            str: The contextual query with history prepended.
+        """
+        context = "\n".join(
+            [f"{msg['role']}: {msg['content']}" for msg in self.history]
+        )
+        return f"{context}\nuser: {current_query}"
+   
+    def reset_session(self) -> str:
+        """
+        Clear the session history and return a confirmation message.
+       
+        Returns:
+            str: Confirmation message for the user.
+        """
+        self.history = []
+        return "New conversation started. Memory cleared."
+   
+    def is_new_session_command(self, user_input: str) -> bool:
+        """
+        Check if the user input is a command to start a new session.
+       
+        Args:
+            user_input (str): The raw user input.
+           
+        Returns:
+            bool: True if the input is a new session command.
+        """
+        new_session_commands = {"/new", "/reset", "start over", "new chat", "clear memory"}
+        return user_input.lower().strip() in new_session_commands
+
+
+# Example Usage with Your Chatbot Pipeline
+# -----------------------------------------
+
+# Initialize the session manager (typically done once per user session)
+session_manager = SessionManager(window_size=5)
+
+
+def handle_user_query(user_input: str, session_manager: SessionManager) -> str:
+    """Process a user query with sliding window session memory."""
+    # Check for new session command
+    if session_manager.is_new_session_command(user_input):
+        return session_manager.reset_session()
+
+    # Get contextual query with history
+    contextual_query = session_manager.get_contextual_query(user_input)
+
+    # --- YOUR RAG PIPELINE ---
+    # 1. Generate embedding for the contextual query
+    # TITAN_EMBEDDING_MODEL = os.getenv('TITAN_EMBEDDING_MODEL')
+    TITAN_EMBEDDING_MODEL="amazon.titan-embed-g1-text-02"
+    embedding = generate_embedding(contextual_query, TITAN_EMBEDDING_MODEL)
+
+    # 2. Load FAISS index and metadata
+    # VECTORIZING_PATH = os.getenv('VECTORIZING_PATH')
+    import faiss
+    VECTORIZING_PATH = r"/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/Untitled Folder/vectorless rag/demo/Session memory/vectorising"
+    index = faiss.read_index(os.path.join(VECTORIZING_PATH, "vector_index.faiss"))
+    with open(os.path.join(VECTORIZING_PATH, "vector_index_metadata.json"), 'r') as f:
+        metadata = json.load(f)
+
+    # 3. Search FAISS index
+    distances, indices = index.search(np.array([embedding]), k=3)
+
+    # 4. Format the response
+    assistant_response = ""
+    for i, (idx, distance) in enumerate(zip(indices[0], distances[0])):
+        chunk_metadata = metadata[idx]
+        assistant_response += f"Result {i+1} (Distance: {distance:.4f}):\n"
+        assistant_response += f"Source: {chunk_metadata['source_file']}\n"
+        assistant_response += f"Chunk: {chunk_metadata['chunk_text'][:200]}...\n\n"
+
+    # Add the interaction to the session history
+    session_manager.add_interaction("user", user_input)
+    session_manager.add_interaction("assistant", assistant_response)
+
+    return assistant_response
+
+
+
+
+from Sliding_Window_Session_Memory_Integration import SessionManager, handle_user_query
+
+# Initialize session manager
+session_manager = SessionManager(window_size=5)
+print("🤖 Chatbot ready! Type '/new' to reset. Type 'exit' to quit.\n")
+
+# Start chat loop
+while True:
+    try:
+        user_input = input("👤 User: ")
+        if user_input.lower() in ["exit", "quit", "bye"]:
+            print("🤖 Assistant: Goodbye!")
+            break
+
+        response = handle_user_query(user_input, session_manager)
+        print(f"🤖 Assistant:\n{response}\n")
+
+    except KeyboardInterrupt:
+        print("\n🤖 Assistant: Goodbye!")
+        break
+##############
 import os
 import re
 import boto3
