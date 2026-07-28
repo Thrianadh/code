@@ -1,3 +1,362 @@
+#!/usr/bin/env python3
+"""
+memory.py — Simple sliding window conversation memory
+
+Usage:
+    from memory import ChatMemory
+    
+    memory = ChatMemory()
+    session_id = memory.create_session()
+    
+    history = memory.get_history(session_id)
+    memory.add_exchange(session_id, "What is rehab?", "Rehab is...")
+    
+    # Build prompt with history
+    prompt = memory.build_prompt(session_id, "How long does it take?", "Context: ...")
+"""
+
+import uuid
+from collections import deque
+from typing import List, Dict, Optional
+
+
+class ChatMemory:
+    """Simple in-memory chat history with sliding window."""
+    
+    # Configuration
+    MAX_PAIRS = 5      # 5 Q&A pairs = 10 messages
+    MAX_MESSAGES = MAX_PAIRS * 2
+    
+    def __init__(self):
+        self._sessions: Dict[str, deque] = {}
+    
+    def create_session(self) -> str:
+        """Create new chat session. Returns session ID."""
+        session_id = str(uuid.uuid4())[:8]
+        self._sessions[session_id] = deque(maxlen=self.MAX_MESSAGES)
+        return session_id
+    
+    def get_history(self, session_id: str) -> List[Dict[str, str]]:
+        """Get conversation history for a session."""
+        if session_id not in self._sessions:
+            self._sessions[session_id] = deque(maxlen=self.MAX_MESSAGES)
+        return list(self._sessions[session_id])
+    
+    def add_exchange(self, session_id: str, question: str, answer: str) -> None:
+        """Add Q&A pair to session history."""
+        if session_id not in self._sessions:
+            self._sessions[session_id] = deque(maxlen=self.MAX_MESSAGES)
+        
+        self._sessions[session_id].append({
+            "role": "user", 
+            "content": question[:500]  # Limit length
+        })
+        self._sessions[session_id].append({
+            "role": "assistant", 
+            "content": answer[:500]
+        })
+    
+    def build_prompt(self, session_id: str, current_question: str, context: str = "") -> str:
+        """
+        Build prompt with history + context + current question.
+        
+        Args:
+            session_id: Session ID
+            current_question: User's current question
+            context: Retrieved context from RAG (optional)
+        
+        Returns:
+            str: Complete prompt for LLM
+        """
+        parts = []
+        
+        # System instruction
+        parts.append(
+            "You are an ECMC customer service agent. "
+            "Answer based on the provided context and conversation history. "
+            "Be concise and accurate."
+        )
+        
+        # Retrieved context (from RAG)
+        if context:
+            parts.append(f"[CONTEXT]\n{context}")
+        
+        # Conversation history
+        history = self.get_history(session_id)
+        if history:
+            parts.append("[CONVERSATION HISTORY]")
+            for msg in history:
+                role = "User" if msg["role"] == "user" else "Assistant"
+                parts.append(f"{role}: {msg['content']}")
+        
+        # Current question
+        parts.append(f"[CURRENT QUESTION]\nUser: {current_question}\nAssistant:")
+        
+        return "\n\n".join(parts)
+    
+    def get_stats(self, session_id: str) -> Dict:
+        """Get session statistics."""
+        history = self.get_history(session_id)
+        return {
+            "session_id": session_id,
+            "message_count": len(history),
+            "pair_count": len(history) // 2,
+            "is_full": len(history) >= self.MAX_MESSAGES,
+        }
+    
+    def clear_session(self, session_id: str) -> None:
+        """Remove session from memory."""
+        self._sessions.pop(session_id, None)
+    
+    def list_sessions(self) -> List[str]:
+        """List all active session IDs."""
+        return list(self._sessions.keys())
+# memory.py — add this method to ChatMemory class
+
+def build_prompt(self, session_id: str, current_question: str, 
+                 context: str = "", system_prompt: str = None) -> str:
+    """
+    Build complete prompt with system + context + history + question.
+    
+    Args:
+        session_id: Session ID
+        current_question: User's current question
+        context: Retrieved context (from Vector or Vectorless RAG)
+        system_prompt: Optional custom system instruction
+    
+    Returns:
+        str: Complete prompt for LLM
+    """
+    if system_prompt is None:
+        system_prompt = (
+            "You are an ECMC customer service agent specializing in "
+            "student loans, bankruptcy, and default resolution. "
+            "Answer based on the provided context and conversation history. "
+            "If the answer is not in the context, say 'I don't have that information.'"
+        )
+    
+    parts = [f"[SYSTEM]\n{system_prompt}"]
+    
+    # Retrieved context (Vector chunks OR Vectorless docs)
+    if context:
+        parts.append(f"[RETRIEVED CONTEXT]\n{context}")
+    
+    # Conversation history
+    history = self.get_history(session_id)
+    if history:
+        parts.append("[CONVERSATION HISTORY]")
+        for msg in history:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            content = msg["content"]
+            if len(content) > 300:
+                content = content[:300] + "..."
+            parts.append(f"{role}: {content}")
+    
+    # Current question
+    parts.append(f"[CURRENT QUESTION]\nUser: {current_question}\nAssistant:")
+    
+    return "\n\n".join(parts)
+
+###########
+#Implementation: Router with Memory
+
+# chat_router.py — Unified entry point with memory
+
+from memory import ChatMemory
+from vector_rag import run_query as vector_rag_query      # Your vector RAG
+from vectorless_rag import run_query as vectorless_query  # Your vectorless RAG
+
+memory = ChatMemory()
+
+def chat(question: str, system_type: str = "vector", session_id: str = None):
+    """
+    Unified chat with memory. Routes to Vector or Vectorless RAG.
+    
+    Args:
+        question: User question
+        system_type: "vector" or "vectorless"
+        session_id: None = new session, string = continue session
+    
+    Returns:
+        dict: {answer, session_id, sources, latency, system_used}
+    """
+    # Create or use session
+    if not session_id:
+        session_id = memory.create_session()
+    
+    # Get conversation history
+    history = memory.get_history(session_id)
+    
+    # ── RETRIEVE CONTEXT (different per system) ──
+    if system_type == "vector":
+        # Vector RAG: Embed → FAISS → chunks
+        context_chunks = vector_rag_query.retrieve(question)  # Just retrieval, no LLM
+        context = format_chunks(context_chunks)
+        
+    elif system_type == "vectorless":
+        # Vectorless RAG: Keywords → Tree/Term index → docs
+        context_docs = vectorless_query.retrieve(question)  # Just retrieval, no LLM
+        context = format_docs(context_docs)
+        
+    else:
+        raise ValueError(f"Unknown system: {system_type}")
+    
+    # ── BUILD PROMPT WITH MEMORY + CONTEXT ──
+    prompt = memory.build_prompt(
+        session_id=session_id,
+        current_question=question,
+        context=context
+    )
+    
+    # ── CALL LLM (shared) ──
+    answer = call_bedrock(prompt)  # Your LLM call
+    
+    # ── STORE IN MEMORY ──
+    memory.add_exchange(session_id, question, answer)
+    
+    return {
+        "answer": answer,
+        "session_id": session_id,
+        "system_used": system_type,
+        "history_pairs": len(history) // 2,
+    }
+
+
+def format_chunks(chunks: list) -> str:
+    """Format vector RAG chunks for prompt."""
+    parts = ["[RETRIEVED DOCUMENT CHUNKS]"]
+    for i, chunk in enumerate(chunks, 1):
+        parts.append(f"Source {i}: {chunk['text'][:500]}...")
+    return "\n\n".join(parts)
+
+
+def format_docs(docs: list) -> str:
+    """Format vectorless RAG documents for prompt."""
+    parts = ["[RETRIEVED DOCUMENTS]"]
+    for i, doc in enumerate(docs, 1):
+        parts.append(f"Doc {i}: {doc['title']}\n{doc['content'][:500]}...")
+    return "\n\n".join(parts)
+##########
+#For Vector RAG
+# vector_rag.py
+
+def retrieve(question: str, k: int = 5) -> list:
+    """
+    Retrieve only — no LLM call. Returns chunks for prompt building.
+    """
+    # 1. Embed query
+    embedding = get_embedding(question)
+    
+    # 2. FAISS search
+    distances, indices = index.search(embedding, k)
+    
+    # 3. Return chunks with metadata
+    chunks = []
+    for idx in indices[0]:
+        chunk = metadata[idx]
+        chunks.append({
+            "text": chunk["text"],
+            "source": chunk.get("source", "unknown"),
+            "score": float(distances[0][list(indices[0]).index(idx)])
+        })
+    return chunks
+
+def generate(prompt: str) -> str:
+    """
+    LLM only — no retrieval. Called after prompt is built with memory.
+    """
+    response = bedrock.converse(
+        modelId="amazon.nova-lite-v1:0",
+        messages=[{"role": "user", "content": [{"text": prompt}]}]
+    )
+    return response["output"]["message"]["content"][0]["text"]
+
+# Legacy wrapper (optional)
+def run_query(question: str):
+    """Old way — retrieve + generate in one call."""
+    chunks = retrieve(question)
+    context = "\n\n".join(c["text"] for c in chunks)
+    prompt = f"{context}\n\nQuestion: {question}"
+    return generate(prompt)
+#########
+#for vectorless rag
+# vectorless_rag.py
+
+def retrieve(question: str, max_docs: int = 5) -> list:
+    """
+    Retrieve only — no LLM call. Returns documents from tree/term index.
+    """
+    # 1. Extract keywords
+    keywords = extract_keywords(question)
+    
+    # 2. Search term index / tree index
+    matched_terms = []
+    for kw in keywords:
+        if kw in term_index:
+            matched_terms.extend(term_index[kw])
+    
+    # 3. Deduplicate and rank
+    docs = rank_by_relevance(matched_terms, question)
+    return docs[:max_docs]
+
+def generate(prompt: str) -> str:
+    """Same as vector RAG — shared LLM call."""
+    # ... same bedrock.converse call ...
+
+# Legacy wrapper
+def run_query(question: str):
+    """Old way."""
+    docs = retrieve(question)
+    context = format_docs(docs)
+    prompt = f"{context}\n\nQuestion: {question}"
+    return generate(prompt)
+####
+# compare_rag_systems.py
+
+from chat_router import chat
+
+test_questions = [
+    # Session 1: Vector RAG
+    {"q": "What is loan rehabilitation?", "system": "vector", "session": None},
+    {"q": "How long does it take?", "system": "vector", "session": "SAME"},  # Continue
+    
+    # Session 2: Vectorless RAG  
+    {"q": "What is loan rehabilitation?", "system": "vectorless", "session": None},
+    {"q": "How long does it take?", "system": "vectorless", "session": "SAME"},
+    
+    # Session 3: Mixed — start Vector, follow-up Vectorless
+    {"q": "What is Title IV eligibility?", "system": "vector", "session": None},
+    {"q": "How do I get a T4 letter?", "system": "vectorless", "session": "SAME"},
+]
+
+sessions = {}  # Track session IDs
+
+for test in test_questions:
+    q = test["q"]
+    system = test["system"]
+    
+    # Get session ID (new or continue)
+    if test["session"] == "SAME":
+        session_id = sessions.get(last_key)
+    else:
+        session_id = None
+    
+    print(f"\n{'='*60}")
+    print(f"System: {system.upper()} | Session: {session_id or 'NEW'}")
+    print(f"Question: {q}")
+    print(f"{'='*60}")
+    
+    result = chat(q, system_type=system, session_id=session_id)
+    
+    # Store for next "SAME"
+    last_key = f"{system}_{test['session']}"
+    sessions[last_key] = result["session_id"]
+    
+    print(f"Answer: {result['answer'][:100]}...")
+    print(f"Session: {result['session_id']} | History: {result['history_pairs']} pairs")
+##############
+
+############
 from typing import List, Dict, Optional
 from Embedding_Pipeline import generate_embedding  # Your existing embedding function
 import faiss
