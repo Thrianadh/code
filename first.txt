@@ -1,3 +1,434 @@
+"""
+Enhanced Textract Post-Processor for ECMC Financial Documents.
+Fixes:
+- Fragmented text (groups into paragraphs)
+- Missing structure (detects headings/tables)
+- Layout issues (sorts by reading order)
+- Metadata gaps (preserves page, bbox, etc.)
+"""
+
+import os
+import re
+import json
+import logging
+import boto3
+from typing import List, Dict, Any, Optional, Tuple
+from config import Config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+class EnhancedTextractPostProcessor:
+    """Post-processes Textract output into structured, high-quality blocks."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.s3_client = boto3.client(
+            "s3",
+            region_name=config.AWS_REGION
+        )
+        self.textract_client = boto3.client(
+            "textract",
+            region_name=config.AWS_REGION
+        )
+
+    def process_pdf(self, s3_key: str) -> Dict[str, Any]:
+        """
+        Process a PDF from S3 using Textract and post-process into structured blocks.
+        Args:
+            s3_key: S3 key of the PDF (e.g., "ecmc_org/RAG/Source_data/loan_agreement.pdf").
+        Returns:
+            {
+                "document_id": str,
+                "blocks": List[Dict[str, Any]]  # Structured blocks with metadata
+            }
+        """
+        document_id = os.path.splitext(os.path.basename(s3_key))[0]
+        local_path = self._download_to_temp(s3_key)
+
+        try:
+            logger.info(f"Processing PDF: {s3_key}")
+
+            # Step 1: Call Textract
+            with open(local_path, "rb") as f:
+                response = self.textract_client.analyze_document(
+                    Document={"Bytes": f.read()},
+                    FeatureTypes=["TABLES", "FORMS", "LAYOUT"]
+                )
+
+            # Step 2: Post-process Textract output
+            blocks = self._post_process_textract(response, document_id)
+
+            return {
+                "document_id": document_id,
+                "blocks": blocks
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to process {s3_key}: {e}", exc_info=True)
+            raise
+        finally:
+            if os.path.exists(local_path):
+                os.unlink(local_path)
+
+    def _download_to_temp(self, s3_key: str) -> str:
+        """Download file from S3 to a temporary location."""
+        bucket = self.config.S3_CONFIG["bucket_name"]
+        local_path = f"/tmp/{os.path.basename(s3_key)}"
+        try:
+            self.s3_client.download_file(bucket, s3_key, local_path)
+            return local_path
+        except Exception as e:
+            logger.error(f"Failed to download {s3_key}: {e}")
+            raise
+
+    def _post_process_textract(self, textract_json: Dict[str, Any], document_id: str) -> List[Dict[str, Any]]:
+        """
+        Post-process Textract JSON into structured blocks.
+        Steps:
+        1. Group WORDs into LINEs, then LINEs into PARAGRAPHs.
+        2. Detect HEADINGS from LINEs (heuristics + layout).
+        3. Parse TABLEs from CELL blocks.
+        4. Sort all blocks by reading order (top-to-bottom, left-to-right).
+        """
+        # Group blocks by type
+        words = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "WORD"]
+        lines = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "LINE"]
+        tables = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "TABLE"]
+        cells = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "CELL"]
+
+        # Step 1: Group words into lines (Textract may split lines into words)
+        grouped_lines = self._group_words_into_lines(words, lines)
+
+        # Step 2: Group lines into paragraphs
+        paragraphs = self._group_lines_into_paragraphs(grouped_lines)
+
+        # Step 3: Detect headings from lines
+        headings = self._detect_headings(grouped_lines)
+
+        # Step 4: Parse tables
+        parsed_tables = self._parse_tables(tables, cells, textract_json)
+
+        # Step 5: Combine all blocks
+        blocks = headings + parsed_tables + paragraphs
+
+        # Step 6: Sort by reading order (using bounding boxes)
+        blocks = self._sort_by_reading_order(blocks)
+
+        # Step 7: Assign final metadata (positions, chunk IDs)
+        for i, block in enumerate(blocks):
+            block["metadata"]["position"] = i
+            block["metadata"]["chunk_id"] = f"{document_id}_{block['type']}_{i}"
+
+        return blocks
+
+    def _group_words_into_lines(self, words: List[Dict[str, Any]], existing_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Group WORD blocks into LINE blocks (Textract may split lines into words).
+        Uses bounding box Y-coordinates to group words horizontally.
+        """
+        if existing_lines:
+            # If Textract already provides lines, use them
+            return existing_lines
+
+        # Group words by Y-coordinate (same line = similar Y)
+        lines = []
+        word_groups = {}
+        for word in words:
+            y = word["Geometry"]["BoundingBox"]["Top"]
+            if y not in word_groups:
+                word_groups[y] = []
+            word_groups[y].append(word)
+
+        # Sort groups by Y, then X
+        for y, group in word_groups.items():
+            group.sort(key=lambda w: w["Geometry"]["BoundingBox"]["Left"])
+            line_text = " ".join(w["Text"] for w in group)
+            # Use the first word's bbox as the line's bbox
+            first_word = group[0]
+            lines.append({
+                "BlockType": "LINE",
+                "Text": line_text,
+                "Geometry": first_word["Geometry"],
+                "Page": first_word["Page"],
+                "Id": f"line_{y}"  # Temporary ID
+            })
+
+        return lines
+
+    def _group_lines_into_paragraphs(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Group LINE blocks into PARAGRAPH blocks.
+        Uses bounding box Y-coordinates to group lines vertically.
+        """
+        if not lines:
+            return []
+
+        # Sort lines by Y, then X
+        lines.sort(key=lambda l: (
+            l["Geometry"]["BoundingBox"]["Top"],
+            l["Geometry"]["BoundingBox"]["Left"]
+        ))
+
+        paragraphs = []
+        current_para = {
+            "type": "text",
+            "content": "",
+            "metadata": {
+                "page": lines[0]["Page"],
+                "bbox": [
+                    lines[0]["Geometry"]["BoundingBox"]["Left"],
+                    lines[0]["Geometry"]["BoundingBox"]["Top"],
+                    lines[0]["Geometry"]["BoundingBox"]["Width"],
+                    lines[0]["Geometry"]["BoundingBox"]["Height"]
+                ],
+                "lines": []
+            }
+        }
+
+        for line in lines:
+            # Check if this line is on the same "paragraph" (Y distance < threshold)
+            y_diff = line["Geometry"]["BoundingBox"]["Top"] - current_para["metadata"]["bbox"][1]
+            if y_diff > 0.05:  # Threshold: 5% of page height = new paragraph
+                if current_para["content"].strip():
+                    paragraphs.append(current_para)
+                current_para = {
+                    "type": "text",
+                    "content": line["Text"] + " ",
+                    "metadata": {
+                        "page": line["Page"],
+                        "bbox": [
+                            line["Geometry"]["BoundingBox"]["Left"],
+                            line["Geometry"]["BoundingBox"]["Top"],
+                            line["Geometry"]["BoundingBox"]["Width"],
+                            line["Geometry"]["BoundingBox"]["Height"]
+                        ],
+                        "lines": [line["Text"]]
+                    }
+                }
+            else:
+                current_para["content"] += line["Text"] + " "
+                current_para["metadata"]["lines"].append(line["Text"])
+                # Expand bbox to include this line
+                current_para["metadata"]["bbox"] = [
+                    min(current_para["metadata"]["bbox"][0], line["Geometry"]["BoundingBox"]["Left"]),
+                    min(current_para["metadata"]["bbox"][1], line["Geometry"]["BoundingBox"]["Top"]),
+                    max(current_para["metadata"]["bbox"][0] + current_para["metadata"]["bbox"][2],
+                        line["Geometry"]["BoundingBox"]["Left"] + line["Geometry"]["BoundingBox"]["Width"]),
+                    max(current_para["metadata"]["bbox"][1] + current_para["metadata"]["bbox"][3],
+                        line["Geometry"]["BoundingBox"]["Top"] + line["Geometry"]["BoundingBox"]["Height"])
+                ]
+
+        if current_para["content"].strip():
+            paragraphs.append(current_para)
+
+        # Clean up content (remove extra spaces)
+        for para in paragraphs:
+            para["content"] = re.sub(r'\s+', ' ', para["content"]).strip()
+
+        return paragraphs
+
+    def _detect_headings(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Detect headings from LINE blocks using heuristics:
+        - Short lines (< 10 words)
+        - All caps or title case
+        - Numbered (e.g., "1.", "A.")
+        - Bold/large font (if Textract provides font info)
+        """
+        headings = []
+        for line in lines:
+            text = line["Text"].strip()
+            if not text:
+                continue
+
+            # Heuristic 1: Short lines (likely headings)
+            if len(text.split()) <= 8:
+                # Heuristic 2: Starts with a number/letter (e.g., "1.", "A.")
+                if re.match(r'^[0-9A-Za-z]\.\s', text) or re.match(r'^[IVXivx]+\.\s', text):
+                    headings.append({
+                        "type": "heading",
+                        "content": text,
+                        "metadata": {
+                            "page": line["Page"],
+                            "bbox": self._normalize_bbox(line["Geometry"]["BoundingBox"]),
+                            "level": self._guess_heading_level(text)
+                        }
+                    })
+                    continue
+
+                # Heuristic 3: All caps or title case
+                if text.isupper() or text.istitle():
+                    headings.append({
+                        "type": "heading",
+                        "content": text,
+                        "metadata": {
+                            "page": line["Page"],
+                            "bbox": self._normalize_bbox(line["Geometry"]["BoundingBox"]),
+                            "level": self._guess_heading_level(text)
+                        }
+                    })
+                    continue
+
+        return headings
+
+    def _guess_heading_level(self, text: str) -> int:
+        """Guess heading level (1-6) from text."""
+        if re.match(r'^#\s', text):
+            return 1
+        elif re.match(r'^##\s', text):
+            return 2
+        elif re.match(r'^[0-9]+\.\s', text):
+            return 1  # Assume top-level if numbered
+        elif text.isupper():
+            return 1
+        else:
+            return 2  # Default to level 2
+
+    def _parse_tables(self, tables: List[Dict[str, Any]], cells: List[Dict[str, Any]], textract_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Parse TABLE blocks into structured tables with headers/rows.
+        Uses CELL blocks to reconstruct table content.
+        """
+        parsed_tables = []
+        for table in tables:
+            # Get all cells in this table
+            cell_ids = []
+            for rel in table.get("Relationships", []):
+                if rel["Type"] == "CHILD":
+                    cell_ids.extend(rel["Ids"])
+
+            # Map cell IDs to cell blocks
+            cell_map = {c["Id"]: c for c in cells if c["Id"] in cell_ids}
+
+            # Group cells by row
+            rows = {}
+            for cell_id in cell_ids:
+                if cell_id in cell_map:
+                    cell = cell_map[cell_id]
+                    row_idx = cell.get("RowIndex", 0)
+                    if row_idx not in rows:
+                        rows[row_idx] = []
+                    rows[row_idx].append(cell)
+
+            # Sort rows by RowIndex, then cells by ColumnIndex
+            for row_idx in sorted(rows.keys()):
+                rows[row_idx].sort(key=lambda c: c.get("ColumnIndex", 0))
+
+            # Extract headers (first row) and data rows
+            headers = []
+            data_rows = []
+            for row_idx in sorted(rows.keys()):
+                row_cells = rows[row_idx]
+                cell_texts = [c["Text"].strip() for c in row_cells]
+                if row_idx == 1:  # First row = headers
+                    headers = cell_texts
+                else:
+                    data_rows.append(cell_texts)
+
+            # Reconstruct table text (pipe-delimited)
+            table_text = self._reconstruct_table_text(headers, data_rows)
+
+            parsed_tables.append({
+                "type": "table",
+                "content": table_text,
+                "metadata": {
+                    "page": table["Page"],
+                    "bbox": self._normalize_bbox(table["Geometry"]["BoundingBox"]),
+                    "headers": headers,
+                    "rows": data_rows
+                }
+            })
+
+        return parsed_tables
+
+    def _reconstruct_table_text(self, headers: List[str], rows: List[List[str]]) -> str:
+        """Reconstruct table as pipe-delimited Markdown."""
+        if not headers:
+            return ""
+
+        lines = []
+        # Header row
+        lines.append("| " + " | ".join(headers) + " |")
+        # Separator row
+        lines.append("|" + "|".join(["---"] * len(headers)) + "|")
+        # Data rows
+        for row in rows:
+            lines.append("| " + " | ".join(row) + " |")
+
+        return "\n".join(lines)
+
+    def _normalize_bbox(self, bbox: Dict[str, float]) -> List[float]:
+        """Convert Textract's normalized bbox to [x, y, width, height]."""
+        return [
+            bbox["Left"],
+            bbox["Top"],
+            bbox["Width"],
+            bbox["Height"]
+        ]
+
+    def _sort_by_reading_order(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Sort blocks by reading order (top-to-bottom, left-to-right).
+        Uses the top-left corner of each block's bounding box.
+        """
+        return sorted(
+            blocks,
+            key=lambda x: (
+                x["metadata"]["bbox"][1],  # Top (Y)
+                x["metadata"]["bbox"][0]   # Left (X)
+            )
+        )
+
+    def process_all_pdfs(self, prefix: str = "") -> None:
+        """Process all PDFs in the S3 prefix."""
+        s3_keys = self._list_s3_keys(prefix)
+        for s3_key in s3_keys:
+            if s3_key.lower().endswith('.pdf'):
+                try:
+                    result = self.process_pdf(s3_key)
+                    output_key = f"{self.config.S3_CONFIG['parsed_documents']}{os.path.basename(s3_key)}.json"
+                    self._upload_to_s3(result, output_key)
+                    logger.info(f"Processed and uploaded: {s3_key} -> {output_key}")
+                except Exception as e:
+                    logger.error(f"Failed to process {s3_key}: {e}")
+
+    def _list_s3_keys(self, prefix: str) -> List[str]:
+        """List all S3 keys under a prefix."""
+        paginator = self.s3_client.get_paginator('list_objects_v2')
+        keys = []
+        for page in paginator.paginate(Bucket=self.config.S3_CONFIG["bucket_name"], Prefix=prefix):
+            keys.extend([obj['Key'] for obj in page.get('Contents', [])])
+        return keys
+
+    def _upload_to_s3(self, data: Dict, s3_key: str) -> None:
+        """Upload structured blocks to S3."""
+        temp_file = "/tmp/structured_blocks.json"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            self.s3_client.upload_file(
+                temp_file,
+                self.config.S3_CONFIG["bucket_name"],
+                s3_key
+            )
+            logger.info(f"Uploaded to: s3://{self.config.S3_CONFIG['bucket_name']}/{s3_key}")
+        except Exception as e:
+            logger.error(f"Failed to upload {s3_key}: {e}")
+            raise
+        finally:
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+
+if __name__ == "__main__":
+    from config import Config
+    processor = EnhancedTextractPostProcessor(Config)
+    processor.process_all_pdfs(Config.S3_CONFIG["source_prefix"])
+#################
 class Config:
     """Centralized configuration for the Textract RAG pipeline."""
 
