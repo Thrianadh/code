@@ -1,3 +1,130 @@
+"""
+Main pipeline for processing PDFs with Amazon Textract.
+Generates Markdown and plain text outputs, and saves logs to S3.
+"""
+
+import os
+import tempfile
+import logging
+from datetime import datetime
+from typing import Optional
+from config import Config
+from utility import S3Manager, TextractManager, logger
+
+# Configure logging to a file (in addition to stdout)
+log_file = f"/tmp/textract_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_file),  # Log to a file
+        logging.StreamHandler()          # Also log to stdout (for Lambda)
+    ]
+)
+
+class TextractPipeline:
+    """Orchestrates the Textract RAG pipeline."""
+
+    def __init__(self):
+        """Initialize pipeline components."""
+        self.s3_manager = S3Manager(Config.S3_CONFIG["bucket_name"])
+        self.textract_manager = TextractManager()
+
+    def upload_logs(self) -> None:
+        """Upload the log file to S3."""
+        log_key = Config.S3_CONFIG["logs"].replace(
+            f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
+        ) + f"textract_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+        if os.path.exists(log_file):
+            self.s3_manager.upload_file(log_file, log_key)
+            logger.info(f"Uploaded logs to s3://{Config.S3_CONFIG['bucket_name']}/{log_key}")
+
+    def process_pdf(self, s3_key: str) -> None:
+        """
+        Process a single PDF file from S3.
+        Extracts content using Textract, generates Markdown and text outputs,
+        and saves them to S3.
+        """
+        logger.info(f"Processing PDF: {s3_key}")
+
+        # Step 1: Start Textract job
+        job_id = self.textract_manager.start_document_analysis(s3_key)
+        if not self.textract_manager.wait_for_job_completion(job_id):
+            logger.error(f"Textract job {job_id} failed or timed out for {s3_key}")
+            return
+
+        # Step 2: Retrieve and parse results
+        results = self.textract_manager.get_job_results(job_id)
+        blocks = results.get("Blocks", [])
+        plain_text, markdown = TextractManager.parse_blocks(blocks)
+
+        # Step 3: Generate output filenames
+        base_name = os.path.splitext(os.path.basename(s3_key))[0]
+        textract_output_path = Config.S3_CONFIG["textract_output"].replace(
+            f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
+        )
+        output_key_base = f"{textract_output_path}{base_name}"
+
+        # Step 4: Save outputs to S3
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as txt_file:
+            txt_file.write(plain_text)
+            txt_file_path = txt_file.name
+
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".md", delete=False) as md_file:
+            md_file.write(markdown)
+            md_file_path = md_file.name
+
+        self.s3_manager.upload_file(txt_file_path, f"{output_key_base}.txt")
+        self.s3_manager.upload_file(md_file_path, f"{output_key_base}.md")
+
+        # Clean up temp files
+        os.unlink(txt_file_path)
+        os.unlink(md_file_path)
+
+        logger.info(f"Successfully processed and saved outputs to {output_key_base}")
+
+    def process_all_pdfs(self) -> None:
+        """Process all PDFs in the source S3 prefix."""
+        source_prefix = Config.S3_CONFIG["source_prefix"]
+        pdf_keys = [
+            key for key in self.s3_manager.list_objects(source_prefix)
+            if key.lower().endswith(".pdf")
+        ]
+        logger.info(f"Found {len(pdf_keys)} PDFs to process in {source_prefix}")
+
+        for s3_key in pdf_keys:
+            self.process_pdf(s3_key)
+
+        # ✅ Upload logs to S3 after processing all PDFs
+        self.upload_logs()
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler for the Textract RAG pipeline.
+    Processes PDFs from S3 and saves outputs + logs to S3.
+    """
+    try:
+        logger.info("Lambda function started")
+        pipeline = TextractPipeline()
+        pipeline.process_all_pdfs()
+        logger.info("Lambda function completed successfully")
+        return {
+            "statusCode": 200,
+            "body": "PDF processing completed successfully",
+        }
+    except Exception as e:
+        logger.error(f"Lambda function failed: {e}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "body": f"Error: {str(e)}",
+        }
+
+if __name__ == "__main__":
+    # For local testing
+    pipeline = TextractPipeline()
+    pipeline.process_all_pdfs()
+#############
 def process_pdf(self, s3_key: str) -> None:
     """
     Process a single PDF file from S3.
