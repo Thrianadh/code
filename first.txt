@@ -1,3 +1,447 @@
+import os
+import re
+import boto3
+from typing import List, Dict, Tuple
+from botocore.config import Config
+from botocore.exceptions import ClientError
+import pdfplumber
+from docx import Document
+from bs4 import BeautifulSoup
+
+# --- Constants ---
+BEDROCK_REGION = "us-east-1"
+MODEL_IDS = ["us.anthropic.claude-sonnet-4-6"]
+MODEL_IDS = ["us.amazon.nova-2-lite-v1:0"]
+INPUT_DIR = "/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/Untitled Folder/vectorless rag/demo/Session memory/pdfs/"
+OUTPUT_DIR = "/home/ec2-user/SageMaker/trinadh/Ecmc_Rag/Untitled Folder/vectorless rag/demo/Session memory/output_hierarchy/"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --- Updated Few-Shot Prompt (Strict Rules) ---
+FEW_SHOT_PROMPT = """
+You are a hierarchical glossary extraction assistant. Your task:
+1. **Analyze the document** and extract its **logical sections and sub-sections ONLY**.
+2. For each section/sub-section, extract **1-2 keywords** that best represent its content.
+3. Format the output as a tree with "├─" and "└─". Include keywords after "→".
+4. **CRITICAL RULES (MUST FOLLOW):**
+   - **ONLY output the hierarchy tree.** DO NOT include **ANY** explanatory text, notes, or comments.
+   - **NEVER** include lines starting with:
+     - "Here is the"
+     - "Based on the document"
+     - "Therefore,"
+     - "Summary:"
+     - "**Note:**"
+     - "**Result:**"
+     - "This document"
+     - "---"
+     - "```"
+     - "|"
+   - If the document has **no clear sections/sub-sections**, generate **EXACTLY ONE dynamic heading** that consolidates the document's **main theme**.
+   - **Limit the hierarchy to ONLY 2 levels** (sections + sub-sections). **NO deeper nesting.**
+   - **NEVER** output empty lines, code blocks, or markdown artifacts.
+
+---
+### Example 1: Structured Document
+Input:
+# Consequences of Default
+- Administrative wage garnishment
+- Certification to Treasury
+
+Output:
+├─ Consequences of Default → default, penalties
+   ├─ Administrative wage garnishment → wage seizure, paycheck
+   └─ Certification to Treasury → tax refund, federal seizure
+
+---
+### Example 2: Flat Document (No Sections)
+Input:
+This is a single authorization form with no sections. It contains borrower information and consent statements.
+
+Output:
+├─ Borrower Authorization Form → consent, disclosure
+
+---
+### Example 3: No Clear Structure
+Input:
+The document discusses various aspects of bankruptcy and student loans without clear headings.
+
+Output:
+├─ Bankruptcy and Student Loans Overview → bankruptcy, student loans
+
+---
+### Example 4: Too Many Shallow Sections (Consolidate)
+Input:
+- Bankruptcy and Student Loans
+- Overview
+- The Consequences of Bankruptcy
+- Types of Personal Bankruptcy
+
+Output:
+├─ Bankruptcy and Student Loans → bankruptcy, student loans
+   ├─ Overview → undue hardship, adversary proceeding
+   ├─ Consequences → credit impact, debt elimination
+   └─ Types of Personal Bankruptcy → Chapter 7, Chapter 13
+
+---
+Now analyze this document and return **ONLY the hierarchy** (no explanations, no notes, no artifacts):
+{DOCUMENT_TEXT}
+"""
+
+# --- AWS Bedrock Client ---
+def initialize_bedrock_client():
+    config = Config(retries={"max_attempts": 3, "mode": "standard"})
+    return boto3.client(service_name="bedrock-runtime", region_name=BEDROCK_REGION, config=config)
+
+# --- Document Parsing (Unchanged) ---
+def parse_pdf(file_path: str) -> Tuple[str, List[Dict]]:
+    full_text = ""
+    sections = []
+    current_level = 0
+    current_title = ""
+    current_text = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+            if not words:
+                continue
+            lines = {}
+            for word in words:
+                y = round(word["top"], 1)
+                if y not in lines:
+                    lines[y] = []
+                lines[y].append(word["text"])
+            sorted_lines = sorted(lines.items(), key=lambda x: x[0])
+            for _, line_words in sorted_lines:
+                line_text = " ".join(line_words)
+                full_text += line_text + "\n"
+                if re.match(r'^\s*[0-9a-zA-Z]+\.\s+', line_text):
+                    level = 1 if re.match(r'^\s*[0-9]+\.\s+', line_text) else 2
+                    if current_text:
+                        sections.append({"level": current_level, "title": current_title, "text": "\n".join(current_text)})
+                    current_level = level
+                    current_title = line_text.strip()
+                    current_text = []
+                else:
+                    current_text.append(line_text)
+            if current_text:
+                sections.append({"level": current_level, "title": current_title, "text": "\n".join(current_text)})
+    return full_text, sections
+
+def parse_docx(file_path: str) -> Tuple[str, List[Dict]]:
+    doc = Document(file_path)
+    full_text = []
+    sections = []
+    current_level = 0
+    current_title = ""
+    current_text = []
+    for para in doc.paragraphs:
+        text = para.text
+        full_text.append(text)
+        if para.style.name.startswith("Heading"):
+            level = int(para.style.name.split(" ")[-1])
+            if current_text:
+                sections.append({"level": current_level, "title": current_title, "text": "\n".join(current_text)})
+            current_level = level
+            current_title = text
+            current_text = []
+        else:
+            current_text.append(text)
+    if current_text:
+        sections.append({"level": current_level, "title": current_title, "text": "\n".join(current_text)})
+    return "\n".join(full_text), sections
+
+def parse_html(file_path: str) -> Tuple[str, List[Dict]]:
+    with open(file_path, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f.read(), "html.parser")
+    full_text = []
+    sections = []
+    current_level = 0
+    current_title = ""
+    current_text = []
+    for element in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p"]):
+        tag = element.name
+        text = element.get_text().strip()
+        if tag.startswith("h"):
+            level = int(tag[1])
+            if current_text:
+                sections.append({"level": current_level, "title": current_title, "text": "\n".join(current_text)})
+            current_level = level
+            current_title = text
+            current_text = []
+        else:
+            current_text.append(text)
+            full_text.append(text)
+    if current_text:
+        sections.append({"level": current_level, "title": current_title, "text": "\n".join(current_text)})
+    return "\n".join(full_text), sections
+
+def parse_document(file_path: str) -> Tuple[str, List[Dict]]:
+    if file_path.endswith(".pdf"):
+        return parse_pdf(file_path)
+    elif file_path.endswith(".docx"):
+        return parse_docx(file_path)
+    elif file_path.endswith(".html") or file_path.endswith(".htm"):
+        return parse_html(file_path)
+    else:
+        raise ValueError(f"Unsupported file type: {file_path}")
+
+# --- Bedrock Converse API ---
+def call_bedrock_converse(client: boto3.client, model_id: str, document_text: str, max_tokens: int = 4096) -> str:
+    prompt = FEW_SHOT_PROMPT.format(DOCUMENT_TEXT=document_text)
+    try:
+        response = client.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.1}
+        )
+        return response["output"]["message"]["content"][0]["text"]
+    except ClientError as e:
+        print(f"[ERROR] Bedrock API error: {e}")
+        raise
+
+# --- Post-Processing: Clean and Limit Depth ---
+# def clean_raw_output(raw_output: str) -> str:
+#     """
+#     Remove ALL unwanted lines, notes, and artifacts.
+#     """
+#     lines = raw_output.split('\n')
+#     cleaned_lines = []
+
+#     # Patterns to EXCLUDE (case-insensitive)
+#     unwanted_patterns = [
+#         r'^Here is the',
+#         r'^Based on the document',
+#         r'^Therefore,',
+#         r'^Summary:',
+#         r'^\*\*Note:',
+#         r'^\*\*Result:',
+#         r'^This document',
+#         r'^There are',
+#         r'^The document',
+#         r'^---+',
+#         r'^```+',
+#         r'^\|+',
+#         r'^\s*\$',  # Empty/whitespace lines
+#         r'^>.*',    # Blockquotes (e.g., "> **Note:**")
+#         r'^\d+\.\s+',  # Numbered lists
+#         r'^\- ',      # Bullet points
+#         r'^$$
+# .*
+# $$',    # Brackets (e.g., "[PDF]")
+#     ]
+
+#     for line in lines:
+#         line = line.strip()
+#         # Skip if line matches any unwanted pattern
+#         if any(re.match(pattern, line, re.IGNORECASE) for pattern in unwanted_patterns):
+#             continue
+#         # Skip short lines (likely noise)
+#         if len(line) < 3:
+#             continue
+#         cleaned_lines.append(line)
+
+#     return '\n'.join(cleaned_lines)
+def clean_raw_output(raw_output: str) -> str:
+    """
+    Remove ALL unwanted lines, notes, and artifacts.
+    """
+    lines = raw_output.split('\n')
+    cleaned_lines = []
+
+    # Patterns to EXCLUDE (case-insensitive)
+    unwanted_patterns = [
+        r'^Here is the',
+        r'^Based on the document',
+        r'^Therefore,',
+        r'^Summary:',
+        r'^\*\*Note:',
+        r'^\*\*Result:',
+        r'^This document',
+        r'^There are',
+        r'^The document',
+        r'^---+',          # Lines with only dashes (e.g., "---")
+        r'^```+',          # Lines with only backticks (e.g., "```")
+        r'^\|+',           # Lines with only pipes (e.g., "|")
+        r'^\s*$',          # Empty/whitespace lines
+        r'^>.*',           # Blockquotes (e.g., "> **Note:**")
+        r'^\d+\.\s+',      # Numbered lists (e.g., "1. ")
+        r'^\- ',           # Bullet points (e.g., "- ")
+        r'^\[.*\]$',       # Lines with only brackets (e.g., "[PDF]")
+        r'← first_seen here',  # Remove first-seen annotations
+    ]
+
+    for line in lines:
+        line = line.strip()
+        # Skip if line matches any unwanted pattern
+        if any(re.match(pattern, line, re.IGNORECASE) for pattern in unwanted_patterns):
+            continue
+        # Skip short lines (likely noise)
+        if len(line) < 3:
+            continue
+        cleaned_lines.append(line)
+
+    return '\n'.join(cleaned_lines)
+def post_process_hierarchy(raw_output: str, max_depth: int = 1) -> List[Dict]:
+    """
+    Convert raw output to hierarchy and limit to `max_depth` levels.
+    Args:
+        max_depth: 0 = root, 1 = sections, 2 = sections + sub-sections.
+    """
+    cleaned_output = clean_raw_output(raw_output)
+    lines = cleaned_output.split("\n")
+    root = []
+    stack = [(0, root)]  # (indent_level, parent_list)
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        # Detect indent level
+        indent = 0
+        if "├─" in line:
+            indent = line.index("├─")
+            line = line[indent + 2:].strip()
+        elif "└─" in line:
+            indent = line.index("└─")
+            line = line[indent + 2:].strip()
+
+        # Extract title and keywords
+        if "→" in line:
+            title, keywords_str = line.split("→", 1)
+            title = title.strip()
+            keywords = [kw.strip() for kw in keywords_str.split(",")]
+        else:
+            title = line.strip()
+            keywords = []
+
+        node = {"title": title, "keywords": keywords, "children": []}
+
+        # Find parent in stack
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if stack:
+            stack[-1][1].append(node)
+        else:
+            root.append(node)
+        stack.append((indent + 2, node["children"]))
+
+    # Limit depth to `max_depth` (1 = sections only, 2 = sections + sub-sections)
+    def limit_depth(nodes: List[Dict], current_depth: int = 0) -> List[Dict]:
+        if current_depth > max_depth:
+            return []
+        limited_nodes = []
+        for node in nodes:
+            limited_node = {
+                "title": node["title"],
+                "keywords": node["keywords"],
+                "children": limit_depth(node["children"], current_depth + 1)
+            }
+            limited_nodes.append(limited_node)
+        return limited_nodes
+
+    return limit_depth(root, 0)
+
+# --- First-Seen Tracking ---
+def track_first_seen(hierarchy: List[Dict], first_seen: Dict[str, str], current_doc: str) -> Dict[str, str]:
+    def traverse(nodes: List[Dict], path: str):
+        for node in nodes:
+            for keyword in node["keywords"]:
+                if keyword not in first_seen:
+                    first_seen[keyword] = f"{path} → {node['title']}"
+                    node["first_seen"] = True
+            traverse(node["children"], f"{path}/{node['title']}")
+    traverse(hierarchy, current_doc)
+    return first_seen
+
+# --- Save Hierarchy ---
+# def save_hierarchy(hierarchy: List[Dict], output_path: str) -> None:
+#     def build_tree_string(nodes: List[Dict], prefix: str = "") -> str:
+#         tree_str = ""
+#         for i, node in enumerate(nodes):
+#             is_last = i == len(nodes) - 1
+#             connector = "└─" if is_last else "├─"
+#             keywords = f" → {', '.join(node['keywords'])}" if node["keywords"] else ""
+#             first_seen = " ← first_seen here" if node.get("first_seen") else ""
+#             tree_str += f"{prefix}{connector} {node['title']}{keywords}{first_seen}\n"
+#             if node["children"]:
+#                 new_prefix = prefix + ("    " if is_last else "│   ")
+#                 tree_str += build_tree_string(node["children"], new_prefix)
+#         return tree_str
+
+#     with open(output_path, "w", encoding="utf-8") as f:
+#         f.write("ROOT\n")
+#         f.write(build_tree_string(hierarchy))
+def save_hierarchy(hierarchy: List[Dict], output_path: str) -> None:
+    def build_tree_string(nodes: List[Dict], prefix: str = "") -> str:
+        tree_str = ""
+        for i, node in enumerate(nodes):
+            is_last = i == len(nodes) - 1
+            connector = "└─" if is_last else "├─"
+            keywords = f" → {', '.join(node['keywords'])}" if node["keywords"] else ""
+            # Removed: first_seen annotation
+            tree_str += f"{prefix}{connector} {node['title']}{keywords}\n"
+
+            if node["children"]:
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                tree_str += build_tree_string(node["children"], new_prefix)
+        return tree_str
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("ROOT\n")
+        f.write(build_tree_string(hierarchy))
+# --- Main Workflow ---
+def generate_glossary_hierarchy():
+    client = initialize_bedrock_client()
+    first_seen = {}
+    root_hierarchy = {"title": "ROOT", "children": []}
+
+    for root, dirs, files in os.walk(INPUT_DIR):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for file in files:
+            if file.startswith('.') or 'checkpoint' in file.lower():
+                continue
+
+            file_path = os.path.join(root, file)
+            relative_path = os.path.relpath(file_path, INPUT_DIR)
+            print(f"Processing: {file}")
+
+            try:
+                doc_text, _ = parse_document(file_path)
+            except Exception as e:
+                print(f"Error parsing {file}: {e}")
+                continue
+
+            source = "OneNote" if "onenote" in relative_path.lower() else "Website"
+            source_node = next(
+                (node for node in root_hierarchy["children"] if node["title"] == source),
+                None
+            )
+            if not source_node:
+                source_node = {"title": source, "children": [], "keywords": [], "first_seen": False}
+                root_hierarchy["children"].append(source_node)
+
+            for model_id in MODEL_IDS:
+                try:
+                    raw_output = call_bedrock_converse(client, model_id, doc_text)
+                    hierarchy = post_process_hierarchy(raw_output, max_depth=1)  # Sections + sub-sections only
+                    doc_node = {
+                        "title": os.path.splitext(file)[0],
+                        "keywords": [],
+                        "children": hierarchy,
+                        "first_seen": False
+                    }
+                    source_node["children"].append(doc_node)
+                    first_seen = track_first_seen(doc_node["children"], first_seen, f"{source}/{doc_node['title']}")
+                except Exception as e:
+                    print(f"Error processing {file} with {model_id}: {e}")
+                    continue
+
+    output_path = os.path.join(OUTPUT_DIR, "nova_glossary_hierarchy3.txt")
+    save_hierarchy(root_hierarchy["children"], output_path)
+    print(f"Saved to: {output_path}")
+
+if __name__ == "__main__":
+    generate_glossary_hierarchy()
+########
 #!/usr/bin/env python3
 """
 chat_with_memory.py — Chatbot wrapper with memory for existing Vector RAG
