@@ -1,3 +1,47 @@
+faiss_vector_store.py — Add this method inside the class:
+
+def search_hybrid(
+    self,
+    query_text: str,
+    query_embedding: List[float],
+    k: int = 0,
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Compatibility alias for retrieval engines that call search_hybrid.
+    FAISS does not support BM25, so this delegates to pure vector search.
+    """
+    return self.search(query_embedding=query_embedding, k=k, filters=filters)
+==================
+#retrieval_engine.py — The search call should be:
+
+chunks = self.store.search(query_embedding=query_embedding, k=top_k, filters=filters)
+
+=============
+from faiss_vector_store import FAISSVectorStore
+from retrieval_engine import RetrievalEngine
+
+# 1. Build FAISS index from your S3 embeddings
+store = FAISSVectorStore()
+store.build_from_s3()  # Reads from ecmc_org/RAG/embeddings/
+
+# 2. Retrieve
+retriever = RetrievalEngine(vector_store=store)
+result = retriever.retrieve(
+    query="What is income-driven repayment?",
+    top_k=5,
+    expand_context=True,
+)
+
+# 3. Print results
+print(f"Found {result['total_chunks']} chunks")
+for chunk in result["chunks"]:
+    print(f"\n--- {chunk['chunk_id']} (score: {chunk.get('score', 0):.4f}) ---")
+    print(chunk["text"][:300] + "...")
+
+# 4. Get context for Claude
+context = result["context_text"]
+##############
 from faiss_vector_store import FAISSVectorStore
 from retrieval_engine import RetrievalEngine
 
