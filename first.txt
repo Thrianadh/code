@@ -1,4 +1,314 @@
 """
+Main pipeline: Discover all documents in S3, run Textract analysis,
+post-process with enhanced parsing, and save structured outputs back to S3.
+"""
+
+import json
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from botocore.exceptions import ClientError, BotoCoreError
+
+from config import config
+from utility import S3Manager, TextractManager, ParsedDocument
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class TextractPipeline:
+    """End-to-end pipeline for batch Textract processing."""
+
+    def __init__(self):
+        self.s3 = S3Manager(
+            bucket_name=config.S3_BUCKET_NAME,
+            region=config.AWS_REGION,
+        )
+        self.textract = TextractManager(region=config.AWS_REGION)
+
+    def discover_documents(self, prefix: Optional[str] = None) -> List[str]:
+        """
+        List all supported documents under the source S3 prefix.
+
+        Returns:
+            List of S3 keys for documents to process.
+        """
+        prefix = prefix or config.S3_SOURCE_PREFIX
+        all_keys = self.s3.list_objects(prefix=prefix)
+
+        docs = [
+            key for key in all_keys
+            if key.lower().endswith(config.SUPPORTED_EXTENSIONS)
+        ]
+        logger.info(f"Discovered {len(docs)} documents under {prefix}")
+        return docs
+
+    def process_single_document(self, s3_key: str) -> Tuple[str, bool, str]:
+        """
+        Process one document: Textract -> parse -> save outputs.
+
+        Args:
+            s3_key: S3 key of the source document.
+
+        Returns:
+            Tuple of (s3_key, success: bool, message: str).
+        """
+        doc_name = Path(s3_key).stem
+        logger.info(f"Processing: {s3_key}")
+
+        try:
+            # 1. Start Textract job
+            job_id = self.textract.start_document_analysis(
+                s3_bucket=config.S3_BUCKET_NAME,
+                s3_key=s3_key,
+                features=config.TEXTRACT_FEATURES,
+            )
+
+            # 2. Wait for completion
+            success = self.textract.wait_for_job_completion(
+                job_id=job_id,
+                max_retries=config.MAX_RETRIES,
+                sleep_sec=config.POLL_INTERVAL_SEC,
+            )
+            if not success:
+                return s3_key, False, f"Textract job {job_id} failed or timed out"
+
+            # 3. Retrieve and parse blocks
+            blocks = self.textract.get_job_results(job_id=job_id)
+            parsed: ParsedDocument = self.textract.parse_document(blocks)
+
+            # 4. Save outputs to S3
+            base_output_key = f"{config.S3_TEXTRACT_OUTPUT_PREFIX}{doc_name}"
+
+            saved = []
+            if "json" in config.OUTPUT_FORMATS:
+                json_key = f"{base_output_key}.json"
+                self._save_to_s3(json_key, self._to_json(parsed))
+                saved.append(json_key)
+
+            if "txt" in config.OUTPUT_FORMATS:
+                txt_key = f"{base_output_key}.txt"
+                self._save_to_s3(txt_key, parsed.plain_text)
+                saved.append(txt_key)
+
+            if "md" in config.OUTPUT_FORMATS:
+                md_key = f"{base_output_key}.md"
+                self._save_to_s3(md_key, parsed.markdown_text)
+                saved.append(md_key)
+
+            logger.info(f"Saved {len(saved)} outputs for {doc_name}")
+            return s3_key, True, f"OK -> {saved}"
+
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"AWS error processing {s3_key}: {e}")
+            return s3_key, False, str(e)
+        except Exception as e:
+            logger.error(f"Unexpected error processing {s3_key}: {e}")
+            return s3_key, False, str(e)
+
+    def _save_to_s3(self, s3_key: str, content: str) -> bool:
+        """Save string content to S3."""
+        try:
+            self.s3.s3_client.put_object(
+                Bucket=config.S3_BUCKET_NAME,
+                Key=s3_key,
+                Body=content.encode("utf-8"),
+                ContentType="text/plain; charset=utf-8",
+            )
+            logger.info(f"Saved s3://{config.S3_BUCKET_NAME}/{s3_key}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save {s3_key}: {e}")
+            return False
+
+    @staticmethod
+    def _to_json(parsed: ParsedDocument) -> str:
+        """Serialize ParsedDocument to JSON."""
+        return json.dumps(
+            {
+                "metadata": parsed.metadata,
+                "plain_text": parsed.plain_text,
+                "markdown_text": parsed.markdown_text,
+                "elements": [
+                    {
+                        "type": type(e).__name__,
+                        "text": getattr(e, "text", None),
+                        "page": getattr(e, "page", None),
+                        "block_type": getattr(e, "block_type", None),
+                        "is_heading": getattr(e, "is_heading", None),
+                        "heading_level": getattr(e, "heading_level", None),
+                        "column_count": getattr(e, "column_count", None),
+                        "cells": [
+                            {
+                                "text": c.text,
+                                "row": c.row_index,
+                                "col": c.column_index,
+                                "is_header": c.is_header,
+                            }
+                            for c in getattr(e, "cells", [])
+                        ],
+                    }
+                    for e in parsed.elements
+                ],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    def run_sequential(self, prefix: Optional[str] = None) -> List[Tuple[str, bool, str]]:
+        """Process all documents one by one."""
+        docs = self.discover_documents(prefix)
+        results = []
+        for doc in docs:
+            result = self.process_single_document(doc)
+            results.append(result)
+        return results
+
+    def run_parallel(self, prefix: Optional[str] = None, max_workers: Optional[int] = None) -> List[Tuple[str, bool, str]]:
+        """
+        Process documents in parallel using ThreadPoolExecutor.
+        Note: Textract has service quotas; adjust max_workers accordingly.
+        """
+        docs = self.discover_documents(prefix)
+        max_workers = max_workers or config.MAX_WORKERS
+        results = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_doc = {
+                executor.submit(self.process_single_document, doc): doc
+                for doc in docs
+            }
+            for future in as_completed(future_to_doc):
+                doc = future_to_doc[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logger.error(f"Exception for {doc}: {e}")
+                    result = (doc, False, str(e))
+                results.append(result)
+
+        return results
+
+    def generate_report(self, results: List[Tuple[str, bool, str]]) -> str:
+        """Generate a simple processing report."""
+        total = len(results)
+        success = sum(1 for _, ok, _ in results if ok)
+        failed = total - success
+
+        lines = [
+            "=" * 60,
+            "TEXTRACT BATCH PROCESSING REPORT",
+            "=" * 60,
+            f"Total documents : {total}",
+            f"Successful      : {success}",
+            f"Failed          : {failed}",
+            f"Success rate    : {success / total * 100:.1f}%" if total else "N/A",
+            "-" * 60,
+        ]
+
+        for s3_key, ok, msg in results:
+            status = "PASS" if ok else "FAIL"
+            lines.append(f"[{status}] {Path(s3_key).name:<40} {msg}")
+
+        lines.append("=" * 60)
+        report = "\n".join(lines)
+        logger.info("\n" + report)
+
+        # Save report to S3
+        report_key = f"{config.S3_LOGS_PREFIX}report_{int(time.time())}.txt"
+        self._save_to_s3(report_key, report)
+        return report
+
+
+def main():
+    """Entry point."""
+    pipeline = TextractPipeline()
+
+    # Choose sequential or parallel based on volume
+    # Sequential
+############
+"""
+Centralized configuration for the Textract RAG pipeline.
+Loads environment variables with sensible defaults.
+"""
+
+import os
+from typing import List, Dict
+
+
+class Config:
+    """Centralized configuration for the Textract RAG pipeline."""
+
+    # AWS Configuration
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
+
+    # S3 Paths
+    S3_SOURCE_PREFIX: str = os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/")
+    S3_TEXTRACT_OUTPUT_PREFIX: str = os.getenv(
+        "S3_TEXTRACT_OUTPUT_PREFIX", "ecmc_org/RAG/textract-output/"
+    )
+    S3_LOGS_PREFIX: str = os.getenv("S3_LOGS_PREFIX", "ecmc_org/RAG/logs/")
+
+    # Derived S3 URIs
+    @property
+    def S3_SOURCE_URI(self) -> str:
+        return f"s3://{self.S3_BUCKET_NAME}/{self.S3_SOURCE_PREFIX}"
+
+    @property
+    def S3_TEXTRACT_OUTPUT_URI(self) -> str:
+        return f"s3://{self.S3_BUCKET_NAME}/{self.S3_TEXTRACT_OUTPUT_PREFIX}"
+
+    @property
+    def S3_LOGS_URI(self) -> str:
+        return f"s3://{self.S3_BUCKET_NAME}/{self.S3_LOGS_PREFIX}"
+
+    # Textract Features
+    TEXTRACT_FEATURES: List[str] = ["TABLES", "FORMS", "LAYOUT"]
+
+    # Processing
+    SUPPORTED_EXTENSIONS: tuple = (".pdf", ".png", ".jpg", ".jpeg", ".tiff")
+    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "60"))
+    POLL_INTERVAL_SEC: int = int(os.getenv("POLL_INTERVAL_SEC", "5"))
+    MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "5"))  # For parallel processing
+
+    # Output
+    OUTPUT_FORMATS: List[str] = ["json", "txt", "md"]  # Save structured, plain, markdown
+
+
+# Singleton instance
+config = Config()
+##############
+from utility import TextractManager, S3Manager
+
+# 1. Start job
+textract = TextractManager(region="us-east-1")
+job_id = textract.start_document_analysis(
+    s3_bucket="bankrupcy-data-bkt",
+    s3_key="ecmc_org/RAG/Source_data/myfile.pdf",
+    features=["TABLES", "FORMS", "LAYOUT"]
+)
+
+# 2. Wait
+textract.wait_for_job_completion(job_id)
+
+# 3. Get structured output
+blocks = textract.get_job_results(job_id)
+doc = textract.parse_document(blocks)
+
+print(doc.plain_text)      # Clean paragraphs + [TABLE] markers
+print(doc.markdown_text)   # Full markdown with tables
+print(doc.metadata)  
+
+########
+"""
 Reusable utilities for S3, Textract, logging, and document processing.
 Production-grade with proper reading order, paragraph grouping,
 heading detection, and robust table parsing.
