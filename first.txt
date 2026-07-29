@@ -1,3 +1,84 @@
+"""
+Centralized configuration for the Textract RAG pipeline.
+Loads environment variables and defines S3 paths, chunking, and Lambda settings.
+"""
+
+import os
+from typing import List
+
+
+class Config:
+    """Centralized configuration for the Textract RAG pipeline."""
+
+    # ── AWS ──────────────────────────────────────────────────────
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
+
+    # ── S3 Paths ─────────────────────────────────────────────────
+    S3_SOURCE_PREFIX: str = os.getenv(
+        "S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"
+    )
+    S3_TEXTRACT_OUTPUT_PREFIX: str = os.getenv(
+        "S3_TEXTRACT_OUTPUT_PREFIX", "ecmc_org/RAG/textract-output/"
+    )
+    S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
+        "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
+    )
+    S3_LOGS_PREFIX: str = os.getenv(
+        "S3_LOGS_PREFIX", "ecmc_org/RAG/logs/"
+    )
+
+    # ── Textract ─────────────────────────────────────────────────
+    TEXTRACT_FEATURES: List[str] = ["TABLES", "FORMS", "LAYOUT"]
+    SUPPORTED_EXTENSIONS: tuple = (".pdf", ".png", ".jpg", ".jpeg", ".tiff")
+    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "60"))
+    POLL_INTERVAL_SEC: int = int(os.getenv("POLL_INTERVAL_SEC", "5"))
+
+    # ── Output from Textract (both saved; chunking picks one) ────
+    OUTPUT_FORMATS: List[str] = ["md", "txt"]
+
+    # ── Chunking ─────────────────────────────────────────────────
+    # Input format for the chunking engine (always use md for structure-aware)
+    CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
+
+    # Token-based sizing (industry standard for embedding models)
+    CHUNK_SIZE_TOKENS: int = int(os.getenv("CHUNK_SIZE_TOKENS", "512"))
+    CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "128"))
+
+    # Table chunking
+    MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
+
+    # Character equivalents (1 token ≈ 4 chars for English)
+    # NOTE: Must be plain ints, NOT @property, so LangChain splitters accept them
+    CHUNK_SIZE_CHARS: int = CHUNK_SIZE_TOKENS * 4
+    CHUNK_OVERLAP_CHARS: int = CHUNK_OVERLAP_TOKENS * 4
+
+    # ── Metadata fields preserved per chunk ──────────────────────
+    CHUNK_METADATA_FIELDS: List[str] = [
+        "chunk_id",
+        "document_id",
+        "source_s3_key",
+        "page_number",
+        "section",
+        "section_level",
+        "element_type",
+        "parent_id",
+        "prev_chunk_id",
+        "next_chunk_id",
+        "contains_table",
+        "table_headers",
+        "char_count",
+        "token_estimate",
+    ]
+
+    # ── Lambda / Deployment ──────────────────────────────────────
+    LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
+    LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
+
+
+# Singleton instance
+config = Config()
+####################
 from textract_processor import TextractPipeline
 from chunking_engine import run_chunking_pipeline
 
