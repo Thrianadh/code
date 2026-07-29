@@ -1,3 +1,55 @@
+CHUNKING_CONFIG = {
+    # Token limits
+    "token_limit": 512,                # Target chunk size (tokens)
+    "text_overlap": 50,                # Token overlap for text chunks
+    "table_overlap_rows": 2,           # Rows to overlap in table chunks
+
+    # Table handling
+    "min_table_rows": 2,              # Minimum rows to consider a table
+    "inject_headers": True,           # Prepend headers to table chunks
+    "table_title_lookup": 5,          # Lines to scan for table titles
+    "fallback_to_text": True,         # Treat unparseable tables as text
+
+    # Storage
+    "vector_db": "weaviate",          # or "pinecone"
+    "embedding_model": "text-embedding-ada-002",
+    "enable_graph_queries": True,     # For parent/child relationships
+}
+
+# ======================
+# METADATA SCHEMA
+# ======================
+METADATA_SCHEMA = {
+    "required": [
+        "document_id",
+        "chunk_id",
+        "element_type",  # "heading", "table", "text"
+        "page_number",
+        "position",      # Sequential order in document
+    ],
+    "optional": [
+        "section",        # Parent section header
+        "parent_id",      # ID of parent chunk (e.g., heading)
+        "neighbors",      # List of adjacent chunk IDs
+        "table_id",        # Unique ID for tables
+        "headers",         # Column headers (for tables)
+        "row_range",       # For split tables (e.g., "rows 1-10")
+    ]
+}
+
+# ======================
+# S3 PATHS
+# ======================
+S3_CONFIG = {
+    "bucket_name": "bankrupcy-data-bkt",
+    "parsed_documents": "ecmc_org/RAG/parsed-documents/",
+    "chunking_output": "ecmc_org/RAG/chunking-output/",
+    "enriched_chunks": "ecmc_org/RAG/chunking-output/enriched/",
+    "vector_db_backup": "ecmc_org/RAG/vector-db-backup/",
+    "logs": "ecmc_org/RAG/logs/",
+}
+
+######################
 processor = EnhancedTextractPostProcessor(Config)
 processor.process_pdf("ecmc_org/RAG/Source_data/BK_team.pdf")
 ################
