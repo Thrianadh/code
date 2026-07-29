@@ -1,3 +1,445 @@
+## retrieval_engine.py
+"""
+Retrieval engine for RAG pipeline.
+Orchestrates query embedding, vector search, optional re-ranking,
+and context expansion to produce rich context for generation.
+
+Optimized for Nova/Claude consumption:
+  - Clean context formatting with clear source citations
+  - Graceful handling when 0 chunks retrieved
+  - Optional LLM-based re-ranking hook (for future enhancement)
+
+Works with ANY vector store that implements:
+  - search(query_embedding, k, filters) -> List[chunk_dict]
+  - get_chunk_by_id(chunk_id) -> Optional[chunk_dict]
+"""
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from config import config
+from embedding_engine import EmbeddingEngine
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class RetrievalEngine:
+    """
+    End-to-end retrieval: embed query -> search -> [re-rank] -> expand context.
+    Vector store is pluggable (OpenSearch, FAISS, or any custom store).
+    """
+
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        embedding_engine: Optional[EmbeddingEngine] = None,
+    ):
+        self.embedder = embedding_engine or EmbeddingEngine()
+        self.store = vector_store
+
+    # ------------------------------------------------------------------
+    # Main retrieval API
+    # ------------------------------------------------------------------
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        expand_context: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve relevant chunks for a user query.
+
+        Args:
+            query: Raw user query text.
+            top_k: Number of chunks to retrieve. Defaults to config.RETRIEVAL_TOP_K.
+            filters: Metadata filters (e.g., {"document_id": "loan-guide"}).
+            expand_context: Whether to fetch prev/next neighbors.
+                Defaults to config.ENABLE_CONTEXT_EXPANSION.
+
+        Returns:
+            Dict with keys:
+                - "query": original query
+                - "chunks": list of retrieved chunk dicts
+                - "context_text": concatenated text of all chunks (for prompt)
+                - "total_chunks": number of chunks
+                - "expanded": whether context expansion was applied
+        """
+        if self.store is None:
+            raise ValueError(
+                "No vector store provided. "
+                "Pass a FAISSVectorStore or OpenSearchVectorStore instance."
+            )
+
+        top_k = top_k or config.RETRIEVAL_TOP_K
+        expand = expand_context if expand_context is not None else config.ENABLE_CONTEXT_EXPANSION
+
+        # 1. Embed query via Bedrock Titan (same model used for indexing)
+        query_embedding = self.embedder.embed_text(query)
+
+        # 2. Search vector store (works with BOTH FAISS and OpenSearch)
+        chunks = self.store.search(
+            query_embedding=query_embedding,
+            k=top_k,
+            filters=filters,
+        )
+
+        # 3. Optional: re-rank chunks (placeholder for future LLM re-ranking)
+        # chunks = self._rerank_chunks(query, chunks)
+
+        # 4. Context expansion (fetch prev/next neighbors)
+        if expand and chunks:
+            chunks = self._expand_context(chunks)
+
+        # 5. Build context text for LLM prompt
+        context_text = self._build_context_text(chunks, query)
+
+        result = {
+            "query": query,
+            "chunks": chunks,
+            "context_text": context_text,
+            "total_chunks": len(chunks),
+            "expanded": expand,
+        }
+
+        logger.info(
+            f"Retrieved {len(chunks)} chunks for query: '{query[:60]}...' "
+            f"(expanded={expand})"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _expand_context(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        For each chunk, fetch its prev and next neighbors from the vector store
+        and insert them in correct order.
+        """
+        expanded = []
+        seen_ids = set()
+
+        for chunk in chunks:
+            # Fetch prev
+            prev_id = chunk.get("metadata", {}).get("prev_chunk_id") or chunk.get("prev_chunk_id")
+            if prev_id and prev_id not in seen_ids:
+                prev_doc = self.store.get_chunk_by_id(prev_id)
+                if prev_doc:
+                    prev_doc = dict(prev_doc)
+                    prev_doc["score"] = 0.0
+                    prev_doc["is_neighbor"] = True
+                    expanded.append(prev_doc)
+                    seen_ids.add(prev_id)
+
+            # Main chunk
+            cid = chunk.get("chunk_id", "")
+            if cid not in seen_ids:
+                chunk = dict(chunk)
+                chunk["is_neighbor"] = False
+                expanded.append(chunk)
+                seen_ids.add(cid)
+
+            # Fetch next
+            next_id = chunk.get("metadata", {}).get("next_chunk_id") or chunk.get("next_chunk_id")
+            if next_id and next_id not in seen_ids:
+                next_doc = self.store.get_chunk_by_id(next_id)
+                if next_doc:
+                    next_doc = dict(next_doc)
+                    next_doc["score"] = 0.0
+                    next_doc["is_neighbor"] = True
+                    expanded.append(next_doc)
+                    seen_ids.add(next_id)
+
+        return expanded
+
+    @staticmethod
+    def _build_context_text(chunks: List[Dict[str, Any]], query: str = "") -> str:
+        """
+        Concatenate chunk texts into a single context string for LLM prompting.
+        Optimized for Nova/Claude consumption with clear source citations.
+        """
+        if not chunks:
+            return (
+                "[NO RELEVANT DOCUMENTS FOUND]\n\n"
+                "No matching documents were found in the knowledge base for this query. "
+                "Please answer based on general knowledge, but clearly state that "
+                "this information may not be from official ECMC documents."
+            )
+
+        parts = []
+        parts.append(f"The following documents were retrieved for the query: "{query}"\n")
+
+        for i, chunk in enumerate(chunks, 1):
+            tag = "[NEIGHBOR]" if chunk.get("is_neighbor") else f"[DOCUMENT {i}]"
+            meta = chunk.get("metadata", chunk)
+
+            # Build citation header
+            doc_id = meta.get("document_id", "unknown")
+            page = meta.get("page_number", 0)
+            section = meta.get("section", "")
+            score = chunk.get("score", 0)
+
+            header = f"{tag} Source: {doc_id} | Page: {page} | Section: {section}"
+            if not chunk.get("is_neighbor"):
+                header += f" | Relevance: {score:.3f}"
+
+            parts.append(header)
+            parts.append(chunk.get("text", "").strip())
+            parts.append("")  # blank line between chunks
+
+        parts.append("--- END OF DOCUMENTS ---")
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Future: LLM-based re-ranking (optional enhancement)
+    # ------------------------------------------------------------------
+
+    def _rerank_chunks(
+        self,
+        query: str,
+        chunks: List[Dict[str, Any]],
+        top_n: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        [PLACEHOLDER] Re-rank chunks using an LLM cross-encoder.
+        Currently returns chunks as-is. For future enhancement:
+        use Bedrock Nova/Claude to score each chunk's relevance to query.
+        """
+        # TODO: Implement LLM-based re-ranking for better retrieval quality
+        # Example approach:
+        #   scores = []
+        #   for chunk in chunks:
+        #       prompt = f"Rate relevance (0-10): Query: {query}\nChunk: {chunk['text'][:500]}"
+        #       score = call_bedrock(prompt)
+        #       scores.append((score, chunk))
+        #   return [c for _, c in sorted(scores, reverse=True)[:top_n]]
+        return chunks[:top_n]
+
+    # ------------------------------------------------------------------
+    # Convenience methods
+    # ------------------------------------------------------------------
+
+    def retrieve_simple(self, query: str, top_k: int = 0) -> str:
+        """
+        Simplest API: query -> context text string (for direct prompt injection).
+
+        Returns:
+            Concatenated context text ready for LLM prompt.
+        """
+        result = self.retrieve(query, top_k=top_k)
+        return result["context_text"]
+########
+#rag_chatbot.py
+"""
+RAG ChatBot with session memory, retrieval, and Bedrock generation.
+Nova-compatible: system prompt passed via 'system' param, not message role.
+Integrates: ChatSession + RetrievalEngine + Bedrock Nova/Claude.
+"""
+
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+import boto3
+
+from chat_memory import ChatSession, SessionManager
+from config import config
+from embedding_engine import EmbeddingEngine
+from faiss_vector_store import FAISSVectorStore
+from retrieval_engine import RetrievalEngine
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class RAGChatBot:
+    """
+    End-to-end RAG chatbot with Nova/Claude generation.
+    """
+
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are a helpful assistant for ECMC student loan services. "
+        "Answer questions based ONLY on the provided context. "
+        "If the answer is not in the context, say "I don't have enough information." "
+        "Always cite the document name and page number when possible."
+    )
+
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        model_id: Optional[str] = None,
+        session_manager: Optional[SessionManager] = None,
+    ):
+        self.store = vector_store or self._load_default_store()
+        self.retriever = RetrievalEngine(vector_store=self.store)
+        self.sessions = session_manager or SessionManager(default_window_size=5)
+        self.bedrock = boto3.client("bedrock-runtime", region_name=config.AWS_REGION)
+        self.model_id = model_id or "amazon.nova-pro-v1:0"
+        self.is_nova = "nova" in self.model_id.lower()
+
+    def _load_default_store(self) -> FAISSVectorStore:
+        store = FAISSVectorStore()
+        try:
+            store.load_from_s3(name="ecmc_index")
+        except FileNotFoundError:
+            logger.warning("No saved FAISS index found. Call build_index() first.")
+        return store
+
+    def build_index(self) -> None:
+        self.store.build_from_s3()
+        self.store.save_to_s3(name="ecmc_index")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def chat(
+        self,
+        user_message: str,
+        session_id: Optional[str] = None,
+        top_k: int = 5,
+        expand_context: bool = True,
+    ) -> Dict[str, Any]:
+        session = self.sessions.get_or_create(
+            session_id=session_id,
+            system_prompt=self.DEFAULT_SYSTEM_PROMPT,
+        )
+
+        # 1. Retrieve chunks
+        retrieval_result = self.retriever.retrieve(
+            query=user_message,
+            top_k=top_k,
+            expand_context=expand_context,
+        )
+        chunks = retrieval_result["chunks"]
+        context = retrieval_result["context_text"]
+
+        # 2. Build prompt
+        if chunks:
+            user_prompt = self._build_user_prompt(user_message, context)
+        else:
+            # No chunks found — inform user we lack info
+            user_prompt = (
+                f"Question: {user_message}\n\n"
+                f"Note: No relevant documents were found for this query. "
+                f"Please answer based on your general knowledge, but clearly state "
+                f"that this information may not be from the official ECMC documents."
+            )
+            logger.warning(f"No chunks retrieved for query: {user_message[:60]}")
+
+        session.add_message("user", user_prompt)
+
+        # 3. Generate
+        messages = session.get_history(include_system=False)
+        answer = self._generate(messages, system_prompt=session.messages[0].content if session.messages else self.DEFAULT_SYSTEM_PROMPT)
+
+        session.add_message("assistant", answer, metadata={"sources": [c.get("chunk_id") for c in chunks]})
+
+        return {
+            "session_id": session.session_id,
+            "answer": answer,
+            "chunks": chunks,
+            "context_used": bool(chunks),
+            "history_length": len(session.messages),
+        }
+
+    def new_chat(self, session_id: Optional[str] = None) -> str:
+        if session_id:
+            session = self.sessions.new_chat(session_id, system_prompt=self.DEFAULT_SYSTEM_PROMPT)
+            return session.session_id
+        else:
+            session = self.sessions.get_or_create(system_prompt=self.DEFAULT_SYSTEM_PROMPT)
+            session.new_chat()
+            return session.session_id
+
+    def get_history(self, session_id: str) -> List[Dict[str, str]]:
+        session = self.sessions.get_or_create(session_id)
+        return session.get_history(include_system=False)
+
+    # ------------------------------------------------------------------
+    # Generation (Nova-compatible)
+    # ------------------------------------------------------------------
+
+    def _generate(self, messages: List[Dict[str, str]], system_prompt: str = "") -> str:
+        """Call Bedrock Converse API with Nova/Claude compatibility."""
+        try:
+            # Format messages for Converse API (only user/assistant, no system)
+            converse_messages = [
+                {"role": m["role"], "content": [{"text": m["content"]}]}
+                for m in messages
+                if m["role"] in ("user", "assistant")
+            ]
+
+            kwargs = {
+                "modelId": self.model_id,
+                "messages": converse_messages,
+                "inferenceConfig": {"maxTokens": 1024, "temperature": 0.3},
+            }
+
+            # Nova requires system prompt as top-level param, not in messages
+            if self.is_nova and system_prompt:
+                kwargs["system"] = [{"text": system_prompt}]
+
+            response = self.bedrock.converse(**kwargs)
+            return response["output"]["message"]["content"][0]["text"]
+
+        except Exception as e:
+            logger.error(f"Bedrock generation failed: {e}")
+            return self._generate_fallback(messages, system_prompt)
+
+    def _generate_fallback(self, messages: List[Dict[str, str]], system_prompt: str = "") -> str:
+        """Fallback using InvokeModel with native Nova payload."""
+        # Build Nova-native payload (NO system role in messages)
+        nova_messages = []
+        for m in messages:
+            if m["role"] in ("user", "assistant"):
+                nova_messages.append({
+                    "role": m["role"],
+                    "content": [{"text": m["content"]}]
+                })
+
+        native_request = {
+            "messages": nova_messages,
+            "inferenceConfig": {"max_new_tokens": 1024, "temperature": 0.3},
+        }
+
+        # Nova native format uses top-level "system" field
+        if self.is_nova and system_prompt:
+            native_request["system"] = [{"text": system_prompt}]
+
+        request = json.dumps(native_request)
+
+        try:
+            response = self.bedrock.invoke_model(
+                modelId=self.model_id,
+                body=request,
+            )
+            model_response = json.loads(response["body"].read())
+            # Nova response format
+            return (
+                model_response.get("output", {})
+                .get("message", {})
+                .get("content", [{}])[0]
+                .get("text", "")
+            )
+        except Exception as e:
+            logger.error(f"Fallback generation also failed: {e}")
+            return "I apologize, but I'm unable to generate a response right now."
+
+    @staticmethod
+    def _build_user_prompt(question: str, context: str) -> str:
+        return (
+            f"Context:\n{context}\n\n"
+            f"Question: {question}\n\n"
+            f"Please answer based on the context above."
+        )
+########################
 """
 Terminal-based chat interface for the RAG ChatBot.
 Displays conversation like a real chatbot in the terminal.
