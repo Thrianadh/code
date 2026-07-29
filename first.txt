@@ -1,3 +1,664 @@
+"""
+Reusable utilities for S3, Textract, logging, and document processing.
+Follows PEP 8, type hints, and best practices for maintainability.
+"""
+
+import os
+import re
+import time
+import logging
+from typing import Dict, List, Optional, Any, Tuple
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
+
+# Import Config from config.py
+from config import Config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),  # Log to stdout
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class S3Manager:
+    """Handles all S3 operations (upload, download, list, validate)."""
+
+    def __init__(self, bucket_name: str = Config.S3_CONFIG["bucket_name"], region: str = Config.AWS_REGION):
+        """Initialize S3 client."""
+        self.bucket_name = bucket_name
+        self.s3_client = boto3.client("s3", region_name=region)
+        logger.info(f"Initialized S3Manager for bucket: {bucket_name}")
+
+    def upload_file(
+        self,
+        local_file_path: str,
+        s3_key: str,
+        extra_args: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Upload a file to S3.
+
+        Args:
+            local_file_path: Local path of the file to upload.
+            s3_key: S3 key (path within the bucket, e.g., "ecmc_org/RAG/output/file.txt").
+            extra_args: Additional arguments (e.g., ACL, ContentType).
+
+        Returns:
+            bool: True if upload succeeded, False otherwise.
+        """
+        try:
+            self.s3_client.upload_file(
+                local_file_path,
+                self.bucket_name,
+                s3_key,
+                ExtraArgs=extra_args or {},
+            )
+            logger.info(f"Uploaded {local_file_path} to s3://{self.bucket_name}/{s3_key}")
+            return True
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to upload {local_file_path} to {s3_key}: {e}")
+            return False
+
+    def download_file(self, s3_key: str, local_file_path: str) -> bool:
+        """
+        Download a file from S3.
+
+        Args:
+            s3_key: S3 key (path within the bucket).
+            local_file_path: Local path to save the file.
+
+        Returns:
+            bool: True if download succeeded, False otherwise.
+        """
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+            self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
+            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} to {local_file_path}")
+            return True
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to download {s3_key} to {local_file_path}: {e}")
+            return False
+
+    def list_objects(self, prefix: str = "") -> List[str]:
+        """
+        List all objects under a prefix in the S3 bucket.
+
+        Args:
+            prefix: S3 prefix to filter objects (e.g., "ecmc_org/RAG/Source_data/").
+
+        Returns:
+            List[str]: List of S3 keys (paths within the bucket).
+        """
+        try:
+            paginator = self.s3_client.get_paginator("list_objects_v2")
+            objects = []
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
+                objects.extend([obj["Key"] for obj in page.get("Contents", [])])
+            logger.info(f"Listed {len(objects)} objects under prefix: {prefix}")
+            return objects
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to list objects under {prefix}: {e}")
+            return []
+
+    def validate_path(self, s3_key: str) -> bool:
+        """
+        Validate if an S3 object exists.
+
+        Args:
+            s3_key: S3 key (path within the bucket).
+
+        Returns:
+            bool: True if the object exists, False otherwise.
+        """
+        try:
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            return True
+        except (ClientError, BotoCoreError):
+            return False
+
+class TextractManager:
+    """Handles Amazon Textract operations (job management, result parsing)."""
+
+    def __init__(self, region: str = Config.AWS_REGION):
+        """Initialize Textract client."""
+        self.textract_client = boto3.client("textract", region_name=region)
+        logger.info("Initialized TextractManager")
+
+    def start_document_analysis(
+        self,
+        s3_key: str,
+        features: List[str] = Config.TEXTRACT_FEATURES,
+    ) -> str:
+        """
+        Start a Textract document analysis job.
+
+        Args:
+            s3_key: S3 key of the document to analyze (e.g., "ecmc_org/RAG/Source_data/file.pdf").
+            features: List of Textract features to enable (e.g., ["FORMS", "TABLES"]).
+
+        Returns:
+            str: Job ID for tracking the analysis.
+
+        Raises:
+            ClientError: If Textract job fails to start.
+        """
+        try:
+            response = self.textract_client.start_document_analysis(
+                DocumentLocation={
+                    "S3Object": {
+                        "Bucket": Config.S3_CONFIG["bucket_name"],
+                        "Name": s3_key,
+                    }
+                },
+                FeatureTypes=features,
+            )
+            job_id = response["JobId"]
+            logger.info(f"Started Textract job {job_id} for {s3_key}")
+            return job_id
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to start Textract job for {s3_key}: {e}")
+            raise
+
+    def get_job_status(self, job_id: str) -> str:
+        """
+        Get the status of a Textract job.
+
+        Args:
+            job_id: Textract job ID.
+
+        Returns:
+            str: Job status (e.g., "SUCCEEDED", "FAILED", "IN_PROGRESS").
+
+        Raises:
+            ClientError: If job status cannot be retrieved.
+        """
+        try:
+            response = self.textract_client.get_document_analysis(JobId=job_id)
+            return response["JobStatus"]
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to get job status for {job_id}: {e}")
+            raise
+
+    def wait_for_job_completion(self, job_id: str, max_retries: int = Config.TEXTRACT_MAX_RETRIES, delay: int = Config.TEXTRACT_RETRY_DELAY) -> bool:
+        """
+        Poll Textract job status until completion.
+
+        Args:
+            job_id: Textract job ID.
+            max_retries: Maximum number of retries.
+            delay: Delay between retries in seconds.
+
+        Returns:
+            bool: True if job succeeded, False otherwise.
+        """
+        for attempt in range(max_retries):
+            try:
+                status = self.get_job_status(job_id)
+                if status == "SUCCEEDED":
+                    logger.info(f"Textract job {job_id} succeeded.")
+                    return True
+                elif status == "FAILED":
+                    logger.error(f"Textract job {job_id} failed.")
+                    return False
+                logger.info(f"Job {job_id} status: {status}. Retry {attempt + 1}/{max_retries} in {delay} seconds...")
+                time.sleep(delay)
+            except (ClientError, BotoCoreError) as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for job {job_id}: {e}")
+                time.sleep(delay)
+        logger.error(f"Textract job {job_id} timed out after {max_retries * delay} seconds.")
+        return False
+
+    def get_job_results(self, job_id: str) -> Dict[str, Any]:
+        """
+        Retrieve results from a completed Textract job.
+
+        Args:
+            job_id: Textract job ID.
+
+        Returns:
+            Dict[str, Any]: Parsed Textract response.
+
+        Raises:
+            ClientError: If results cannot be retrieved.
+        """
+        try:
+            response = self.textract_client.get_document_analysis(JobId=job_id)
+            return response
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to get results for job {job_id}: {e}")
+            raise
+
+    @staticmethod
+    def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str, str]:
+        """
+        Parse Textract blocks into:
+        1. Structured blocks (with metadata for RAG)
+        2. Plain text
+        3. Markdown text
+
+        Args:
+            blocks: List of Textract blocks.
+
+        Returns:
+            Tuple[List[Dict], str, str]:
+                - Structured blocks (with type, content, metadata)
+                - Plain text
+                - Markdown text
+        """
+        structured_blocks = []
+        plain_text_parts = []
+        markdown_text_parts = []
+
+        # Sort blocks by reading order (top-to-bottom, left-to-right)
+        sorted_blocks = sorted(
+            blocks,
+            key=lambda x: (
+                x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0),
+                x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0),
+            ),
+        )
+
+        for block in sorted_blocks:
+            block_type = block["BlockType"]
+            text = block.get("Text", "")
+            page = block.get("Page", 1)
+            bbox = block.get("Geometry", {}).get("BoundingBox", {})
+            block_id = block.get("Id", "")
+
+            # Create structured block
+            structured_block = {
+                "type": "text",
+                "content": text,
+                "metadata": {
+                    "page": page,
+                    "bbox": [
+                        bbox.get("Left", 0),
+                        bbox.get("Top", 0),
+                        bbox.get("Width", 0),
+                        bbox.get("Height", 0)
+                    ],
+                    "element_type": block_type.lower(),
+                    "block_id": block_id,
+                }
+            }
+
+            # --- Handle different block types ---
+            if block_type in ["LINE", "WORD"]:
+                structured_block["type"] = "text"
+                plain_text_parts.append(text)
+                markdown_text_parts.append(text)
+
+            elif block_type == "TABLE":
+                table_md = TextractManager._parse_table(block, sorted_blocks)
+                headers = TextractManager._extract_table_headers(block, sorted_blocks)
+                structured_block["type"] = "table"
+                structured_block["content"] = table_md
+                structured_block["metadata"]["headers"] = headers
+                plain_text_parts.append("[TABLE]")
+                markdown_text_parts.append(table_md)
+
+            elif block_type == "KEY_VALUE_SET":
+                key = block.get("Key", {}).get("Text", "")
+                value = block.get("Value", {}).get("Text", "")
+                structured_block["type"] = "key_value"
+                structured_block["content"] = f"{key}: {value}"
+                structured_block["metadata"]["key"] = key
+                structured_block["metadata"]["value"] = value
+                plain_text_parts.append(f"{key}: {value}")
+                markdown_text_parts.append(f"**{key}**: {value}")
+
+            elif block_type == "SELECTION_ELEMENT":
+                structured_block["type"] = "selection"
+                structured_block["metadata"]["status"] = block.get("SelectionStatus", "NOT_SELECTED")
+                if block.get("SelectionStatus") == "SELECTED":
+                    structured_block["content"] = f"[x] {text}"
+                    plain_text_parts.append(f"[x] {text}")
+                    markdown_text_parts.append(f"- [x] {text}")
+                else:
+                    structured_block["content"] = f"[ ] {text}"
+                    plain_text_parts.append(f"[ ] {text}")
+                    markdown_text_parts.append(f"- [ ] {text}")
+
+            # --- Detect headings ---
+            if block_type in ["LINE", "WORD"] and TextractManager._is_heading(text):
+                structured_block["type"] = "heading"
+                structured_block["metadata"]["level"] = TextractManager._guess_heading_level(text)
+                plain_text_parts[-1] = f"\n{text}\n"  # Add newlines for headings
+                markdown_text_parts[-1] = f"\n{'#' * structured_block['metadata']['level']} {text}\n"
+
+            structured_blocks.append(structured_block)
+
+        return structured_blocks, "\n".join(plain_text_parts), "\n".join(markdown_text_parts)
+
+    @staticmethod
+    def _parse_table(table_block: Dict[str, Any], all_blocks: List[Dict[str, Any]]) -> str:
+        """
+        Parse a Textract TABLE block into Markdown.
+
+        Args:
+            table_block: Textract TABLE block.
+            all_blocks: All blocks in the document (for resolving relationships).
+
+        Returns:
+            str: Markdown-formatted table.
+        """
+        # Find all cells in the table
+        cells = []
+        for rel in table_block.get("Relationships", []):
+            if rel["Type"] == "CHILD":
+                for cell_id in rel["Ids"]:
+                    cell = next((b for b in all_blocks if b["Id"] == cell_id), None)
+                    if cell:
+                        cells.append(cell)
+
+        # Sort cells by row and column indices
+        cells.sort(key=lambda x: (x.get("RowIndex", 0), x.get("ColumnIndex", 0)))
+
+        # Extract text from each cell
+        rows = []
+        current_row = []
+        prev_row_index = None
+        for cell in cells:
+            row_index = cell.get("RowIndex", 0)
+            if row_index != prev_row_index and current_row:
+                rows.append(current_row)
+                current_row = []
+            prev_row_index = row_index
+
+            # Get cell text (from child blocks)
+            cell_text = []
+            for rel in cell.get("Relationships", []):
+                if rel["Type"] == "CHILD":
+                    for content_id in rel["Ids"]:
+                        content_block = next(
+                            (b for b in all_blocks if b["Id"] == content_id), None
+                        )
+                        if content_block and content_block["BlockType"] in ["LINE", "WORD"]:
+                            cell_text.append(content_block.get("Text", ""))
+            current_row.append(" | ".join(cell_text))
+        if current_row:
+            rows.append(current_row)
+
+        # Format as Markdown table
+        if not rows:
+            return ""
+
+        markdown_table = []
+        markdown_table.append("| " + " | ".join(rows[0]) + " |")
+        markdown_table.append("|" + "|".join(["---"] * len(rows[0])) + "|")
+        for row in rows[1:]:
+            markdown_table.append("| " + " | ".join(row) + " |")
+
+        return "\n".join(markdown_table)
+
+    @staticmethod
+    def _extract_table_headers(table_block: Dict[str, Any], all_blocks: List[Dict[str, Any]]) -> List[str]:
+        """Extract headers from a TABLE block (first row)."""
+        headers = []
+        for rel in table_block.get("Relationships", []):
+            if rel["Type"] == "CHILD":
+                for cell_id in rel["Ids"]:
+                    cell = next((b for b in all_blocks if b["Id"] == cell_id), None)
+                    if cell and cell.get("RowIndex") == 1:  # First row = headers
+                        headers.append(cell.get("Text", ""))
+        return headers
+
+    @staticmethod
+    def _is_heading(text: str) -> bool:
+        """Check if text is a heading (short, numbered, or all-caps)."""
+        if not text or len(text.split()) > 8:
+            return False
+        # Numbered headings (e.g., "1.", "A.")
+        if re.match(r'^[0-9A-Za-z]\.\s', text) or re.match(r'^[IVXivx]+\.\s', text):
+            return True
+        # All caps or title case
+        if text.isupper() or (text.istitle() and len(text.split()) <= 5):
+            return True
+        return False
+
+    @staticmethod
+    def _guess_heading_level(text: str) -> int:
+        """Guess heading level (1-6) from text."""
+        if re.match(r'^#\s', text):
+            return len(text.split()[0])  # Count # symbols
+        elif re.match(r'^[0-9]+\.\s', text):
+            return 1
+        elif text.isupper():
+            return 1
+        else:
+            return 2
+############
+#config.py
+"""
+Centralized configuration for the Textract RAG pipeline.
+Loads environment variables and defines S3 paths, chunking settings, and metadata schema.
+"""
+
+import os
+from typing import Dict, List, Any
+
+class Config:
+    """Centralized configuration for the Textract RAG pipeline."""
+
+    # --- AWS Configuration ---
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
+
+    # --- S3 Paths (relative to bucket) ---
+    S3_CONFIG: Dict[str, str] = {
+        "bucket_name": S3_BUCKET_NAME,
+        "source_prefix": os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"),
+        "textract_output": os.getenv("S3_TEXTRACT_OUTPUT", "ecmc_org/RAG/textract-output/"),
+        "parsed_documents": os.getenv("S3_PARSED_DOCUMENTS", "ecmc_org/RAG/parsed-documents/"),
+        "logs": os.getenv("S3_LOGS_PATH", "ecmc_org/RAG/logs/"),
+        "chunking_output": os.getenv("S3_CHUNKING_OUTPUT", "ecmc_org/RAG/chunking-output/"),
+    }
+
+    # --- Textract Configuration ---
+    TEXTRACT_FEATURES: List[str] = ["FORMS", "TABLES", "LAYOUT"]
+    TEXTRACT_MAX_RETRIES: int = 30
+    TEXTRACT_RETRY_DELAY: int = 5  # seconds
+
+    # --- Chunking Configuration ---
+    CHUNKING_CONFIG: Dict[str, Any] = {
+        "token_limit": 512,                # Target chunk size (tokens)
+        "text_overlap": 50,                # Token overlap for text chunks
+        "table_overlap_rows": 2,           # Rows to overlap in table chunks
+        "min_table_rows": 2,              # Minimum rows to consider a table
+        "inject_headers": True,           # Prepend headers to table chunks
+        "table_title_lookup": 5,          # Lines to scan for table titles
+        "fallback_to_text": True,         # Treat unparseable tables as text
+    }
+
+    # --- Metadata Schema ---
+    METADATA_SCHEMA: Dict[str, List[str]] = {
+        "required": [
+            "document_id",
+            "chunk_id",
+            "element_type",  # "heading", "table", "text", "key_value", "selection"
+            "page_number",
+            "position",      # Sequential order in document
+        ],
+        "optional": [
+            "section",        # Parent section header
+            "parent_id",      # ID of parent chunk (e.g., heading)
+            "neighbors",      # List of adjacent chunk IDs
+            "table_id",       # Unique ID for tables
+            "headers",        # Column headers (for tables)
+            "level",         # Heading level (1-6)
+            "row_range",      # For split tables (e.g., "rows 1-10")
+        ]
+    }
+
+    # --- Vector DB Configuration ---
+    VECTOR_DB_CONFIG: Dict[str, Any] = {
+        "provider": os.getenv("VECTOR_DB_PROVIDER", "weaviate"),  # "weaviate" or "pinecone"
+        "embedding_model": os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002"),
+        "enable_graph_queries": True,
+    }
+
+###############################
+"""
+Main pipeline for processing PDFs with Amazon Textract.
+Generates Markdown and TXT outputs, and saves to S3.
+"""
+
+import os
+import re
+import time
+import logging
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+from config import Config
+from utility import S3Manager, TextractManager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+class TextractPipeline:
+    """Orchestrates the Textract RAG pipeline."""
+
+    def __init__(self):
+        """Initialize pipeline components."""
+        self.s3_manager = S3Manager(Config.S3_CONFIG["bucket_name"])
+        self.textract_manager = TextractManager()
+        self.temp_dir = os.path.join(os.path.expanduser("~"), "textract_temp")
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+    def process_pdf(self, s3_key: str) -> bool:
+        """
+        Process a single PDF file from S3.
+        Steps:
+        1. Start Textract job.
+        2. Wait for completion.
+        3. Parse blocks into structured format + TXT/Markdown.
+        4. Upload outputs to S3.
+        5. Log results.
+
+        Args:
+            s3_key: S3 key of the PDF (e.g., "ecmc_org/RAG/Source_data/BK_team.pdf").
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        document_id = os.path.splitext(os.path.basename(s3_key))[0]
+        logger.info(f"Processing PDF: {s3_key}")
+
+        try:
+            # Step 1: Start Textract job
+            job_id = self.textract_manager.start_document_analysis(s3_key)
+            if not self.textract_manager.wait_for_job_completion(job_id):
+                logger.error(f"Textract job {job_id} failed for {s3_key}")
+                return False
+
+            # Step 2: Retrieve and parse results
+            results = self.textract_manager.get_job_results(job_id)
+            blocks = results.get("Blocks", [])
+
+            # Step 3: Parse into structured blocks + TXT/Markdown
+            structured_blocks, plain_text, markdown_text = self.textract_manager.parse_blocks(blocks)
+
+            # Step 4: Generate output filenames
+            output_key_base = f"{Config.S3_CONFIG['textract_output']}{document_id}"
+
+            # Step 5: Save outputs to S3
+            self._upload_outputs(document_id, plain_text, markdown_text, output_key_base)
+
+            logger.info(f"Successfully processed {s3_key}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to process {s3_key}: {e}", exc_info=True)
+            return False
+
+    def _upload_outputs(self, document_id: str, plain_text: str, markdown_text: str, output_key_base: str) -> None:
+        """
+        Upload TXT and Markdown outputs to S3.
+
+        Args:
+            document_id: Base filename (without extension).
+            plain_text: Plain text content.
+            markdown_text: Markdown content.
+            output_key_base: Base S3 key (e.g., "ecmc_org/RAG/textract-output/BK_team").
+        """
+        # Save TXT
+        txt_path = os.path.join(self.temp_dir, f"{document_id}.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(plain_text)
+        self.s3_manager.upload_file(txt_path, f"{output_key_base}.txt")
+
+        # Save Markdown
+        md_path = os.path.join(self.temp_dir, f"{document_id}.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(markdown_text)
+        self.s3_manager.upload_file(md_path, f"{output_key_base}.md")
+
+        # Clean up
+        for path in [txt_path, md_path]:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def process_all_pdfs(self) -> None:
+        """Process all PDFs in S3_SOURCE_PREFIX."""
+        prefix = Config.S3_CONFIG["source_prefix"]
+        s3_keys = self.s3_manager.list_objects(prefix)
+        pdf_keys = [key for key in s3_keys if key.lower().endswith(".pdf")]
+
+        logger.info(f"Found {len(pdf_keys)} PDFs to process in {prefix}")
+
+        for s3_key in pdf_keys:
+            self.process_pdf(s3_key)
+
+    def upload_logs(self) -> None:
+        """Upload logs to S3."""
+        log_files = [f for f in os.listdir(self.temp_dir) if f.endswith(".log")]
+        for log_file in log_files:
+            log_path = os.path.join(self.temp_dir, log_file)
+            log_key = f"{Config.S3_CONFIG['logs']}{log_file}"
+            self.s3_manager.upload_file(log_path, log_key)
+            logger.info(f"Uploaded logs to s3://{Config.S3_CONFIG['bucket_name']}/{log_key}")
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler for the Textract pipeline.
+    Processes PDFs from S3 and saves outputs + logs to S3.
+    """
+    try:
+        logger.info("Lambda function started")
+        pipeline = TextractPipeline()
+        pipeline.process_all_pdfs()
+        pipeline.upload_logs()
+        logger.info("Lambda function completed successfully")
+        return {
+            "statusCode": 200,
+            "body": f"Processed {len(pipeline.s3_manager.list_objects(Config.S3_CONFIG['source_prefix']))} PDFs",
+        }
+    except Exception as e:
+        logger.error(f"Lambda function failed: {e}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "body": f"Error: {str(e)}",
+        }
+
+if __name__ == "__main__":
+    # For local testing
+    pipeline = TextractPipeline()
+    pipeline.process_all_pdfs()
+    pipeline.upload_logs()
+
+
+
+
+#########################
 S3_CONFIG = {
     "bucket_name": "bankrupcy-data-bkt",
     "source_prefix": "ecmc_org/RAG/Source_data/",
