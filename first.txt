@@ -1,4 +1,536 @@
 """
+Structure-aware chunking engine for RAG pipelines.
+
+Pipeline:
+  1. Read Markdown from S3 (with YAML frontmatter + HTML page markers)
+  2. Split by Markdown headers (#, ##, ###)
+  3. Detect tables → keep atomic or split by rows with header injection
+  4. Fallback to RecursiveCharacterTextSplitter for oversized text sections
+  5. Enrich metadata (page, section, parent_id, prev/next links)
+  6. Save as JSON Lines (.jsonl) to S3
+
+Dependencies:
+  pip install langchain-text-splitters
+"""
+
+import json
+import logging
+import re
+import time
+from pathlib import Path
+from typing import List, Dict, Optional, Any, Tuple
+
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
+from config import config
+from utility import S3Manager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Regex for HTML page markers injected by Textract post-processor
+PAGE_MARKER_RE = re.compile(r"<!--\s*page:\s*(\d+)\s*-->")
+
+# Regex for YAML frontmatter
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
+
+
+class ChunkingEngine:
+    """Structure-aware chunking with table preservation and metadata enrichment."""
+
+    def __init__(self):
+        self.md_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=[
+                ("#", "Header_1"),
+                ("##", "Header_2"),
+                ("###", "Header_3"),
+            ],
+            strip_headers=False,  # Keep headers in chunk text for context
+        )
+        self.recursive_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.CHUNK_SIZE_CHARS,
+            chunk_overlap=config.CHUNK_OVERLAP_CHARS,
+            separators=["\n\n", "\n", ". ", " "],
+            length_function=len,
+        )
+        self.s3 = S3Manager(
+            bucket_name=config.S3_BUCKET_NAME,
+            region=config.AWS_REGION,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def chunk_document_from_s3(self, md_s3_key: str) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Read a Markdown file from S3, chunk it, and return chunks + log.
+
+        Args:
+            md_s3_key: S3 key of the .md file (e.g., ecmc_org/RAG/textract-output/doc1.md)
+
+        Returns:
+            Tuple of (chunks list, log string).
+        """
+        logger.info(f"Chunking document from S3: {md_s3_key}")
+
+        md_text = self.s3.get_string(md_s3_key)
+        if md_text is None:
+            raise ValueError(f"Could not read {md_s3_key} from S3")
+
+        document_id = self._extract_document_id(md_s3_key, md_text)
+        chunks = self.chunk_markdown(md_text, document_id, source_s3_key=md_s3_key)
+
+        log = self._generate_chunking_log(document_id, md_s3_key, chunks)
+        return chunks, log
+
+    def chunk_markdown(
+        self,
+        md_text: str,
+        document_id: str,
+        source_s3_key: str = "",
+    ) -> List[Dict[str, Any]]:
+        """
+        Core chunking logic. Operates on Markdown string in memory.
+
+        Args:
+            md_text: Full Markdown content (with frontmatter + page markers).
+            document_id: Unique document identifier.
+            source_s3_key: Original S3 key for provenance.
+
+        Returns:
+            List of chunk dicts ready for .jsonl serialization.
+        """
+        # 1. Strip frontmatter before header splitting
+        body_text = self._strip_frontmatter(md_text)
+
+        # 2. Build page-marker map: position in text → page number
+        page_markers = self._build_page_marker_map(body_text)
+
+        # 3. Split by Markdown headers
+        sections = self.md_splitter.split_text(body_text)
+        logger.info(f"Document '{document_id}' split into {len(sections)} header sections")
+
+        all_chunks: List[Dict[str, Any]] = []
+        section_idx = 0
+
+        for section in sections:
+            section_idx += 1
+            content = section.page_content
+            meta = section.metadata  # e.g., {"Header_1": "Title", "Header_2": "Sub"}
+
+            # Build human-readable section path
+            section_path = " > ".join(
+                v for k, v in sorted(meta.items()) if v
+            )
+            section_level = len(meta)
+            parent_id = f"{document_id}_sec_{section_idx:03d}"
+
+            # Determine page number from first page marker in this section
+            page_number = self._resolve_page_number(content, page_markers, body_text)
+
+            # 4. Detect and handle tables
+            table_chunks = self._extract_and_chunk_tables(
+                content,
+                section_path=section_path,
+                section_level=section_level,
+                page_number=page_number,
+                parent_id=parent_id,
+                document_id=document_id,
+                source_s3_key=source_s3_key,
+            )
+
+            if table_chunks:
+                all_chunks.extend(table_chunks)
+                continue
+
+            # 5. No table → standard text chunking with recursive fallback
+            text_chunks = self._chunk_text_section(
+                content,
+                section_path=section_path,
+                section_level=section_level,
+                page_number=page_number,
+                parent_id=parent_id,
+                document_id=document_id,
+                source_s3_key=source_s3_key,
+            )
+            all_chunks.extend(text_chunks)
+
+        # 6. Link prev/next chunk IDs globally
+        all_chunks = self._link_neighbors(all_chunks)
+
+        logger.info(
+            f"Document '{document_id}' → {len(all_chunks)} final chunks "
+            f"(tables: {sum(1 for c in all_chunks if c['metadata']['contains_table'])})"
+        )
+        return all_chunks
+
+    def save_chunks_to_s3(
+        self,
+        chunks: List[Dict[str, Any]],
+        document_id: str,
+        log: str = "",
+    ) -> str:
+        """
+        Save chunks as .jsonl to S3 and optionally save the log.
+
+        Returns:
+            S3 key of the saved .jsonl file.
+        """
+        jsonl_key = f"{config.S3_CHUNKING_OUTPUT_PREFIX}{document_id}.jsonl"
+        jsonl_body = "\n".join(
+            json.dumps(chunk, ensure_ascii=False) for chunk in chunks
+        )
+        self.s3.put_string(
+            jsonl_key,
+            jsonl_body,
+            content_type="application/jsonlines",
+        )
+
+        if log:
+            log_key = f"{config.S3_LOGS_PREFIX}chunking_{document_id}_{int(time.time())}.txt"
+            self.s3.put_string(log_key, log)
+
+        return jsonl_key
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_document_id(md_s3_key: str, md_text: str) -> str:
+        """Extract document_id from YAML frontmatter or S3 key stem."""
+        match = FRONTMATTER_RE.search(md_text)
+        if match:
+            fm = match.group(1)
+            for line in fm.split("\n"):
+                if line.strip().startswith("document_id:"):
+                    return line.split(":", 1)[1].strip().strip('"').strip("'")
+        return Path(md_s3_key).stem
+
+    @staticmethod
+    def _strip_frontmatter(md_text: str) -> str:
+        """Remove YAML frontmatter so MarkdownHeaderTextSplitter works cleanly."""
+        match = FRONTMATTER_RE.search(md_text)
+        if match:
+            return md_text[match.end():]
+        return md_text
+
+    @staticmethod
+    def _build_page_marker_map(text: str) -> List[Tuple[int, int]]:
+        """
+        Build a list of (char_position, page_number) from HTML comments.
+        Sorted by position.
+        """
+        markers = []
+        for match in PAGE_MARKER_RE.finditer(text):
+            pos = match.start()
+            page = int(match.group(1))
+            markers.append((pos, page))
+        markers.sort()
+        return markers
+
+    @staticmethod
+    def _resolve_page_number(
+        section_text: str, page_markers: List[Tuple[int, int]], full_body: str
+    ) -> int:
+        """
+        Find the page number for a section by looking at the first page marker
+        that appears before or within the section text.
+        """
+        # Find where this section starts in the full body
+        idx = full_body.find(section_text)
+        if idx == -1:
+            return 1
+
+        # Walk backwards through markers to find the nearest preceding one
+        best_page = 1
+        for pos, page in page_markers:
+            if pos <= idx:
+                best_page = page
+            else:
+                break
+        return best_page
+
+    def _extract_and_chunk_tables(
+        self,
+        text: str,
+        section_path: str,
+        section_level: int,
+        page_number: int,
+        parent_id: str,
+        document_id: str,
+        source_s3_key: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        If the text contains one or more Markdown tables, extract and chunk them.
+        Returns None if no tables found (caller falls back to text chunking).
+        """
+        tables = self._find_markdown_tables(text)
+        if not tables:
+            return None
+
+        chunks = []
+        for table_idx, table_md in enumerate(tables, 1):
+            header_row, separator, data_rows, table_headers = self._parse_table_rows(table_md)
+
+            if not header_row or not separator:
+                # Malformed table → treat as plain text
+                continue
+
+            # Section context to inject above every table chunk
+            context_prefix = f"# {section_path}\n\n" if section_path else ""
+
+            if len(data_rows) <= config.MAX_TABLE_CHUNK_ROWS:
+                # Atomic table chunk
+                chunk_text = context_prefix + "\n".join([header_row, separator] + data_rows)
+                chunks.append(self._build_chunk(
+                    text=chunk_text,
+                    document_id=document_id,
+                    source_s3_key=source_s3_key,
+                    page_number=page_number,
+                    section=section_path,
+                    section_level=section_level,
+                    element_type="table",
+                    parent_id=parent_id,
+                    contains_table=True,
+                    table_headers=table_headers,
+                ))
+            else:
+                # Split table by row groups
+                for i in range(0, len(data_rows), config.MAX_TABLE_CHUNK_ROWS):
+                    group = data_rows[i : i + config.MAX_TABLE_CHUNK_ROWS]
+                    chunk_text = context_prefix + "\n".join([header_row, separator] + group)
+                    chunks.append(self._build_chunk(
+                        text=chunk_text,
+                        document_id=document_id,
+                        source_s3_key=source_s3_key,
+                        page_number=page_number,
+                        section=section_path,
+                        section_level=section_level,
+                        element_type="table",
+                        parent_id=parent_id,
+                        contains_table=True,
+                        table_headers=table_headers,
+                    ))
+
+        # If there is non-table text mixed in, we should also chunk that.
+        # For simplicity in v1, we return only table chunks when tables are detected.
+        # TODO: interleave non-table text chunks between table chunks.
+        return chunks if chunks else None
+
+    @staticmethod
+    def _find_markdown_tables(text: str) -> List[str]:
+        """
+        Find all Markdown pipe tables in the text.
+        A table = consecutive lines starting with '|', with at least 2 rows
+        (header + separator).
+        """
+        lines = text.split("\n")
+        tables = []
+        current = []
+        in_table = False
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("|"):
+                current.append(line)
+                in_table = True
+            else:
+                if in_table and len(current) >= 2:
+                    tables.append("\n".join(current))
+                current = []
+                in_table = False
+
+        if in_table and len(current) >= 2:
+            tables.append("\n".join(current))
+
+        return tables
+
+    @staticmethod
+    def _parse_table_rows(table_md: str) -> Tuple[str, str, List[str], List[str]]:
+        """
+        Parse a Markdown table into (header_row, separator, data_rows, headers_list).
+        """
+        lines = [l.strip() for l in table_md.strip().split("\n") if l.strip()]
+        if len(lines) < 2:
+            return "", "", [], []
+
+        header_row = lines[0]
+        separator = lines[1]
+        data_rows = lines[2:]
+
+        # Extract header names
+        headers = [c.strip() for c in header_row.strip("|").split("|")]
+        return header_row, separator, data_rows, headers
+
+    def _chunk_text_section(
+        self,
+        text: str,
+        section_path: str,
+        section_level: int,
+        page_number: int,
+        parent_id: str,
+        document_id: str,
+        source_s3_key: str,
+    ) -> List[Dict[str, Any]]:
+        """Chunk a text section using RecursiveCharacterTextSplitter if needed."""
+        if len(text) <= config.CHUNK_SIZE_CHARS:
+            return [self._build_chunk(
+                text=text,
+                document_id=document_id,
+                source_s3_key=source_s3_key,
+                page_number=page_number,
+                section=section_path,
+                section_level=section_level,
+                element_type="paragraph",
+                parent_id=parent_id,
+                contains_table=False,
+                table_headers=None,
+            )]
+
+        sub_chunks = self.recursive_splitter.split_text(text)
+        return [
+            self._build_chunk(
+                text=sc,
+                document_id=document_id,
+                source_s3_key=source_s3_key,
+                page_number=page_number,
+                section=section_path,
+                section_level=section_level,
+                element_type="paragraph",
+                parent_id=parent_id,
+                contains_table=False,
+                table_headers=None,
+            )
+            for sc in sub_chunks
+        ]
+
+    def _build_chunk(
+        self,
+        text: str,
+        document_id: str,
+        source_s3_key: str,
+        page_number: int,
+        section: str,
+        section_level: int,
+        element_type: str,
+        parent_id: str,
+        contains_table: bool,
+        table_headers: Optional[List[str]],
+    ) -> Dict[str, Any]:
+        """Assemble a single chunk dict with metadata."""
+        return {
+            "chunk_id": "",  # filled later by _link_neighbors
+            "text": text.strip(),
+            "metadata": {
+                "document_id": document_id,
+                "source_s3_key": source_s3_key,
+                "page_number": page_number,
+                "section": section,
+                "section_level": section_level,
+                "element_type": element_type,
+                "parent_id": parent_id,
+                "prev_chunk_id": None,
+                "next_chunk_id": None,
+                "contains_table": contains_table,
+                "table_headers": table_headers,
+                "char_count": len(text),
+                "token_estimate": len(text) // 4,
+            },
+        }
+
+    @staticmethod
+    def _link_neighbors(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Assign chunk_ids and link prev/next references."""
+        document_id = chunks[0]["metadata"]["document_id"] if chunks else "doc"
+        for i, chunk in enumerate(chunks):
+            chunk["chunk_id"] = f"{document_id}_{i:04d}"
+            if i > 0:
+                chunk["metadata"]["prev_chunk_id"] = chunks[i - 1]["chunk_id"]
+            if i < len(chunks) - 1:
+                chunk["metadata"]["next_chunk_id"] = chunks[i + 1]["chunk_id"]
+        return chunks
+
+    @staticmethod
+    def _generate_chunking_log(
+        document_id: str, source_key: str, chunks: List[Dict[str, Any]]
+    ) -> str:
+        """Generate a human-readable log of the chunking operation."""
+        total = len(chunks)
+        tables = sum(1 for c in chunks if c["metadata"]["contains_table"])
+        avg_len = sum(c["metadata"]["char_count"] for c in chunks) // total if total else 0
+
+        lines = [
+            "=" * 70,
+            f"CHUNKING LOG: {document_id}",
+            "=" * 70,
+            f"Source         : {source_key}",
+            f"Total chunks   : {total}",
+            f"Table chunks   : {tables}",
+            f"Text chunks    : {total - tables}",
+            f"Avg chars/chunk: {avg_len}",
+            f"Target size    : {config.CHUNK_SIZE_TOKENS} tokens (~{config.CHUNK_SIZE_CHARS} chars)",
+            "-" * 70,
+        ]
+        for c in chunks:
+            m = c["metadata"]
+            t = "[TBL]" if m["contains_table"] else "[TXT]"
+            lines.append(
+                f"{c['chunk_id']} {t} page={m['page_number']} "
+                f"chars={m['char_count']} section="{m['section']}""
+            )
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# Standalone helper for batch chunking
+# ------------------------------------------------------------------
+
+def run_chunking_pipeline(md_s3_prefix: Optional[str] = None):
+    """
+    Discover all .md files under the Textract output prefix, chunk each,
+    and save .jsonl + logs to S3.
+    """
+    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
+    engine = ChunkingEngine()
+
+    prefix = md_s3_prefix or config.S3_TEXTRACT_OUTPUT_PREFIX
+    md_keys = [
+        k for k in s3.list_objects(prefix=prefix)
+        if k.endswith(".md")
+    ]
+
+    logger.info(f"Found {len(md_keys)} Markdown files to chunk under {prefix}")
+    results = []
+
+    for md_key in md_keys:
+        try:
+            chunks, log = engine.chunk_document_from_s3(md_key)
+            doc_name = Path(md_key).stem
+            jsonl_key = engine.save_chunks_to_s3(chunks, doc_name, log=log)
+            results.append((md_key, True, jsonl_key))
+        except Exception as e:
+            logger.error(f"Chunking failed for {md_key}: {e}")
+            results.append((md_key, False, str(e)))
+
+    # Save batch report
+    report_lines = ["CHUNKING BATCH REPORT", "=" * 70]
+    for mk, ok, msg in results:
+        status = "PASS" if ok else "FAIL"
+        report_lines.append(f"[{status}] {Path(mk).name} → {msg}")
+    report = "\n".join(report_lines)
+
+    report_key = f"{config.S3_LOGS_PREFIX}chunking_batch_report_{int(time.time())}.txt"
+    s3.put_string(report_key, report)
+    logger.info(f"Batch report saved to {report_key}")
+    return results
+######################
+"""
 Centralized configuration for the Textract RAG pipeline.
 Loads environment variables and defines S3 paths, chunking, and Lambda settings.
 """
