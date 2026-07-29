@@ -1,3 +1,18 @@
+from textract_processor import TextractPipeline
+from chunking_engine import run_chunking_pipeline
+
+# ── Step 1: Run Textract on all source PDFs ──
+pipeline = TextractPipeline()
+results = pipeline.run_sequential()   # or run_parallel(max_workers=3)
+pipeline.generate_report(results)
+
+# ── Step 2: Chunk all generated .md files ──
+print("\n" + "="*50)
+print("Starting chunking phase...")
+chunk_results = run_chunking_pipeline()
+
+print(f"\nChunking complete. Processed {len(chunk_results)} documents.")
+#######################
 """
 Structure-aware chunking engine for RAG pipelines.
 
