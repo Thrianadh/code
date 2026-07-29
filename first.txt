@@ -1,3 +1,54 @@
+def save_to_s3(self, name="faiss_index"):
+    if self.index is None:
+        raise ValueError("Index is empty; nothing to save.")
+
+    import tempfile
+    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
+    tmp_dir = tempfile.gettempdir()
+
+    # Save FAISS index
+    local_index = os.path.join(tmp_dir, f"{name}.faiss")
+    faiss.write_index(self.index, local_index)
+    index_key = f"{config.S3_VECTORSTORE_PREFIX}{name}.faiss"
+    s3.upload_file(local_index, index_key)
+    os.remove(local_index)
+
+    # Save metadata
+    local_meta = os.path.join(tmp_dir, f"{name}_meta.pkl")
+    with open(local_meta, "wb") as f:
+        pickle.dump({"chunks": self.chunks, "id_map": self._id_map}, f)
+    meta_key = f"{config.S3_VECTORSTORE_PREFIX}{name}_meta.pkl"
+    s3.upload_file(local_meta, meta_key)
+    os.remove(local_meta)
+
+    print(f"Saved FAISS index to {index_key}")
+    return index_key, meta_key
+
+def load_from_s3(self, name="faiss_index"):
+    import tempfile
+    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
+    tmp_dir = tempfile.gettempdir()
+
+    index_key = f"{config.S3_VECTORSTORE_PREFIX}{name}.faiss"
+    meta_key = f"{config.S3_VECTORSTORE_PREFIX}{name}_meta.pkl"
+
+    local_index = os.path.join(tmp_dir, f"{name}.faiss")
+    if not s3.download_file(index_key, local_index):
+        raise FileNotFoundError(f"FAISS index not found at {index_key}")
+    self.index = faiss.read_index(local_index)
+    os.remove(local_index)
+
+    local_meta = os.path.join(tmp_dir, f"{name}_meta.pkl")
+    if not s3.download_file(meta_key, local_meta):
+        raise FileNotFoundError(f"Metadata not found at {meta_key}")
+    with open(local_meta, "rb") as f:
+        data = pickle.load(f)
+    self.chunks = data["chunks"]
+    self._id_map = data["id_map"]
+    os.remove(local_meta)
+
+    print(f"Loaded FAISS index with {self.index.ntotal} vectors from S3")
+################################################
 from faiss_vector_store import FAISSVectorStore
 from retrieval_engine import RetrievalEngine
 
