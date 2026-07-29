@@ -1,3 +1,11 @@
+from config import config
+print(type(config.CHUNK_SIZE_CHARS))   # Should print: <class 'int'>
+print(config.CHUNK_SIZE_CHARS)         # Should print: 2048
+
+from chunking_engine import ChunkingEngine
+engine = ChunkingEngine()
+print(type(engine.recursive_splitter._chunk_size))  # Should print: <class 'int'>
+#####
 """
 Centralized configuration for the Textract RAG pipeline.
 Loads environment variables and defines S3 paths, chunking, and Lambda settings.
