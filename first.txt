@@ -1,3 +1,16 @@
+S3_CONFIG = {
+    "bucket_name": "bankrupcy-data-bkt",
+    "source_prefix": "ecmc_org/RAG/Source_data/",
+    "parsed_documents": "ecmc_org/RAG/parsed-documents/",
+    "logs": "ecmc_org/RAG/logs/",
+}
+
+import tempfile
+print(tempfile.gettempdir())  # Should print a valid path like C:\Users\...\AppData\Local\Temp
+
+processor = EnhancedTextractPostProcessor(Config)
+processor.process_pdf("ecmc_org/RAG/Source_data/BK_team.pdf")
+############
 """
 Enhanced Textract Post-Processor for ECMC Financial Documents.
 Fixes:
