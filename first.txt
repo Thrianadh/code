@@ -1,3 +1,635 @@
+"""
+Reusable utilities for S3, Textract, logging, and document processing.
+Production-grade with proper reading order, paragraph grouping,
+heading detection, and robust table parsing.
+"""
+
+import os
+import re
+import logging
+from typing import Dict, List, Optional, Any, Tuple, Set
+from dataclasses import dataclass, field
+from collections import defaultdict
+
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses for structured output
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TextElement:
+    """Represents a single text element with metadata."""
+    text: str
+    block_type: str  # LINE, WORD, etc.
+    page: int
+    confidence: float
+    bbox: Dict[str, float]  # Top, Left, Width, Height
+    block_id: str
+    is_heading: bool = False
+    heading_level: int = 0
+
+
+@dataclass
+class TableCell:
+    """Represents a table cell."""
+    text: str
+    row_index: int
+    column_index: int
+    row_span: int = 1
+    column_span: int = 1
+    is_header: bool = False
+    confidence: float = 0.0
+
+
+@dataclass
+class TableElement:
+    """Represents a parsed table."""
+    cells: List[TableCell] = field(default_factory=list)
+    page: int = 1
+    bbox: Dict[str, float] = field(default_factory=dict)
+    block_id: str = ""
+    column_count: int = 0
+
+
+@dataclass
+class ParsedDocument:
+    """Structured document output."""
+    elements: List[Any] = field(default_factory=list)
+    plain_text: str = ""
+    markdown_text: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# S3 Manager
+# ---------------------------------------------------------------------------
+
+class S3Manager:
+    """Handles all S3 operations (upload, download, list, validate)."""
+
+    def __init__(self, bucket_name: str, region: str = "us-east-1"):
+        """Initialize S3 client."""
+        self.bucket_name = bucket_name
+        self.s3_client = boto3.client("s3", region_name=region)
+
+    def upload_file(
+        self,
+        local_file_path: str,
+        s3_key: str,
+        extra_args: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Upload a file to S3."""
+        try:
+            self.s3_client.upload_file(
+                local_file_path,
+                self.bucket_name,
+                s3_key,
+                ExtraArgs=extra_args or {},
+            )
+            logger.info(f"Uploaded {local_file_path} to s3://{self.bucket_name}/{s3_key}")
+            return True
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to upload {local_file_path}: {e}")
+            return False
+
+    def download_file(self, s3_key: str, local_file_path: str) -> bool:
+        """Download a file from S3."""
+        try:
+            self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
+            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} to {local_file_path}")
+            return True
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to download {s3_key}: {e}")
+            return False
+
+    def list_objects(self, prefix: str = "") -> List[str]:
+        """List all objects under a prefix in the S3 bucket."""
+        try:
+            paginator = self.s3_client.get_paginator("list_objects_v2")
+            objects = []
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
+                objects.extend([obj["Key"] for obj in page.get("Contents", [])])
+            return objects
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to list objects: {e}")
+            return []
+
+    def validate_path(self, s3_key: str) -> bool:
+        """Validate if an S3 object exists."""
+        try:
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            return True
+        except (ClientError, BotoCoreError):
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Textract Manager
+# ---------------------------------------------------------------------------
+
+class TextractManager:
+    """Handles Amazon Textract operations with enhanced post-processing."""
+
+    def __init__(self, region: str = "us-east-1"):
+        """Initialize Textract client."""
+        self.textract_client = boto3.client("textract", region_name=region)
+
+    def start_document_analysis(
+        self,
+        s3_bucket: str,
+        s3_key: str,
+        features: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Start a Textract document analysis job.
+
+        Args:
+            s3_bucket: S3 bucket name containing the document.
+            s3_key: S3 key of the document to analyze.
+            features: List of Textract features (FORMS, TABLES, LAYOUT).
+
+        Returns:
+            str: Job ID for tracking.
+        """
+        features = features or ["TABLES", "FORMS", "LAYOUT"]
+        try:
+            response = self.textract_client.start_document_analysis(
+                DocumentLocation={
+                    "S3Object": {
+                        "Bucket": s3_bucket,
+                        "Name": s3_key,
+                    }
+                },
+                FeatureTypes=features,
+            )
+            job_id = response["JobId"]
+            logger.info(f"Started Textract job {job_id} for s3://{s3_bucket}/{s3_key}")
+            return job_id
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to start Textract job for {s3_key}: {e}")
+            raise
+
+    def get_job_status(self, job_id: str) -> str:
+        """Get the status of a Textract job."""
+        try:
+            response = self.textract_client.get_document_analysis(JobId=job_id)
+            return response["JobStatus"]
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to get job status for {job_id}: {e}")
+            raise
+
+    def wait_for_job_completion(self, job_id: str, max_retries: int = 60, sleep_sec: int = 5) -> bool:
+        """
+        Poll Textract job status until completion.
+
+        Args:
+            job_id: Textract job ID.
+            max_retries: Maximum number of retries.
+            sleep_sec: Seconds between polls.
+
+        Returns:
+            bool: True if job succeeded, False otherwise.
+        """
+        import time
+        for attempt in range(max_retries):
+            status = self.get_job_status(job_id)
+            if status == "SUCCEEDED":
+                logger.info(f"Textract job {job_id} succeeded.")
+                return True
+            elif status == "FAILED":
+                logger.error(f"Textract job {job_id} failed.")
+                return False
+            logger.info(f"Job {job_id} status: {status}. Retry {attempt + 1}/{max_retries}...")
+            time.sleep(sleep_sec)
+        logger.error(f"Textract job {job_id} timed out after {max_retries} retries.")
+        return False
+
+    def get_job_results(self, job_id: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve ALL results from a completed Textract job with pagination.
+
+        Args:
+            job_id: Textract job ID.
+
+        Returns:
+            List[Dict]: All blocks from the document analysis.
+        """
+        blocks = []
+        next_token = None
+        try:
+            while True:
+                kwargs = {"JobId": job_id}
+                if next_token:
+                    kwargs["NextToken"] = next_token
+                
+                response = self.textract_client.get_document_analysis(**kwargs)
+                blocks.extend(response.get("Blocks", []))
+                next_token = response.get("NextToken")
+                if not next_token:
+                    break
+            logger.info(f"Retrieved {len(blocks)} blocks for job {job_id}")
+            return blocks
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to get results for job {job_id}: {e}")
+            raise
+
+    # -----------------------------------------------------------------------
+    # Enhanced Post-Processing
+    # -----------------------------------------------------------------------
+
+    def parse_document(self, blocks: List[Dict[str, Any]]) -> ParsedDocument:
+        """
+        Parse Textract blocks into a structured document with proper reading order,
+        paragraph grouping, heading detection, and table reconstruction.
+
+        Args:
+            blocks: Raw Textract blocks.
+
+        Returns:
+            ParsedDocument: Structured document with plain text and markdown.
+        """
+        # Build lookup maps
+        block_map = {b["Id"]: b for b in blocks}
+        page_blocks = [b for b in blocks if b["BlockType"] == "PAGE"]
+        
+        # Group blocks by page
+        blocks_by_page = defaultdict(list)
+        for block in blocks:
+            page = block.get("Page", 1)
+            blocks_by_page[page].append(block)
+
+        elements = []
+        
+        for page_num in sorted(blocks_by_page.keys()):
+            page_blocks_list = blocks_by_page[page_num]
+            
+            # Separate block types
+            lines = [b for b in page_blocks_list if b["BlockType"] == "LINE"]
+            tables = [b for b in page_blocks_list if b["BlockType"] == "TABLE"]
+            words = [b for b in page_blocks_list if b["BlockType"] == "WORD"]
+            
+            # Build reading order for lines (handle multi-column layouts)
+            ordered_lines = self._reconstruct_reading_order(lines)
+            
+            # Detect headings
+            heading_ids = self._detect_headings(ordered_lines, words)
+            
+            # Group lines into paragraphs
+            paragraphs = self._group_paragraphs(ordered_lines)
+            
+            # Process tables
+            table_elements = []
+            for table_block in tables:
+                table_elem = self._parse_table_enhanced(table_block, block_map)
+                table_elem.page = page_num
+                table_elements.append(table_elem)
+            
+            # Merge paragraphs and tables in reading order
+            page_elements = self._merge_elements(paragraphs, table_elements, page_num)
+            elements.extend(page_elements)
+
+        # Generate outputs
+        plain_text = self._generate_plain_text(elements)
+        markdown_text = self._generate_markdown(elements)
+        
+        metadata = {
+            "total_pages": max(blocks_by_page.keys()) if blocks_by_page else 0,
+            "total_blocks": len(blocks),
+            "total_lines": len([b for b in blocks if b["BlockType"] == "LINE"]),
+            "total_tables": len([b for b in blocks if b["BlockType"] == "TABLE"]),
+        }
+        
+        return ParsedDocument(
+            elements=elements,
+            plain_text=plain_text,
+            markdown_text=markdown_text,
+            metadata=metadata,
+        )
+
+    def _reconstruct_reading_order(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Reconstruct proper reading order using bounding boxes.
+        Handles multi-column layouts by grouping lines into horizontal bands first.
+        """
+        if not lines:
+            return []
+        
+        # Sort by Top position to group into horizontal bands
+        lines_sorted = sorted(lines, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0))
+        
+        # Group into horizontal bands (lines within ~2% vertical distance)
+        bands = []
+        current_band = [lines_sorted[0]]
+        band_threshold = 0.02
+        
+        for line in lines_sorted[1:]:
+            prev_top = current_band[-1].get("Geometry", {}).get("BoundingBox", {}).get("Top", 0)
+            curr_top = line.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0)
+            
+            if abs(curr_top - prev_top) <= band_threshold:
+                current_band.append(line)
+            else:
+                # Sort current band by Left position
+                bands.append(sorted(current_band, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0)))
+                current_band = [line]
+        
+        if current_band:
+            bands.append(sorted(current_band, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0)))
+        
+        # Flatten bands
+        ordered = []
+        for band in bands:
+            ordered.extend(band)
+        
+        return ordered
+
+    def _detect_headings(self, lines: List[Dict[str, Any]], words: List[Dict[str, Any]]) -> Set[str]:
+        """
+        Detect headings using heuristics:
+        - Short line length (< 100 chars)
+        - All caps or title case
+        - Position (top of page or after blank space)
+        - Font size (taller bounding box than average)
+        """
+        heading_ids = set()
+        if not lines:
+            return heading_ids
+        
+        # Calculate average line height
+        heights = []
+        for line in lines:
+            bbox = line.get("Geometry", {}).get("BoundingBox", {})
+            heights.append(bbox.get("Height", 0))
+        avg_height = sum(heights) / len(heights) if heights else 0.01
+        
+        for i, line in enumerate(lines):
+            text = line.get("Text", "").strip()
+            if not text:
+                continue
+            
+            bbox = line.get("Geometry", {}).get("BoundingBox", {})
+            height = bbox.get("Height", 0)
+            
+            # Heuristics
+            is_short = len(text) < 100
+            is_tall = height > avg_height * 1.3
+            is_all_caps = text.isupper() and len(text) > 3
+            is_title_case = text.istitle() and len(text.split()) <= 10
+            
+            # Position heuristic: first line on page or after significant gap
+            is_prominent = False
+            if i == 0:
+                is_prominent = True
+            elif i > 0:
+                prev_bbox = lines[i-1].get("Geometry", {}).get("BoundingBox", {})
+                curr_top = bbox.get("Top", 0)
+                prev_bottom = prev_bbox.get("Top", 0) + prev_bbox.get("Height", 0)
+                gap = curr_top - prev_bottom
+                if gap > avg_height * 2:
+                    is_prominent = True
+            
+            # Combined score
+            score = sum([
+                is_short,
+                is_tall,
+                is_all_caps,
+                is_title_case,
+                is_prominent,
+            ])
+            
+            if score >= 3 or (is_all_caps and is_short) or (is_tall and is_prominent):
+                heading_ids.add(line["Id"])
+        
+        return heading_ids
+
+    def _group_paragraphs(self, lines: List[Dict[str, Any]]) -> List[TextElement]:
+        """
+        Group lines into paragraphs based on vertical proximity and indentation.
+        """
+        if not lines:
+            return []
+        
+        paragraphs = []
+        current_para_lines = [lines[0]]
+        
+        for i in range(1, len(lines)):
+            prev_line = lines[i - 1]
+            curr_line = lines[i]
+            
+            prev_bbox = prev_line.get("Geometry", {}).get("BoundingBox", {})
+            curr_bbox = curr_line.get("Geometry", {}).get("BoundingBox", {})
+            
+            prev_bottom = prev_bbox.get("Top", 0) + prev_bbox.get("Height", 0)
+            curr_top = curr_bbox.get("Top", 0)
+            vertical_gap = curr_top - prev_bottom
+            
+            prev_left = prev_bbox.get("Left", 0)
+            curr_left = curr_bbox.get("Left", 0)
+            horizontal_diff = abs(curr_left - prev_left)
+            
+            # Thresholds
+            line_height = prev_bbox.get("Height", 0.01)
+            para_gap_threshold = line_height * 1.8
+            
+            # Check if new paragraph
+            is_new_para = (
+                vertical_gap > para_gap_threshold or  # Significant vertical gap
+                horizontal_diff > 0.05  # Significant indentation change
+            )
+            
+            if is_new_para:
+                # Flush current paragraph
+                para_text = " ".join(l.get("Text", "") for l in current_para_lines)
+                first_line = current_para_lines[0]
+                bbox = first_line.get("Geometry", {}).get("BoundingBox", {})
+                
+                paragraphs.append(TextElement(
+                    text=para_text,
+                    block_type="PARAGRAPH",
+                    page=first_line.get("Page", 1),
+                    confidence=min(l.get("Confidence", 99) for l in current_para_lines),
+                    bbox=bbox,
+                    block_id=first_line["Id"],
+                ))
+                current_para_lines = [curr_line]
+            else:
+                current_para_lines.append(curr_line)
+        
+        # Flush last paragraph
+        if current_para_lines:
+            para_text = " ".join(l.get("Text", "") for l in current_para_lines)
+            first_line = current_para_lines[0]
+            bbox = first_line.get("Geometry", {}).get("BoundingBox", {})
+            
+            paragraphs.append(TextElement(
+                text=para_text,
+                block_type="PARAGRAPH",
+                page=first_line.get("Page", 1),
+                confidence=min(l.get("Confidence", 99) for l in current_para_lines),
+                bbox=bbox,
+                block_id=first_line["Id"],
+            ))
+        
+        return paragraphs
+
+    def _parse_table_enhanced(
+        self,
+        table_block: Dict[str, Any],
+        block_map: Dict[str, Dict[str, Any]],
+    ) -> TableElement:
+        """
+        Parse a Textract TABLE block into a structured TableElement.
+        Handles merged cells and header detection.
+        """
+        cells = []
+        cell_blocks = []
+        
+        # Collect all cell blocks
+        for rel in table_block.get("Relationships", []):
+            if rel["Type"] == "CHILD":
+                for cell_id in rel["Ids"]:
+                    cell = block_map.get(cell_id)
+                    if cell and cell["BlockType"] == "CELL":
+                        cell_blocks.append(cell)
+        
+        # Extract cell data
+        max_col = 0
+        for cell in cell_blocks:
+            row_idx = cell.get("RowIndex", 0)
+            col_idx = cell.get("ColumnIndex", 0)
+            row_span = cell.get("RowSpan", 1)
+            col_span = cell.get("ColumnSpan", 1)
+            
+            # Extract text from cell children
+            cell_texts = []
+            for rel in cell.get("Relationships", []):
+                if rel["Type"] == "CHILD":
+                    for child_id in rel["Ids"]:
+                        child = block_map.get(child_id)
+                        if child and child["BlockType"] in ("WORD", "LINE", "SELECTION_ELEMENT"):
+                            if child["BlockType"] == "SELECTION_ELEMENT":
+                                status = "[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]"
+                                cell_texts.append(status)
+                            else:
+                                cell_texts.append(child.get("Text", ""))
+            
+            text = " ".join(cell_texts).strip()
+            max_col = max(max_col, col_idx + col_span - 1)
+            
+            # Heuristic: first row is header
+            is_header = row_idx == 1
+            
+            cells.append(TableCell(
+                text=text,
+                row_index=row_idx,
+                column_index=col_idx,
+                row_span=row_span,
+                column_span=col_span,
+                is_header=is_header,
+                confidence=cell.get("Confidence", 0),
+            ))
+        
+        return TableElement(
+            cells=cells,
+            page=table_block.get("Page", 1),
+            bbox=table_block.get("Geometry", {}).get("BoundingBox", {}),
+            block_id=table_block["Id"],
+            column_count=max_col,
+        )
+
+    def _merge_elements(
+        self,
+        paragraphs: List[TextElement],
+        tables: List[TableElement],
+        page_num: int,
+    ) -> List[Any]:
+        """
+        Merge paragraphs and tables into a single list ordered by vertical position.
+        """
+        all_elements = []
+        
+        for para in paragraphs:
+            all_elements.append(("paragraph", para.bbox.get("Top", 0), para))
+        
+        for table in tables:
+            all_elements.append(("table", table.bbox.get("Top", 0), table))
+        
+        # Sort by vertical position
+        all_elements.sort(key=lambda x: x[1])
+        
+        return [elem for _, _, elem in all_elements]
+
+    def _generate_plain_text(self, elements: List[Any]) -> str:
+        """Generate clean plain text from structured elements."""
+        parts = []
+        for elem in elements:
+            if isinstance(elem, TextElement):
+                parts.append(elem.text)
+            elif isinstance(elem, TableElement):
+                parts.append("[TABLE]")
+        return "\n\n".join(parts)
+
+    def _generate_markdown(self, elements: List[Any]) -> str:
+        """Generate Markdown from structured elements."""
+        parts = []
+        for elem in elements:
+            if isinstance(elem, TextElement):
+                if elem.is_heading:
+                    level = min(elem.heading_level, 6)
+                    parts.append(f"{'#' * level} {elem.text}")
+                else:
+                    parts.append(elem.text)
+            elif isinstance(elem, TableElement):
+                parts.append(self._table_to_markdown(elem))
+            parts.append("")  # Blank line between elements
+        return "\n".join(parts)
+
+    def _table_to_markdown(self, table: TableElement) -> str:
+        """Convert TableElement to Markdown table."""
+        if not table.cells:
+            return ""
+        
+        # Group cells by row
+        rows = defaultdict(list)
+        for cell in table.cells:
+            rows[cell.row_index].append(cell)
+        
+        md_lines = []
+        for row_idx in sorted(rows.keys()):
+            row_cells = sorted(rows[row_idx], key=lambda c: c.column_index)
+            cell_texts = [c.text.replace("|", "\\|") for c in row_cells]
+            md_lines.append("| " + " | ".join(cell_texts) + " |")
+            
+            # Add separator after first row (header)
+            if row_idx == 1:
+                md_lines.append("|" + "|".join(["---"] * len(row_cells)) + "|")
+        
+        return "\n".join(md_lines)
+
+    # -----------------------------------------------------------------------
+    # Legacy compatibility
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[str, str]:
+        """
+        Legacy wrapper for backward compatibility.
+        Uses the enhanced parser internally.
+        """
+        manager = TextractManager()
+        doc = manager.parse_document(blocks)
+        return doc.plain_text, doc.markdown_text
+######################################
 @staticmethod
 def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str, str]:
     """
