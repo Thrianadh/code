@@ -1,3 +1,6 @@
+processor = EnhancedTextractPostProcessor(Config)
+processor.process_pdf("ecmc_org/RAG/Source_data/BK_team.pdf")
+################
 """
 Enhanced Textract Post-Processor for ECMC Financial Documents.
 Fixes:
