@@ -1,3 +1,203 @@
+from faiss_vector_store import FAISSVectorStore
+from retrieval_engine import RetrievalEngine
+
+# Build from S3 embeddings
+store = FAISSVectorStore()
+store.build_from_s3()
+
+# Search
+retriever = RetrievalEngine(vector_store=store)
+context = retriever.retrieve_simple("What is income-driven repayment?")
+print(context)
+##################
+"""
+FAISS-based vector store for RAG pipeline.
+Lightweight alternative to OpenSearch — runs entirely locally in SageMaker.
+Supports cosine similarity search, metadata filtering, and S3 persistence.
+
+Dependencies:
+    pip install faiss-cpu
+"""
+
+import json
+import logging
+import os
+import pickle
+from typing import Any, Dict, List, Optional, Tuple
+
+import faiss
+import numpy as np
+
+from config import config
+from utility import S3Manager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class FAISSVectorStore:
+    """
+    FAISS vector store with metadata sidecar.
+    Stores embeddings in a FAISS index and metadata in a parallel list.
+    """
+
+    def __init__(self, dimension: int = 0):
+        self.dimension = dimension or config.EMBED_DIMENSIONS
+        self.index: Optional[faiss.Index] = None
+        self.chunks: List[Dict[str, Any]] = []  # metadata sidecar
+        self._id_map: Dict[str, int] = {}  # chunk_id → index position
+
+    # ------------------------------------------------------------------
+    # Build index
+    # ------------------------------------------------------------------
+
+    def build_from_chunks(self, chunks: List[Dict[str, Any]]) -> None:
+        """
+        Build FAISS index from embedded chunks.
+
+        Args:
+            chunks: List of chunk dicts with "embedding" and "metadata" fields.
+        """
+        if not chunks:
+            logger.warning("No chunks provided; empty index.")
+            return
+
+        embeddings = []
+        for i, chunk in enumerate(chunks):
+            emb = chunk.get("embedding", [])
+            if not emb or len(emb) != self.dimension:
+                logger.warning(f"Chunk {i} has invalid embedding; using zero vector.")
+                emb = [0.0] * self.dimension
+            embeddings.append(emb)
+            self._id_map[chunk.get("chunk_id", f"chunk_{i}")] = i
+
+        # FAISS expects float32 numpy array
+        vectors = np.array(embeddings, dtype=np.float32)
+
+        # Normalize for cosine similarity (L2 norm = 1 → cosine = dot product)
+        faiss.normalize_L2(vectors)
+
+        # Inner product index (cosine after normalization)
+        self.index = faiss.IndexFlatIP(self.dimension)
+        self.index.add(vectors)
+
+        self.chunks = chunks
+        logger.info(f"Built FAISS index with {len(chunks)} chunks, dim={self.dimension}")
+
+    def build_from_s3(self, embeddings_prefix: Optional[str] = None) -> None:
+        """
+        Load all _embedded.jsonl files from S3 embeddings/ folder and build index.
+
+        Args:
+            embeddings_prefix: S3 prefix to scan. Defaults to config.S3_EMBEDDINGS_PREFIX.
+        """
+        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
+        prefix = embeddings_prefix or config.S3_EMBEDDINGS_PREFIX
+
+        keys = [
+            k for k in s3.list_objects(prefix=prefix)
+            if k.endswith("_embedded.jsonl")
+        ]
+
+        all_chunks = []
+        for key in keys:
+            raw = s3.get_string(key)
+            if raw:
+                for line in raw.strip().split("\n"):
+                    line = line.strip()
+                    if line:
+                        all_chunks.append(json.loads(line))
+
+        logger.info(f"Loaded {len(all_chunks)} embedded chunks from {len(keys)} files")
+        self.build_from_chunks(all_chunks)
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        query_embedding: List[float],
+        k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search FAISS index for nearest neighbors.
+
+        Args:
+            query_embedding: Dense vector (must match index dimension).
+            k: Number of results. Defaults to config.RETRIEVAL_TOP_K.
+            filters: Optional metadata filters (e.g., {"document_id": "loan-guide"}).
+
+        Returns:
+            List of chunk dicts with "score" (cosine similarity) added.
+        """
+        if self.index is None or self.index.ntotal == 0:
+            logger.warning("FAISS index is empty.")
+            return []
+
+        k = k or config.RETRIEVAL_TOP_K
+
+        # Normalize query vector
+        query_vec = np.array([query_embedding], dtype=np.float32)
+        faiss.normalize_L2(query_vec)
+
+        # Search
+        scores, indices = self.index.search(query_vec, k * 3 if filters else k)
+        scores = scores[0]
+        indices = indices[0]
+
+        results = []
+        for score, idx in zip(scores, indices):
+            if idx < 0 or idx >= len(self.chunks):
+                continue
+            chunk = dict(self.chunks[idx])  # copy
+            chunk["score"] = float(score)
+
+            # Apply metadata filters post-search
+            if filters:
+                meta = chunk.get("metadata", {})
+                if not all(meta.get(f) == v for f, v in filters.items()):
+                    continue
+
+            results.append(chunk)
+            if len(results) >= k:
+                break
+
+        logger.info(f"FAISS search returned {len(results)} results (k={k})")
+        return results
+
+    # ------------------------------------------------------------------
+    # Persistence (save/load to S3)
+    # ------------------------------------------------------------------
+
+    def save_to_s3(self, name: str = "faiss_index") -> Tuple[str, str]:
+        """
+        Save FAISS index + metadata to S3 vectorstore/ folder.
+
+        Returns:
+            Tuple of (index_s3_key, metadata_s3_key).
+        """
+        if self.index is None:
+            raise ValueError("Index is empty; nothing to save.")
+
+        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
+
+        # Save FAISS index to temp file
+        local_index = f"/tmp/{name}.faiss"
+        faiss.write_index(self.index, local_index)
+
+        index_key = f"{config.S3_VECTORSTORE_PREFIX}{name}.faiss"
+        s3.upload_file(local_index, index_key)
+        os.remove(local_index)
+
+        # Save metadata pickle
+        local_meta = f"/tmp/{name}_meta.pkl"
+        with open(local_meta, "
+##################
 """
 Centralized configuration for the Textract RAG pipeline.
 Loads environment variables and defines S3 paths, chunking, embedding,
