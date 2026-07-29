@@ -1,3 +1,191 @@
+"""
+Retrieval engine for RAG pipeline.
+Orchestrates query embedding, vector search, and context expansion
+to produce rich context for generation.
+
+Works with ANY vector store that implements:
+  - search(query_embedding, k, filters) -> List[chunk_dict]
+  - get_chunk_by_id(chunk_id) -> Optional[chunk_dict]
+
+Compatible with: OpenSearchVectorStore, FAISSVectorStore
+"""
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from config import config
+from embedding_engine import EmbeddingEngine
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class RetrievalEngine:
+    """
+    End-to-end retrieval: embed query -> search vector store -> expand context.
+    Vector store is pluggable (OpenSearch, FAISS, or any custom store).
+    """
+
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        embedding_engine: Optional[EmbeddingEngine] = None,
+    ):
+        self.embedder = embedding_engine or EmbeddingEngine()
+        self.store = vector_store
+
+    # ------------------------------------------------------------------
+    # Main retrieval API
+    # ------------------------------------------------------------------
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        expand_context: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve relevant chunks for a user query.
+
+        Args:
+            query: Raw user query text.
+            top_k: Number of chunks to retrieve. Defaults to config.RETRIEVAL_TOP_K.
+            filters: Metadata filters (e.g., {"document_id": "loan-guide"}).
+            expand_context: Whether to fetch prev/next neighbors.
+                Defaults to config.ENABLE_CONTEXT_EXPANSION.
+
+        Returns:
+            Dict with keys:
+                - "query": original query
+                - "chunks": list of retrieved chunk dicts
+                - "context_text": concatenated text of all chunks (for prompt)
+                - "total_chunks": number of chunks
+                - "expanded": whether context expansion was applied
+        """
+        if self.store is None:
+            raise ValueError(
+                "No vector store provided. "
+                "Pass a FAISSVectorStore or OpenSearchVectorStore instance."
+            )
+
+        top_k = top_k or config.RETRIEVAL_TOP_K
+        expand = expand_context if expand_context is not None else config.ENABLE_CONTEXT_EXPANSION
+
+        # 1. Embed query via Bedrock Titan
+        query_embedding = self.embedder.embed_text(query)
+
+        # 2. Search vector store (works with BOTH FAISS and OpenSearch)
+        #    FAISS returns chunk dicts directly. OpenSearch also returns chunk dicts.
+        chunks = self.store.search(
+            query_embedding=query_embedding,
+            k=top_k,
+            filters=filters,
+        )
+
+        # 3. Context expansion (fetch prev/next neighbors)
+        if expand:
+            chunks = self._expand_context(chunks)
+
+        # 4. Build context text for LLM prompt
+        context_text = self._build_context_text(chunks)
+
+        result = {
+            "query": query,
+            "chunks": chunks,
+            "context_text": context_text,
+            "total_chunks": len(chunks),
+            "expanded": expand,
+        }
+
+        logger.info(
+            f"Retrieved {len(chunks)} chunks for query: '{query[:60]}...' "
+            f"(expanded={expand})"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _expand_context(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        For each chunk, fetch its prev and next neighbors from the vector store
+        and insert them in correct order.
+        """
+        expanded = []
+        seen_ids = set()
+
+        for chunk in chunks:
+            # Fetch prev
+            prev_id = chunk.get("metadata", {}).get("prev_chunk_id") or chunk.get("prev_chunk_id")
+            if prev_id and prev_id not in seen_ids:
+                prev_doc = self.store.get_chunk_by_id(prev_id)
+                if prev_doc:
+                    prev_doc = dict(prev_doc)
+                    prev_doc["score"] = 0.0
+                    prev_doc["is_neighbor"] = True
+                    expanded.append(prev_doc)
+                    seen_ids.add(prev_id)
+
+            # Main chunk
+            cid = chunk.get("chunk_id", "")
+            if cid not in seen_ids:
+                chunk = dict(chunk)
+                chunk["is_neighbor"] = False
+                expanded.append(chunk)
+                seen_ids.add(cid)
+
+            # Fetch next
+            next_id = chunk.get("metadata", {}).get("next_chunk_id") or chunk.get("next_chunk_id")
+            if next_id and next_id not in seen_ids:
+                next_doc = self.store.get_chunk_by_id(next_id)
+                if next_doc:
+                    next_doc = dict(next_doc)
+                    next_doc["score"] = 0.0
+                    next_doc["is_neighbor"] = True
+                    expanded.append(next_doc)
+                    seen_ids.add(next_id)
+
+        return expanded
+
+    @staticmethod
+    def _build_context_text(chunks: List[Dict[str, Any]]) -> str:
+        """
+        Concatenate chunk texts into a single context string for LLM prompting.
+        Adds citation markers for traceability.
+        """
+        parts = []
+        for chunk in chunks:
+            tag = "[NEIGHBOR]" if chunk.get("is_neighbor") else "[CHUNK]"
+            meta = chunk.get("metadata", chunk)
+            header = (
+                f"{tag} chunk_id={chunk.get('chunk_id', 'unknown')} "
+                f"doc={meta.get('document_id', '')} page={meta.get('page_number', 0)} "
+                f"section=\"{meta.get('section', '')}\""
+            )
+            parts.append(header)
+            parts.append(chunk.get("text", ""))
+            parts.append("")
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Convenience methods
+    # ------------------------------------------------------------------
+
+    def retrieve_simple(self, query: str, top_k: int = 0) -> str:
+        """
+        Simplest API: query -> context text string (for direct prompt injection).
+
+        Returns:
+            Concatenated context text ready for LLM prompt.
+        """
+        result = self.retrieve(query, top_k=top_k)
+        return result["context_text"]
+##############
 faiss_vector_store.py — Add this method inside the class:
 
 def search_hybrid(
