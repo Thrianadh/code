@@ -1,3 +1,38 @@
+
+# ==================== CHUNKING CONFIGURATION ====================
+
+# Toggle input format: "txt" | "md" | "both"
+# NOTE: Chunking engine always uses MD internally for structure parsing
+OUTPUT_FORMAT: str = os.getenv("OUTPUT_FORMAT", "txt")  # Default: txt for storage
+
+# Chunking engine input format (what the chunker reads)
+CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
+
+# S3 paths
+S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
+    "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
+)
+
+# Chunking parameters
+CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1000"))          # characters
+CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "200"))      # characters
+MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
+
+# Metadata fields to preserve
+CHUNK_METADATA_FIELDS: List[str] = [
+    "document_id",
+    "page_number",
+    "section",
+    "element_type",
+    "parent_id",
+    "prev_chunk_id",
+    "next_chunk_id",
+]
+
+# Lambda / deployment
+LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
+LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
+#########################
 """
 Main pipeline: Discover all documents in S3, run Textract analysis,
 post-process with enhanced parsing, and save structured outputs back to S3.
