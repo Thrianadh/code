@@ -1,3 +1,896 @@
+#retrieval_engine.py
+"""
+Retrieval engine for RAG pipeline.
+Orchestrates query embedding, hybrid search, and context expansion
+(prev/next chunk fetching) to produce rich context for generation.
+"""
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from config import config
+from embedding_engine import EmbeddingEngine
+from vector_store import OpenSearchVectorStore
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class RetrievalEngine:
+    """
+    End-to-end retrieval: embed query → hybrid search → expand context.
+    """
+
+    def __init__(
+        self,
+        embedding_engine: Optional[EmbeddingEngine] = None,
+        vector_store: Optional[OpenSearchVectorStore] = None,
+    ):
+        self.embedder = embedding_engine or EmbeddingEngine()
+        self.store = vector_store or OpenSearchVectorStore()
+
+    # ------------------------------------------------------------------
+    # Main retrieval API
+    # ------------------------------------------------------------------
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        expand_context: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve relevant chunks for a user query.
+
+        Args:
+            query: Raw user query text.
+            top_k: Number of chunks to retrieve. Defaults to config.RETRIEVAL_TOP_K.
+            filters: Metadata filters (e.g., {"document_id": "bankruptcy-guide"}).
+            expand_context: Whether to fetch prev/next neighbors.
+                Defaults to config.ENABLE_CONTEXT_EXPANSION.
+
+        Returns:
+            Dict with keys:
+                - "query": original query
+                - "chunks": list of retrieved chunk dicts
+                - "context_text": concatenated text of all chunks (for prompt)
+                - "total_chunks": number of chunks
+                - "expanded": whether context expansion was applied
+        """
+        top_k = top_k or config.RETRIEVAL_TOP_K
+        expand = expand_context if expand_context is not None else config.ENABLE_CONTEXT_EXPANSION
+
+        # 1. Embed query
+        query_embedding = self.embedder.embed_text(query)
+
+        # 2. Hybrid search
+        hits = self.store.search_hybrid(
+            query_text=query,
+            query_embedding=query_embedding,
+            k=top_k,
+            filters=filters,
+        )
+
+        # 3. Convert hits to chunk dicts
+        chunks = [self._hit_to_chunk(hit) for hit in hits]
+
+        # 4. Context expansion (fetch prev/next neighbors)
+        if expand:
+            chunks = self._expand_context(chunks)
+
+        # 5. Build context text for LLM prompt
+        context_text = self._build_context_text(chunks)
+
+        result = {
+            "query": query,
+            "chunks": chunks,
+            "context_text": context_text,
+            "total_chunks": len(chunks),
+            "expanded": expand,
+        }
+
+        logger.info(
+            f"Retrieved {len(chunks)} chunks for query: '{query[:60]}...' "
+            f"(expanded={expand})"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hit_to_chunk(hit: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert an OpenSearch hit to a clean chunk dict."""
+        source = hit.get("_source", {})
+        return {
+            "chunk_id": source.get("chunk_id", ""),
+            "text": source.get("text", ""),
+            "score": hit.get("_rrf_score", hit.get("_score", 0)),
+            "document_id": source.get("document_id", ""),
+            "page_number": source.get("page_number", 0),
+            "section": source.get("section", ""),
+            "contains_table": source.get("contains_table", False),
+            "table_headers": source.get("table_headers", []),
+            "prev_chunk_id": source.get("prev_chunk_id", ""),
+            "next_chunk_id": source.get("next_chunk_id", ""),
+            "metadata": source.get("metadata", {}),
+        }
+
+    def _expand_context(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        For each chunk, fetch its prev and next neighbors from OpenSearch
+        and insert them in correct order.
+        """
+        expanded = []
+        seen_ids = set()
+
+        for chunk in chunks:
+            # Fetch prev
+            prev_id = chunk.get("prev_chunk_id")
+            if prev_id and prev_id not in seen_ids:
+                prev_doc = self.store.get_chunk_by_id(prev_id)
+                if prev_doc:
+                    prev_chunk = {
+                        "chunk_id": prev_doc.get("chunk_id", prev_id),
+                        "text": prev_doc.get("text", ""),
+                        "score": 0.0,
+                        "document_id": prev_doc.get("document_id", ""),
+                        "page_number": prev_doc.get("page_number", 0),
+                        "section": prev_doc.get("section", ""),
+                        "contains_table": prev_doc.get("contains_table", False),
+                        "table_headers": prev_doc.get("table_headers", []),
+                        "prev_chunk_id": prev_doc.get("prev_chunk_id", ""),
+                        "next_chunk_id": prev_doc.get("next_chunk_id", ""),
+                        "metadata": prev_doc.get("metadata", {}),
+                        "is_neighbor": True,
+                    }
+                    expanded.append(prev_chunk)
+                    seen_ids.add(prev_id)
+
+            # Main chunk
+            if chunk["chunk_id"] not in seen_ids:
+                chunk["is_neighbor"] = False
+                expanded.append(chunk)
+                seen_ids.add(chunk["chunk_id"])
+
+            # Fetch next
+            next_id = chunk.get("next_chunk_id")
+            if next_id and next_id not in seen_ids:
+                next_doc = self.store.get_chunk_by_id(next_id)
+                if next_doc:
+                    next_chunk = {
+                        "chunk_id": next_doc.get("chunk_id", next_id),
+                        "text": next_doc.get("text", ""),
+                        "score": 0.0,
+                        "document_id": next_doc.get("document_id", ""),
+                        "page_number": next_doc.get("page_number", 0),
+                        "section": next_doc.get("section", ""),
+                        "contains_table": next_doc.get("contains_table", False),
+                        "table_headers": next_doc.get("table_headers", []),
+                        "prev_chunk_id": next_doc.get("prev_chunk_id", ""),
+                        "next_chunk_id": next_doc.get("next_chunk_id", ""),
+                        "metadata": next_doc.get("metadata", {}),
+                        "is_neighbor": True,
+                    }
+                    expanded.append(next_chunk)
+                    seen_ids.add(next_id)
+
+        return expanded
+
+    @staticmethod
+    def _build_context_text(chunks: List[Dict[str, Any]]) -> str:
+        """
+        Concatenate chunk texts into a single context string for LLM prompting.
+        Adds citation markers for traceability.
+        """
+        parts = []
+        for chunk in chunks:
+            tag = "[NEIGHBOR]" if chunk.get("is_neighbor") else "[CHUNK]"
+            header = (
+                f"{tag} chunk_id={chunk['chunk_id']} "
+                f"doc={chunk['document_id']} page={chunk['page_number']} "
+                f"section="{chunk['section']}""
+            )
+            parts.append(header)
+            parts.append(chunk["text"])
+            parts.append("")
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Convenience methods
+    # ------------------------------------------------------------------
+
+    def retrieve_simple(
+        self, query: str, top_k: int = 0
+    ) -> str:
+        """
+        Simplest API: query → context text string (for direct prompt injection).
+
+        Returns:
+            Concatenated context text ready for LLM prompt.
+        """
+        result = self.retrieve(query, top_k=top_k)
+        return result["context_text"]
+############################
+#vector_store.py
+"""
+OpenSearch Serverless vector store manager.
+Handles index creation, bulk ingestion, and hybrid search (vector + BM25).
+Uses AWS Signature V4 auth for IAM-based access to OpenSearch Serverless.
+"""
+
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+import boto3
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
+
+from config import config
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class OpenSearchVectorStore:
+    """
+    Manages OpenSearch Serverless index for RAG chunks.
+    Supports k-NN vector search, BM25 keyword search, and client-side RRF fusion.
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "",
+        index_name: str = "",
+        region: str = "",
+    ):
+        self.endpoint = endpoint or config.OPENSEARCH_ENDPOINT
+        self.index_name = index_name or config.OPENSEARCH_INDEX_NAME
+        self.region = region or config.AWS_REGION
+        self.vector_field = config.OPENSEARCH_VECTOR_FIELD
+        self.dimensions = config.EMBED_DIMENSIONS
+
+        if not self.endpoint:
+            raise ValueError(
+                "OpenSearch endpoint is required. Set OPENSEARCH_ENDPOINT env var."
+            )
+
+        self.client = self._create_client()
+
+    def _create_client(self) -> OpenSearch:
+        """Create authenticated OpenSearch client for Serverless (aoss)."""
+        credentials = boto3.Session().get_credentials()
+        awsauth = AWS4Auth(
+            credentials.access_key,
+            credentials.secret_key,
+            self.region,
+            "aoss",  # OpenSearch Serverless service name
+            session_token=credentials.token,
+        )
+
+        # Strip protocol from endpoint if present
+        host = self.endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+
+        client = OpenSearch(
+            hosts=[{"host": host, "port": 443}],
+            http_auth=awsauth,
+            use_ssl=True,
+            verify_certs=True,
+            connection_class=RequestsHttpConnection,
+            timeout=30,
+        )
+        logger.info(f"Connected to OpenSearch Serverless: {host}")
+        return client
+
+    # ------------------------------------------------------------------
+    # Index management
+    # ------------------------------------------------------------------
+
+    def create_index(self, delete_existing: bool = False) -> bool:
+        """
+        Create the OpenSearch index with k-NN vector mapping.
+
+        Args:
+            delete_existing: If True, delete index before creating.
+
+        Returns:
+            True if successful.
+        """
+        if delete_existing and self.client.indices.exists(index=self.index_name):
+            self.client.indices.delete(index=self.index_name)
+            logger.info(f"Deleted existing index: {self.index_name}")
+
+        if self.client.indices.exists(index=self.index_name):
+            logger.info(f"Index {self.index_name} already exists.")
+            return True
+
+        mapping = {
+            "settings": {
+                "index.knn": True,
+                "index.knn.algo_param.ef_search": 100,
+            },
+            "mappings": {
+                "properties": {
+                    "chunk_id": {"type": "keyword"},
+                    "text": {"type": "text", "analyzer": "standard"},
+                    "embedding": {
+                        "type": "knn_vector",
+                        "dimension": self.dimensions,
+                        "method": {
+                            "name": "hnsw",
+                            "space_type": "cosinesimil",
+                            "engine": "faiss",
+                            "parameters": {"ef_construction": 128, "m": 16},
+                        },
+                    },
+                    "document_id": {"type": "keyword"},
+                    "page_number": {"type": "integer"},
+                    "section": {"type": "keyword"},
+                    "section_level": {"type": "integer"},
+                    "element_type": {"type": "keyword"},
+                    "parent_id": {"type": "keyword"},
+                    "prev_chunk_id": {"type": "keyword"},
+                    "next_chunk_id": {"type": "keyword"},
+                    "contains_table": {"type": "boolean"},
+                    "table_headers": {"type": "keyword"},
+                    "char_count": {"type": "integer"},
+                    "token_estimate": {"type": "integer"},
+                    "metadata": {"type": "object", "enabled": False},
+                }
+            },
+        }
+
+        try:
+            self.client.indices.create(index=self.index_name, body=mapping)
+            logger.info(f"Created index: {self.index_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to create index: {e}")
+            raise
+
+    def delete_index(self) -> bool:
+        """Delete the index. Use with caution."""
+        if self.client.indices.exists(index=self.index_name):
+            self.client.indices.delete(index=self.index_name)
+            logger.info(f"Deleted index: {self.index_name}")
+        return True
+
+    def index_exists(self) -> bool:
+        return self.client.indices.exists(index=self.index_name)
+
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
+    def bulk_ingest(self, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Bulk ingest chunks into OpenSearch.
+
+        Args:
+            chunks: List of chunk dicts with "embedding" and "text" fields.
+
+        Returns:
+            OpenSearch bulk response summary.
+        """
+        if not chunks:
+            logger.warning("No chunks to ingest.")
+            return {"ingested": 0}
+
+        actions = []
+        for chunk in chunks:
+            doc = {
+                "chunk_id": chunk.get("chunk_id", ""),
+                "text": chunk.get("text", ""),
+                "embedding": chunk.get("embedding", []),
+                "document_id": chunk["metadata"].get("document_id", ""),
+                "page_number": chunk["metadata"].get("page_number", 0),
+                "section": chunk["metadata"].get("section", ""),
+                "section_level": chunk["metadata"].get("section_level", 0),
+                "element_type": chunk["metadata"].get("element_type", ""),
+                "parent_id": chunk["metadata"].get("parent_id", ""),
+                "prev_chunk_id": chunk["metadata"].get("prev_chunk_id", ""),
+                "next_chunk_id": chunk["metadata"].get("next_chunk_id", ""),
+                "contains_table": chunk["metadata"].get("contains_table", False),
+                "table_headers": chunk["metadata"].get("table_headers") or [],
+                "char_count": chunk["metadata"].get("char_count", 0),
+                "token_estimate": chunk["metadata"].get("token_estimate", 0),
+                "metadata": chunk.get("metadata", {}),
+            }
+            actions.append({"index": {"_index": self.index_name, "_id": doc["chunk_id"]}})
+            actions.append(doc)
+
+        try:
+            response = self.client.bulk(body=actions, refresh=True)
+            errors = response.get("errors", False)
+            ingested = len(chunks)
+            if errors:
+                failed = sum(1 for item in response["items"] if "error" in item.get("index", {}))
+                logger.warning(f"Bulk ingest completed with {failed} failures out of {ingested}")
+            else:
+                logger.info(f"Bulk ingested {ingested} chunks into {self.index_name}")
+            return {"ingested": ingested, "errors": errors, "response": response}
+        except Exception as e:
+            logger.error(f"Bulk ingest failed: {e}")
+            raise
+
+    # ------------------------------------------------------------------
+    # Search methods
+    # ------------------------------------------------------------------
+
+    def search_vector(
+        self,
+        query_embedding: List[float],
+        k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Pure k-NN vector search.
+
+        Args:
+            query_embedding: Dense vector from embedding model.
+            k: Number of results. Defaults to RETRIEVAL_TOP_K.
+            filters: Optional metadata filters (e.g., {"document_id": "loan-guide"}).
+
+        Returns:
+            List of hit dicts with "_score", "_source", "_id".
+        """
+        k = k or config.RETRIEVAL_TOP_K
+
+        knn_query = {
+            "size": k,
+            "query": {
+                "knn": {
+                    self.vector_field: {
+                        "vector": query_embedding,
+                        "k": k,
+                    }
+                }
+            },
+        }
+
+        if filters:
+            knn_query["query"]["knn"][self.vector_field]["filter"] = {
+                "bool": {"must": [{"term": {f: v}} for f, v in filters.items()]}
+            }
+
+        response = self.client.search(index=self.index_name, body=knn_query)
+        return response.get("hits", {}).get("hits", [])
+
+    def search_bm25(
+        self,
+        query_text: str,
+        k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Pure BM25 keyword search on the "text" field.
+
+        Args:
+            query_text: Raw user query.
+            k: Number of results. Defaults to RETRIEVAL_TOP_K.
+            filters: Optional metadata filters.
+
+        Returns:
+            List of hit dicts.
+        """
+        k = k or config.RETRIEVAL_TOP_K
+
+        must_clauses = [{"match": {"text": query_text}}]
+        if filters:
+            for field, value in filters.items():
+                must_clauses.append({"term": {field: value}})
+
+        query = {
+            "size": k,
+            "query": {"bool": {"must": must_clauses}},
+        }
+
+        response = self.client.search(index=self.index_name, body=query)
+        return response.get("hits", {}).get("hits", [])
+
+    def search_hybrid(
+        self,
+        query_text: str,
+        query_embedding: List[float],
+        k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Hybrid search: client-side RRF fusion of vector + BM25 results.
+
+        Args:
+            query_text: Raw user query (for BM25).
+            query_embedding: Dense vector (for k-NN).
+            k: Final number of results after fusion.
+            filters: Optional metadata filters applied to both searches.
+
+        Returns:
+            Merged and re-ranked list of hit dicts.
+        """
+        if not config.ENABLE_HYBRID_SEARCH:
+            logger.info("Hybrid search disabled; falling back to vector search.")
+            return self.search_vector(query_embedding, k, filters)
+
+        k = k or config.RETRIEVAL_TOP_K
+        rrf_k = config.RETRIEVAL_RRF_K
+
+        # Fetch 2x results from each search for better fusion coverage
+        fetch_k = k * 2
+
+        vector_hits = self.search_vector(query_embedding, fetch_k, filters)
+        bm25_hits = self.search_bm25(query_text, fetch_k, filters)
+
+        # RRF scoring
+        scores: Dict[str, float] = {}
+        docs: Dict[str, Dict[str, Any]] = {}
+
+        for rank, hit in enumerate(vector_hits):
+            doc_id = hit["_id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+            docs[doc_id] = hit
+
+        for rank, hit in enumerate(bm25_hits):
+            doc_id = hit["_id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+            docs[doc_id] = hit
+
+        # Sort by RRF score descending
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        final_results = []
+        for doc_id, rrf_score in ranked[:k]:
+            hit = docs[doc_id]
+            hit["_rrf_score"] = rrf_score
+            final_results.append(hit)
+
+        logger.info(
+            f"Hybrid search: vector={len(vector_hits)}, bm25={len(bm25_hits)}, "
+            f"fusion={len(final_results)}"
+        )
+        return final_results
+
+    def get_chunk_by_id(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single chunk by its chunk_id."""
+        try:
+            response = self.client.get(index=self.index_name, id=chunk_id)
+            return response.get("_source")
+        except Exception:
+            return None
+#######################
+#embedding_engine.py
+"""
+Embedding engine for RAG pipeline.
+Generates dense vector embeddings using Amazon Bedrock Titan Embed v2.0.
+Supports single-text, batch, and S3 JSONL chunk processing.
+"""
+
+import json
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+from config import config
+from utility import S3Manager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingEngine:
+    """Generates embeddings via Amazon Bedrock Titan Embed Text v2."""
+
+    def __init__(self, region: str = ""):
+        self.region = region or config.AWS_REGION
+        self.bedrock_runtime = boto3.client(
+            "bedrock-runtime", region_name=self.region
+        )
+        self.model_id = config.BEDROCK_EMBED_MODEL_ID
+        self.dimensions = config.EMBED_DIMENSIONS
+        self.normalize = config.EMBED_NORMALIZE
+        self.max_retries = config.EMBED_MAX_RETRIES
+        self.max_workers = config.EMBED_MAX_WORKERS
+
+    # ------------------------------------------------------------------
+    # Core embedding methods
+    # ------------------------------------------------------------------
+
+    def embed_text(self, text: str) -> List[float]:
+        """
+        Embed a single text string.
+
+        Args:
+            text: Raw text to embed (max 8K tokens for Titan v2).
+
+        Returns:
+            List of float values (length = EMBED_DIMENSIONS).
+        """
+        if not text or not text.strip():
+            logger.warning("Empty text passed to embed_text; returning zero vector.")
+            return [0.0] * self.dimensions
+
+        body = json.dumps({
+            "inputText": text.strip(),
+            "dimensions": self.dimensions,
+            "normalize": self.normalize,
+        })
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.bedrock_runtime.invoke_model(
+                    body=body,
+                    modelId=self.model_id,
+                    accept="application/json",
+                    contentType="application/json",
+                )
+                result = json.loads(response["body"].read())
+                embedding = result.get("embedding", [])
+                if not embedding:
+                    raise ValueError("Empty embedding returned by Bedrock.")
+                return embedding
+
+            except ClientError as e:
+                error_code = e.response["Error"]["Code"]
+                if error_code in ("ThrottlingException", "ServiceUnavailable"):
+                    wait = 2 ** attempt
+                    logger.warning(
+                        f"Bedrock throttled (attempt {attempt}/{self.max_retries}). "
+                        f"Retrying in {wait}s..."
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(f"Bedrock ClientError: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected error during embedding: {e}")
+                raise
+
+        raise RuntimeError(f"Failed to embed text after {self.max_retries} retries.")
+
+    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """
+        Embed a batch of texts in parallel using ThreadPoolExecutor.
+
+        Args:
+            texts: List of text strings.
+
+        Returns:
+            List of embeddings (same order as input texts).
+        """
+        if not texts:
+            return []
+
+        results = [None] * len(texts)
+        logger.info(f"Embedding batch of {len(texts)} texts with {self.max_workers} workers")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self.embed_text, txt): idx
+                for idx, txt in enumerate(texts)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    logger.error(f"Failed to embed text at index {idx}: {e}")
+                    results[idx] = [0.0] * self.dimensions
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Chunk-oriented helpers
+    # ------------------------------------------------------------------
+
+    def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Attach embeddings to a list of chunk dicts in-place.
+
+        Args:
+            chunks: List of chunk dicts (must have "text" key).
+
+        Returns:
+            Same list with "embedding" field added to each chunk.
+        """
+        texts = [c.get("text", "") for c in chunks]
+        embeddings = self.embed_batch(texts)
+
+        for chunk, emb in zip(chunks, embeddings):
+            chunk["embedding"] = emb
+
+        logger.info(f"Embedded {len(chunks)} chunks")
+        return chunks
+
+    def embed_chunks_from_s3(self, jsonl_s3_key: str) -> List[Dict[str, Any]]:
+        """
+        Read a .jsonl file from S3, embed all chunks, and return enriched list.
+
+        Args:
+            jsonl_s3_key: S3 key of the .jsonl chunk file.
+
+        Returns:
+            List of chunk dicts with "embedding" field.
+        """
+        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=self.region)
+        raw = s3.get_string(jsonl_s3_key)
+        if raw is None:
+            raise ValueError(f"Could not read {jsonl_s3_key} from S3")
+
+        chunks = []
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if line:
+                chunks.append(json.loads(line))
+
+        logger.info(f"Loaded {len(chunks)} chunks from {jsonl_s3_key}")
+        return self.embed_chunks(chunks)
+
+    def save_embedded_chunks(
+        self,
+        chunks: List[Dict[str, Any]],
+        document_id: str,
+    ) -> str:
+        """
+        Save embedded chunks as .jsonl to S3 (separate from raw chunks).
+
+        Returns:
+            S3 key of the saved embedded .jsonl file.
+        """
+        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=self.region)
+        key = f"{config.S3_CHUNKING_OUTPUT_PREFIX}{document_id}_embedded.jsonl"
+        body = "\n".join(json.dumps(c, ensure_ascii=False) for c in chunks)
+        s3.put_string(key, body, content_type="application/jsonlines")
+        logger.info(f"Saved embedded chunks → s3://{config.S3_BUCKET_NAME}/{key}")
+        return key
+
+
+# ------------------------------------------------------------------
+# Standalone batch helper
+# ------------------------------------------------------------------
+
+def run_embedding_pipeline(jsonl_s3_prefix: Optional[str] = None):
+    """
+    Discover all .jsonl files under the chunking prefix, embed each,
+    and save _embedded.jsonl back to S3.
+    """
+    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
+    engine = EmbeddingEngine()
+
+    prefix = jsonl_s3_prefix or config.S3_CHUNKING_OUTPUT_PREFIX
+    keys = [k for k in s3.list_objects(prefix=prefix) if k.endswith(".jsonl") and not k.endswith("_embedded.jsonl")]
+
+    logger.info(f"Found {len(keys)} chunk files to embed under {prefix}")
+    results = []
+
+    for key in keys:
+        try:
+            doc_name = key.split("/")[-1].replace(".jsonl", "")
+            chunks = engine.embed_chunks_from_s3(key)
+            embedded_key = engine.save_embedded_chunks(chunks, doc_name)
+            results.append((key, True, embedded_key, len(chunks)))
+        except Exception as e:
+            logger.error(f"Embedding failed for {key}: {e}")
+            results.append((key, False, str(e), 0))
+
+    # Save batch report
+    report_lines = ["EMBEDDING BATCH REPORT", "=" * 70]
+    for k, ok, msg, count in results:
+        status = "PASS" if ok else "FAIL"
+        report_lines.append(f"[{status}] {k} → {msg} ({count} chunks)")
+    report = "\n".join(report_lines)
+
+    report_key = f"{config.S3_LOGS_PREFIX}embedding_batch_report_{int(time.time())}.txt"
+    s3.put_string(report_key, report)
+    logger.info(f"Batch report saved to {report_key}")
+    return results
+#####################
+#config.py
+"""
+Centralized configuration for the Textract RAG pipeline.
+Loads environment variables and defines S3 paths, chunking, embedding,
+vector store, retrieval, and Lambda settings.
+"""
+
+import os
+from typing import List
+
+
+class Config:
+    """Centralized configuration for the Textract RAG pipeline."""
+
+    # ── AWS ──────────────────────────────────────────────────────
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
+
+    # ── S3 Paths ─────────────────────────────────────────────────
+    S3_SOURCE_PREFIX: str = os.getenv(
+        "S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"
+    )
+    S3_TEXTRACT_OUTPUT_PREFIX: str = os.getenv(
+        "S3_TEXTRACT_OUTPUT_PREFIX", "ecmc_org/RAG/textract-output/"
+    )
+    S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
+        "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
+    )
+    S3_LOGS_PREFIX: str = os.getenv(
+        "S3_LOGS_PREFIX", "ecmc_org/RAG/logs/"
+    )
+
+    # ── Textract ─────────────────────────────────────────────────
+    TEXTRACT_FEATURES: List[str] = ["TABLES", "FORMS", "LAYOUT"]
+    SUPPORTED_EXTENSIONS: tuple = (".pdf", ".png", ".jpg", ".jpeg", ".tiff")
+    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "60"))
+    POLL_INTERVAL_SEC: int = int(os.getenv("POLL_INTERVAL_SEC", "5"))
+
+    # ── Output from Textract ─────────────────────────────────────
+    OUTPUT_FORMATS: List[str] = ["md", "txt"]
+
+    # ── Chunking ─────────────────────────────────────────────────
+    CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
+    CHUNK_SIZE_TOKENS: int = int(os.getenv("CHUNK_SIZE_TOKENS", "512"))
+    CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "128"))
+    CHUNK_SIZE_CHARS: int = CHUNK_SIZE_TOKENS * 4
+    CHUNK_OVERLAP_CHARS: int = CHUNK_OVERLAP_TOKENS * 4
+    MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
+
+    CHUNK_METADATA_FIELDS: List[str] = [
+        "chunk_id", "document_id", "source_s3_key", "page_number",
+        "section", "section_level", "element_type", "parent_id",
+        "prev_chunk_id", "next_chunk_id", "contains_table",
+        "table_headers", "char_count", "token_estimate",
+    ]
+
+    # ── Embedding (Bedrock Titan) ────────────────────────────────
+    BEDROCK_EMBED_MODEL_ID: str = os.getenv(
+        "BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0"
+    )
+    EMBED_DIMENSIONS: int = int(os.getenv("EMBED_DIMENSIONS", "1024"))
+    EMBED_BATCH_SIZE: int = int(os.getenv("EMBED_BATCH_SIZE", "24"))
+    EMBED_MAX_RETRIES: int = int(os.getenv("EMBED_MAX_RETRIES", "5"))
+    EMBED_MAX_WORKERS: int = int(os.getenv("EMBED_MAX_WORKERS", "10"))
+    EMBED_NORMALIZE: bool = os.getenv("EMBED_NORMALIZE", "true").lower() == "true"
+
+    # ── Vector Store (OpenSearch Serverless) ─────────────────────
+    OPENSEARCH_ENDPOINT: str = os.getenv("OPENSEARCH_ENDPOINT", "")
+    OPENSEARCH_INDEX_NAME: str = os.getenv(
+        "OPENSEARCH_INDEX_NAME", "ecmc-rag-chunks"
+    )
+    OPENSEARCH_VECTOR_FIELD: str = os.getenv(
+        "OPENSEARCH_VECTOR_FIELD", "embedding"
+    )
+
+    # ── Retrieval ────────────────────────────────────────────────
+    RETRIEVAL_TOP_K: int = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+    RETRIEVAL_RRF_K: int = int(os.getenv("RETRIEVAL_RRF_K", "60"))
+    ENABLE_HYBRID_SEARCH: bool = os.getenv(
+        "ENABLE_HYBRID_SEARCH", "true"
+    ).lower() == "true"
+    ENABLE_CONTEXT_EXPANSION: bool = os.getenv(
+        "ENABLE_CONTEXT_EXPANSION", "true"
+    ).lower() == "true"
+
+    # ── Lambda / Deployment ──────────────────────────────────────
+    LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
+    LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
+
+
+# Singleton instance
+config = Config()
+#####################
 from config import config
 print(type(config.CHUNK_SIZE_CHARS))   # Should print: <class 'int'>
 print(config.CHUNK_SIZE_CHARS)         # Should print: 2048
