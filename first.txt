@@ -1,359 +1,95 @@
-
-# ==================== CHUNKING CONFIGURATION ====================
-
-# Toggle input format: "txt" | "md" | "both"
-# NOTE: Chunking engine always uses MD internally for structure parsing
-OUTPUT_FORMAT: str = os.getenv("OUTPUT_FORMAT", "txt")  # Default: txt for storage
-
-# Chunking engine input format (what the chunker reads)
-CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
-
-# S3 paths
-S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
-    "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
-)
-
-# Chunking parameters
-CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1000"))          # characters
-CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "200"))      # characters
-MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
-
-# Metadata fields to preserve
-CHUNK_METADATA_FIELDS: List[str] = [
-    "document_id",
-    "page_number",
-    "section",
-    "element_type",
-    "parent_id",
-    "prev_chunk_id",
-    "next_chunk_id",
-]
-
-# Lambda / deployment
-LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
-LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
-#########################
-"""
-Main pipeline: Discover all documents in S3, run Textract analysis,
-post-process with enhanced parsing, and save structured outputs back to S3.
-"""
-
-import json
-import logging
-import os
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import List, Optional, Tuple
-
-from botocore.exceptions import ClientError, BotoCoreError
-
-from config import config
-from utility import S3Manager, TextractManager, ParsedDocument
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
-class TextractPipeline:
-    """End-to-end pipeline for batch Textract processing."""
-
-    def __init__(self):
-        self.s3 = S3Manager(
-            bucket_name=config.S3_BUCKET_NAME,
-            region=config.AWS_REGION,
-        )
-        self.textract = TextractManager(region=config.AWS_REGION)
-
-    def discover_documents(self, prefix: Optional[str] = None) -> List[str]:
-        """
-        List all supported documents under the source S3 prefix.
-
-        Returns:
-            List of S3 keys for documents to process.
-        """
-        prefix = prefix or config.S3_SOURCE_PREFIX
-        all_keys = self.s3.list_objects(prefix=prefix)
-
-        docs = [
-            key for key in all_keys
-            if key.lower().endswith(config.SUPPORTED_EXTENSIONS)
-        ]
-        logger.info(f"Discovered {len(docs)} documents under {prefix}")
-        return docs
-
-    def process_single_document(self, s3_key: str) -> Tuple[str, bool, str]:
-        """
-        Process one document: Textract -> parse -> save outputs.
-
-        Args:
-            s3_key: S3 key of the source document.
-
-        Returns:
-            Tuple of (s3_key, success: bool, message: str).
-        """
-        doc_name = Path(s3_key).stem
-        logger.info(f"Processing: {s3_key}")
-
-        try:
-            # 1. Start Textract job
-            job_id = self.textract.start_document_analysis(
-                s3_bucket=config.S3_BUCKET_NAME,
-                s3_key=s3_key,
-                features=config.TEXTRACT_FEATURES,
-            )
-
-            # 2. Wait for completion
-            success = self.textract.wait_for_job_completion(
-                job_id=job_id,
-                max_retries=config.MAX_RETRIES,
-                sleep_sec=config.POLL_INTERVAL_SEC,
-            )
-            if not success:
-                return s3_key, False, f"Textract job {job_id} failed or timed out"
-
-            # 3. Retrieve and parse blocks
-            blocks = self.textract.get_job_results(job_id=job_id)
-            parsed: ParsedDocument = self.textract.parse_document(blocks)
-
-            # 4. Save outputs to S3
-            base_output_key = f"{config.S3_TEXTRACT_OUTPUT_PREFIX}{doc_name}"
-
-            saved = []
-            if "json" in config.OUTPUT_FORMATS:
-                json_key = f"{base_output_key}.json"
-                self._save_to_s3(json_key, self._to_json(parsed))
-                saved.append(json_key)
-
-            if "txt" in config.OUTPUT_FORMATS:
-                txt_key = f"{base_output_key}.txt"
-                self._save_to_s3(txt_key, parsed.plain_text)
-                saved.append(txt_key)
-
-            if "md" in config.OUTPUT_FORMATS:
-                md_key = f"{base_output_key}.md"
-                self._save_to_s3(md_key, parsed.markdown_text)
-                saved.append(md_key)
-
-            logger.info(f"Saved {len(saved)} outputs for {doc_name}")
-            return s3_key, True, f"OK -> {saved}"
-
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"AWS error processing {s3_key}: {e}")
-            return s3_key, False, str(e)
-        except Exception as e:
-            logger.error(f"Unexpected error processing {s3_key}: {e}")
-            return s3_key, False, str(e)
-
-    def _save_to_s3(self, s3_key: str, content: str) -> bool:
-        """Save string content to S3."""
-        try:
-            self.s3.s3_client.put_object(
-                Bucket=config.S3_BUCKET_NAME,
-                Key=s3_key,
-                Body=content.encode("utf-8"),
-                ContentType="text/plain; charset=utf-8",
-            )
-            logger.info(f"Saved s3://{config.S3_BUCKET_NAME}/{s3_key}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save {s3_key}: {e}")
-            return False
-
-    @staticmethod
-    def _to_json(parsed: ParsedDocument) -> str:
-        """Serialize ParsedDocument to JSON."""
-        return json.dumps(
-            {
-                "metadata": parsed.metadata,
-                "plain_text": parsed.plain_text,
-                "markdown_text": parsed.markdown_text,
-                "elements": [
-                    {
-                        "type": type(e).__name__,
-                        "text": getattr(e, "text", None),
-                        "page": getattr(e, "page", None),
-                        "block_type": getattr(e, "block_type", None),
-                        "is_heading": getattr(e, "is_heading", None),
-                        "heading_level": getattr(e, "heading_level", None),
-                        "column_count": getattr(e, "column_count", None),
-                        "cells": [
-                            {
-                                "text": c.text,
-                                "row": c.row_index,
-                                "col": c.column_index,
-                                "is_header": c.is_header,
-                            }
-                            for c in getattr(e, "cells", [])
-                        ],
-                    }
-                    for e in parsed.elements
-                ],
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    def run_sequential(self, prefix: Optional[str] = None) -> List[Tuple[str, bool, str]]:
-        """Process all documents one by one."""
-        docs = self.discover_documents(prefix)
-        results = []
-        for doc in docs:
-            result = self.process_single_document(doc)
-            results.append(result)
-        return results
-
-    def run_parallel(self, prefix: Optional[str] = None, max_workers: Optional[int] = None) -> List[Tuple[str, bool, str]]:
-        """
-        Process documents in parallel using ThreadPoolExecutor.
-        Note: Textract has service quotas; adjust max_workers accordingly.
-        """
-        docs = self.discover_documents(prefix)
-        max_workers = max_workers or config.MAX_WORKERS
-        results = []
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_doc = {
-                executor.submit(self.process_single_document, doc): doc
-                for doc in docs
-            }
-            for future in as_completed(future_to_doc):
-                doc = future_to_doc[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    logger.error(f"Exception for {doc}: {e}")
-                    result = (doc, False, str(e))
-                results.append(result)
-
-        return results
-
-    def generate_report(self, results: List[Tuple[str, bool, str]]) -> str:
-        """Generate a simple processing report."""
-        total = len(results)
-        success = sum(1 for _, ok, _ in results if ok)
-        failed = total - success
-
-        lines = [
-            "=" * 60,
-            "TEXTRACT BATCH PROCESSING REPORT",
-            "=" * 60,
-            f"Total documents : {total}",
-            f"Successful      : {success}",
-            f"Failed          : {failed}",
-            f"Success rate    : {success / total * 100:.1f}%" if total else "N/A",
-            "-" * 60,
-        ]
-
-        for s3_key, ok, msg in results:
-            status = "PASS" if ok else "FAIL"
-            lines.append(f"[{status}] {Path(s3_key).name:<40} {msg}")
-
-        lines.append("=" * 60)
-        report = "\n".join(lines)
-        logger.info("\n" + report)
-
-        # Save report to S3
-        report_key = f"{config.S3_LOGS_PREFIX}report_{int(time.time())}.txt"
-        self._save_to_s3(report_key, report)
-        return report
-
-
-def main():
-    """Entry point."""
-    pipeline = TextractPipeline()
-
-    # Choose sequential or parallel based on volume
-    # Sequential
-############
 """
 Centralized configuration for the Textract RAG pipeline.
-Loads environment variables with sensible defaults.
+Loads environment variables and defines S3 paths, chunking, and Lambda settings.
 """
 
 import os
-from typing import List, Dict
+from typing import List
 
 
 class Config:
     """Centralized configuration for the Textract RAG pipeline."""
 
-    # AWS Configuration
+    # ── AWS ──────────────────────────────────────────────────────
     AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
     S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
 
-    # S3 Paths
-    S3_SOURCE_PREFIX: str = os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/")
+    # ── S3 Paths ─────────────────────────────────────────────────
+    S3_SOURCE_PREFIX: str = os.getenv(
+        "S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"
+    )
     S3_TEXTRACT_OUTPUT_PREFIX: str = os.getenv(
         "S3_TEXTRACT_OUTPUT_PREFIX", "ecmc_org/RAG/textract-output/"
     )
-    S3_LOGS_PREFIX: str = os.getenv("S3_LOGS_PREFIX", "ecmc_org/RAG/logs/")
+    S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
+        "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
+    )
+    S3_LOGS_PREFIX: str = os.getenv(
+        "S3_LOGS_PREFIX", "ecmc_org/RAG/logs/"
+    )
 
-    # Derived S3 URIs
-    @property
-    def S3_SOURCE_URI(self) -> str:
-        return f"s3://{self.S3_BUCKET_NAME}/{self.S3_SOURCE_PREFIX}"
-
-    @property
-    def S3_TEXTRACT_OUTPUT_URI(self) -> str:
-        return f"s3://{self.S3_BUCKET_NAME}/{self.S3_TEXTRACT_OUTPUT_PREFIX}"
-
-    @property
-    def S3_LOGS_URI(self) -> str:
-        return f"s3://{self.S3_BUCKET_NAME}/{self.S3_LOGS_PREFIX}"
-
-    # Textract Features
+    # ── Textract ─────────────────────────────────────────────────
     TEXTRACT_FEATURES: List[str] = ["TABLES", "FORMS", "LAYOUT"]
-
-    # Processing
     SUPPORTED_EXTENSIONS: tuple = (".pdf", ".png", ".jpg", ".jpeg", ".tiff")
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "60"))
     POLL_INTERVAL_SEC: int = int(os.getenv("POLL_INTERVAL_SEC", "5"))
-    MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "5"))  # For parallel processing
 
-    # Output
-    OUTPUT_FORMATS: List[str] = ["json", "txt", "md"]  # Save structured, plain, markdown
+    # ── Output from Textract (both saved; chunking picks one) ────
+    OUTPUT_FORMATS: List[str] = ["md", "txt"]
 
+    # ── Chunking ─────────────────────────────────────────────────
+    # Input format for the chunking engine (always use md for structure-aware)
+    CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
 
-# Singleton instance
-config = Config()
-##############
-from utility import TextractManager, S3Manager
+    # Token-based sizing (industry standard for embedding models)
+    CHUNK_SIZE_TOKENS: int = int(os.getenv("CHUNK_SIZE_TOKENS", "512"))
+    CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "128"))
 
-# 1. Start job
-textract = TextractManager(region="us-east-1")
-job_id = textract.start_document_analysis(
-    s3_bucket="bankrupcy-data-bkt",
-    s3_key="ecmc_org/RAG/Source_data/myfile.pdf",
-    features=["TABLES", "FORMS", "LAYOUT"]
-)
+    # Table chunking
+    MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
 
-# 2. Wait
-textract.wait_for_job_completion(job_id)
+    # Rough character estimates (1 token ≈ 4 chars for English)
+    @property
+    def CHUNK_SIZE_CHARS(self) -> int:
+        return self.CHUNK_SIZE_TOKENS * 4
 
-# 3. Get structured output
-blocks = textract.get_job_results(job_id)
-doc = textract.parse_document(blocks)
+    @property
+    def CHUNK_OVERLAP_CHARS(self) -> int:
+        return self.CHUNK_OVERLAP_TOKENS * 4
 
-print(doc.plain_text)      # Clean paragraphs + [TABLE] markers
-print(doc.markdown_text)   # Full markdown with tables
-print(doc.metadata)  
+    # ── Metadata fields preserved per chunk ──────────────────────
+    CHUNK_METADATA_FIELDS: List[str] = [
+        "chunk_id",
+        "document_id",
+        "source_s3_key",
+        "page_number",
+        "section",
+        "section_level",
+        "element_type",
+        "parent_id",
+        "prev_chunk_id",
+        "next_chunk_id",
+        "contains_table",
+        "table_headers",
+        "char_count",
+        "token_estimate",
+    ]
 
-########
+    # ── Lambda / Deployment ──────────────────────────────────────
+    LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
+    LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
+
+################
+
 """
 Reusable utilities for S3, Textract, logging, and document processing.
 Production-grade with proper reading order, paragraph grouping,
-heading detection, and robust table parsing.
+heading detection, robust table parsing, and Markdown page markers.
 """
 
-import os
-import re
 import logging
 from typing import Dict, List, Optional, Any, Tuple, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 
 import boto3
@@ -375,10 +111,10 @@ logger = logging.getLogger(__name__)
 class TextElement:
     """Represents a single text element with metadata."""
     text: str
-    block_type: str  # LINE, WORD, etc.
+    block_type: str
     page: int
     confidence: float
-    bbox: Dict[str, float]  # Top, Left, Width, Height
+    bbox: Dict[str, float]
     block_id: str
     is_heading: bool = False
     heading_level: int = 0
@@ -414,16 +150,30 @@ class ParsedDocument:
     markdown_text: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to a plain dict (JSON-friendly)."""
+        return {
+            "metadata": self.metadata,
+            "plain_text": self.plain_text,
+            "markdown_text": self.markdown_text,
+            "elements": [
+                {
+                    "type": type(e).__name__,
+                    **asdict(e),
+                }
+                for e in self.elements
+            ],
+        }
+
 
 # ---------------------------------------------------------------------------
 # S3 Manager
 # ---------------------------------------------------------------------------
 
 class S3Manager:
-    """Handles all S3 operations (upload, download, list, validate)."""
+    """Handles all S3 operations (upload, download, list, validate, put_string)."""
 
     def __init__(self, bucket_name: str, region: str = "us-east-1"):
-        """Initialize S3 client."""
         self.bucket_name = bucket_name
         self.s3_client = boto3.client("s3", region_name=region)
 
@@ -433,7 +183,6 @@ class S3Manager:
         s3_key: str,
         extra_args: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Upload a file to S3."""
         try:
             self.s3_client.upload_file(
                 local_file_path,
@@ -441,24 +190,46 @@ class S3Manager:
                 s3_key,
                 ExtraArgs=extra_args or {},
             )
-            logger.info(f"Uploaded {local_file_path} to s3://{self.bucket_name}/{s3_key}")
+            logger.info(f"Uploaded {local_file_path} → s3://{self.bucket_name}/{s3_key}")
             return True
         except (ClientError, BotoCoreError) as e:
             logger.error(f"Failed to upload {local_file_path}: {e}")
             return False
 
     def download_file(self, s3_key: str, local_file_path: str) -> bool:
-        """Download a file from S3."""
         try:
             self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
-            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} to {local_file_path}")
+            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} → {local_file_path}")
             return True
         except (ClientError, BotoCoreError) as e:
             logger.error(f"Failed to download {s3_key}: {e}")
             return False
 
+    def put_string(self, s3_key: str, content: str, content_type: str = "text/plain; charset=utf-8") -> bool:
+        """Save a string directly to S3."""
+        try:
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                Body=content.encode("utf-8"),
+                ContentType=content_type,
+            )
+            logger.info(f"Saved string → s3://{self.bucket_name}/{s3_key}")
+            return True
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to save string to {s3_key}: {e}")
+            return False
+
+    def get_string(self, s3_key: str) -> Optional[str]:
+        """Read a string directly from S3."""
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
+            return response["Body"].read().decode("utf-8")
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to read string from {s3_key}: {e}")
+            return None
+
     def list_objects(self, prefix: str = "") -> List[str]:
-        """List all objects under a prefix in the S3 bucket."""
         try:
             paginator = self.s3_client.get_paginator("list_objects_v2")
             objects = []
@@ -470,7 +241,6 @@ class S3Manager:
             return []
 
     def validate_path(self, s3_key: str) -> bool:
-        """Validate if an S3 object exists."""
         try:
             self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
             return True
@@ -486,7 +256,6 @@ class TextractManager:
     """Handles Amazon Textract operations with enhanced post-processing."""
 
     def __init__(self, region: str = "us-east-1"):
-        """Initialize Textract client."""
         self.textract_client = boto3.client("textract", region_name=region)
 
     def start_document_analysis(
@@ -494,6 +263,7 @@ class TextractManager:
         s3_bucket: str,
         s3_key: str,
         features: Optional[List[str]] = None,
+        notification_channel: Optional[Dict[str, str]] = None,
     ) -> str:
         """
         Start a Textract document analysis job.
@@ -502,21 +272,24 @@ class TextractManager:
             s3_bucket: S3 bucket name containing the document.
             s3_key: S3 key of the document to analyze.
             features: List of Textract features (FORMS, TABLES, LAYOUT).
+            notification_channel: Optional SNS topic ARN for job completion.
+                Example: {"SNSTopicArn": "arn:aws:sns:...", "RoleArn": "arn:aws:iam::..."}
 
         Returns:
             str: Job ID for tracking.
         """
         features = features or ["TABLES", "FORMS", "LAYOUT"]
         try:
-            response = self.textract_client.start_document_analysis(
-                DocumentLocation={
-                    "S3Object": {
-                        "Bucket": s3_bucket,
-                        "Name": s3_key,
-                    }
+            kwargs = {
+                "DocumentLocation": {
+                    "S3Object": {"Bucket": s3_bucket, "Name": s3_key}
                 },
-                FeatureTypes=features,
-            )
+                "FeatureTypes": features,
+            }
+            if notification_channel:
+                kwargs["NotificationChannel"] = notification_channel
+
+            response = self.textract_client.start_document_analysis(**kwargs)
             job_id = response["JobId"]
             logger.info(f"Started Textract job {job_id} for s3://{s3_bucket}/{s3_key}")
             return job_id
@@ -525,7 +298,6 @@ class TextractManager:
             raise
 
     def get_job_status(self, job_id: str) -> str:
-        """Get the status of a Textract job."""
         try:
             response = self.textract_client.get_document_analysis(JobId=job_id)
             return response["JobStatus"]
@@ -533,18 +305,9 @@ class TextractManager:
             logger.error(f"Failed to get job status for {job_id}: {e}")
             raise
 
-    def wait_for_job_completion(self, job_id: str, max_retries: int = 60, sleep_sec: int = 5) -> bool:
-        """
-        Poll Textract job status until completion.
-
-        Args:
-            job_id: Textract job ID.
-            max_retries: Maximum number of retries.
-            sleep_sec: Seconds between polls.
-
-        Returns:
-            bool: True if job succeeded, False otherwise.
-        """
+    def wait_for_job_completion(
+        self, job_id: str, max_retries: int = 60, sleep_sec: int = 5
+    ) -> bool:
         import time
         for attempt in range(max_retries):
             status = self.get_job_status(job_id)
@@ -560,15 +323,7 @@ class TextractManager:
         return False
 
     def get_job_results(self, job_id: str) -> List[Dict[str, Any]]:
-        """
-        Retrieve ALL results from a completed Textract job with pagination.
-
-        Args:
-            job_id: Textract job ID.
-
-        Returns:
-            List[Dict]: All blocks from the document analysis.
-        """
+        """Retrieve ALL results from a completed Textract job with pagination."""
         blocks = []
         next_token = None
         try:
@@ -576,7 +331,6 @@ class TextractManager:
                 kwargs = {"JobId": job_id}
                 if next_token:
                     kwargs["NextToken"] = next_token
-                
                 response = self.textract_client.get_document_analysis(**kwargs)
                 blocks.extend(response.get("Blocks", []))
                 next_token = response.get("NextToken")
@@ -592,68 +346,47 @@ class TextractManager:
     # Enhanced Post-Processing
     # -----------------------------------------------------------------------
 
-    def parse_document(self, blocks: List[Dict[str, Any]]) -> ParsedDocument:
+    def parse_document(self, blocks: List[Dict[str, Any]], document_id: str = "") -> ParsedDocument:
         """
         Parse Textract blocks into a structured document with proper reading order,
         paragraph grouping, heading detection, and table reconstruction.
-
-        Args:
-            blocks: Raw Textract blocks.
-
-        Returns:
-            ParsedDocument: Structured document with plain text and markdown.
         """
-        # Build lookup maps
         block_map = {b["Id"]: b for b in blocks}
-        page_blocks = [b for b in blocks if b["BlockType"] == "PAGE"]
-        
-        # Group blocks by page
         blocks_by_page = defaultdict(list)
         for block in blocks:
             page = block.get("Page", 1)
             blocks_by_page[page].append(block)
 
         elements = []
-        
         for page_num in sorted(blocks_by_page.keys()):
             page_blocks_list = blocks_by_page[page_num]
-            
-            # Separate block types
             lines = [b for b in page_blocks_list if b["BlockType"] == "LINE"]
             tables = [b for b in page_blocks_list if b["BlockType"] == "TABLE"]
-            words = [b for b in page_blocks_list if b["BlockType"] == "WORD"]
-            
-            # Build reading order for lines (handle multi-column layouts)
+
             ordered_lines = self._reconstruct_reading_order(lines)
-            
-            # Detect headings
-            heading_ids = self._detect_headings(ordered_lines, words)
-            
-            # Group lines into paragraphs
-            paragraphs = self._group_paragraphs(ordered_lines)
-            
-            # Process tables
+            heading_ids = self._detect_headings(ordered_lines)
+            paragraphs = self._group_paragraphs(ordered_lines, heading_ids)
+
             table_elements = []
             for table_block in tables:
                 table_elem = self._parse_table_enhanced(table_block, block_map)
                 table_elem.page = page_num
                 table_elements.append(table_elem)
-            
-            # Merge paragraphs and tables in reading order
+
             page_elements = self._merge_elements(paragraphs, table_elements, page_num)
             elements.extend(page_elements)
 
-        # Generate outputs
         plain_text = self._generate_plain_text(elements)
-        markdown_text = self._generate_markdown(elements)
-        
+        markdown_text = self._generate_markdown(elements, document_id=document_id)
+
         metadata = {
+            "document_id": document_id,
             "total_pages": max(blocks_by_page.keys()) if blocks_by_page else 0,
             "total_blocks": len(blocks),
             "total_lines": len([b for b in blocks if b["BlockType"] == "LINE"]),
             "total_tables": len([b for b in blocks if b["BlockType"] == "TABLE"]),
         }
-        
+
         return ParsedDocument(
             elements=elements,
             plain_text=plain_text,
@@ -662,200 +395,166 @@ class TextractManager:
         )
 
     def _reconstruct_reading_order(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Reconstruct proper reading order using bounding boxes.
-        Handles multi-column layouts by grouping lines into horizontal bands first.
-        """
         if not lines:
             return []
-        
-        # Sort by Top position to group into horizontal bands
-        lines_sorted = sorted(lines, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0))
-        
-        # Group into horizontal bands (lines within ~2% vertical distance)
+        lines_sorted = sorted(
+            lines,
+            key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0),
+        )
         bands = []
         current_band = [lines_sorted[0]]
         band_threshold = 0.02
-        
+
         for line in lines_sorted[1:]:
             prev_top = current_band[-1].get("Geometry", {}).get("BoundingBox", {}).get("Top", 0)
             curr_top = line.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0)
-            
             if abs(curr_top - prev_top) <= band_threshold:
                 current_band.append(line)
             else:
-                # Sort current band by Left position
-                bands.append(sorted(current_band, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0)))
+                bands.append(
+                    sorted(current_band, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0))
+                )
                 current_band = [line]
-        
         if current_band:
-            bands.append(sorted(current_band, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0)))
-        
-        # Flatten bands
+            bands.append(
+                sorted(current_band, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0))
+            )
+
         ordered = []
         for band in bands:
             ordered.extend(band)
-        
         return ordered
 
-    def _detect_headings(self, lines: List[Dict[str, Any]], words: List[Dict[str, Any]]) -> Set[str]:
-        """
-        Detect headings using heuristics:
-        - Short line length (< 100 chars)
-        - All caps or title case
-        - Position (top of page or after blank space)
-        - Font size (taller bounding box than average)
-        """
+    def _detect_headings(self, lines: List[Dict[str, Any]]) -> Set[str]:
         heading_ids = set()
         if not lines:
             return heading_ids
-        
-        # Calculate average line height
+
         heights = []
         for line in lines:
             bbox = line.get("Geometry", {}).get("BoundingBox", {})
             heights.append(bbox.get("Height", 0))
         avg_height = sum(heights) / len(heights) if heights else 0.01
-        
+
         for i, line in enumerate(lines):
             text = line.get("Text", "").strip()
             if not text:
                 continue
-            
             bbox = line.get("Geometry", {}).get("BoundingBox", {})
             height = bbox.get("Height", 0)
-            
-            # Heuristics
+
             is_short = len(text) < 100
             is_tall = height > avg_height * 1.3
             is_all_caps = text.isupper() and len(text) > 3
             is_title_case = text.istitle() and len(text.split()) <= 10
-            
-            # Position heuristic: first line on page or after significant gap
+
             is_prominent = False
             if i == 0:
                 is_prominent = True
             elif i > 0:
-                prev_bbox = lines[i-1].get("Geometry", {}).get("BoundingBox", {})
+                prev_bbox = lines[i - 1].get("Geometry", {}).get("BoundingBox", {})
                 curr_top = bbox.get("Top", 0)
                 prev_bottom = prev_bbox.get("Top", 0) + prev_bbox.get("Height", 0)
-                gap = curr_top - prev_bottom
-                if gap > avg_height * 2:
+                if curr_top - prev_bottom > avg_height * 2:
                     is_prominent = True
-            
-            # Combined score
-            score = sum([
-                is_short,
-                is_tall,
-                is_all_caps,
-                is_title_case,
-                is_prominent,
-            ])
-            
+
+            score = sum([is_short, is_tall, is_all_caps, is_title_case, is_prominent])
             if score >= 3 or (is_all_caps and is_short) or (is_tall and is_prominent):
                 heading_ids.add(line["Id"])
-        
         return heading_ids
 
-    def _group_paragraphs(self, lines: List[Dict[str, Any]]) -> List[TextElement]:
-        """
-        Group lines into paragraphs based on vertical proximity and indentation.
-        """
+    def _group_paragraphs(
+        self, lines: List[Dict[str, Any]], heading_ids: Set[str]
+    ) -> List[TextElement]:
         if not lines:
             return []
-        
+
         paragraphs = []
         current_para_lines = [lines[0]]
-        
+
         for i in range(1, len(lines)):
             prev_line = lines[i - 1]
             curr_line = lines[i]
-            
+
             prev_bbox = prev_line.get("Geometry", {}).get("BoundingBox", {})
             curr_bbox = curr_line.get("Geometry", {}).get("BoundingBox", {})
-            
+
             prev_bottom = prev_bbox.get("Top", 0) + prev_bbox.get("Height", 0)
             curr_top = curr_bbox.get("Top", 0)
             vertical_gap = curr_top - prev_bottom
-            
+
             prev_left = prev_bbox.get("Left", 0)
             curr_left = curr_bbox.get("Left", 0)
             horizontal_diff = abs(curr_left - prev_left)
-            
-            # Thresholds
+
             line_height = prev_bbox.get("Height", 0.01)
             para_gap_threshold = line_height * 1.8
-            
-            # Check if new paragraph
+
             is_new_para = (
-                vertical_gap > para_gap_threshold or  # Significant vertical gap
-                horizontal_diff > 0.05  # Significant indentation change
+                vertical_gap > para_gap_threshold or horizontal_diff > 0.05
             )
-            
+
+            # Also break if current line is a heading
+            if curr_line["Id"] in heading_ids:
+                is_new_para = True
+
             if is_new_para:
-                # Flush current paragraph
                 para_text = " ".join(l.get("Text", "") for l in current_para_lines)
                 first_line = current_para_lines[0]
                 bbox = first_line.get("Geometry", {}).get("BoundingBox", {})
-                
+                is_heading = first_line["Id"] in heading_ids
+
                 paragraphs.append(TextElement(
                     text=para_text,
-                    block_type="PARAGRAPH",
+                    block_type="HEADING" if is_heading else "PARAGRAPH",
                     page=first_line.get("Page", 1),
                     confidence=min(l.get("Confidence", 99) for l in current_para_lines),
                     bbox=bbox,
                     block_id=first_line["Id"],
+                    is_heading=is_heading,
+                    heading_level=1 if is_heading else 0,
                 ))
                 current_para_lines = [curr_line]
             else:
                 current_para_lines.append(curr_line)
-        
-        # Flush last paragraph
+
         if current_para_lines:
             para_text = " ".join(l.get("Text", "") for l in current_para_lines)
             first_line = current_para_lines[0]
             bbox = first_line.get("Geometry", {}).get("BoundingBox", {})
-            
+            is_heading = first_line["Id"] in heading_ids
             paragraphs.append(TextElement(
                 text=para_text,
-                block_type="PARAGRAPH",
+                block_type="HEADING" if is_heading else "PARAGRAPH",
                 page=first_line.get("Page", 1),
                 confidence=min(l.get("Confidence", 99) for l in current_para_lines),
                 bbox=bbox,
                 block_id=first_line["Id"],
+                is_heading=is_heading,
+                heading_level=1 if is_heading else 0,
             ))
-        
+
         return paragraphs
 
     def _parse_table_enhanced(
-        self,
-        table_block: Dict[str, Any],
-        block_map: Dict[str, Dict[str, Any]],
+        self, table_block: Dict[str, Any], block_map: Dict[str, Dict[str, Any]]
     ) -> TableElement:
-        """
-        Parse a Textract TABLE block into a structured TableElement.
-        Handles merged cells and header detection.
-        """
         cells = []
         cell_blocks = []
-        
-        # Collect all cell blocks
         for rel in table_block.get("Relationships", []):
             if rel["Type"] == "CHILD":
                 for cell_id in rel["Ids"]:
                     cell = block_map.get(cell_id)
                     if cell and cell["BlockType"] == "CELL":
                         cell_blocks.append(cell)
-        
-        # Extract cell data
+
         max_col = 0
         for cell in cell_blocks:
             row_idx = cell.get("RowIndex", 0)
             col_idx = cell.get("ColumnIndex", 0)
             row_span = cell.get("RowSpan", 1)
             col_span = cell.get("ColumnSpan", 1)
-            
-            # Extract text from cell children
+
             cell_texts = []
             for rel in cell.get("Relationships", []):
                 if rel["Type"] == "CHILD":
@@ -867,13 +566,11 @@ class TextractManager:
                                 cell_texts.append(status)
                             else:
                                 cell_texts.append(child.get("Text", ""))
-            
+
             text = " ".join(cell_texts).strip()
             max_col = max(max_col, col_idx + col_span - 1)
-            
-            # Heuristic: first row is header
             is_header = row_idx == 1
-            
+
             cells.append(TableCell(
                 text=text,
                 row_index=row_idx,
@@ -883,7 +580,7 @@ class TextractManager:
                 is_header=is_header,
                 confidence=cell.get("Confidence", 0),
             ))
-        
+
         return TableElement(
             cells=cells,
             page=table_block.get("Page", 1),
@@ -893,29 +590,17 @@ class TextractManager:
         )
 
     def _merge_elements(
-        self,
-        paragraphs: List[TextElement],
-        tables: List[TableElement],
-        page_num: int,
+        self, paragraphs: List[TextElement], tables: List[TableElement], page_num: int
     ) -> List[Any]:
-        """
-        Merge paragraphs and tables into a single list ordered by vertical position.
-        """
         all_elements = []
-        
         for para in paragraphs:
             all_elements.append(("paragraph", para.bbox.get("Top", 0), para))
-        
         for table in tables:
             all_elements.append(("table", table.bbox.get("Top", 0), table))
-        
-        # Sort by vertical position
         all_elements.sort(key=lambda x: x[1])
-        
         return [elem for _, _, elem in all_elements]
 
     def _generate_plain_text(self, elements: List[Any]) -> str:
-        """Generate clean plain text from structured elements."""
         parts = []
         for elem in elements:
             if isinstance(elem, TextElement):
@@ -924,3569 +609,461 @@ class TextractManager:
                 parts.append("[TABLE]")
         return "\n\n".join(parts)
 
-    def _generate_markdown(self, elements: List[Any]) -> str:
-        """Generate Markdown from structured elements."""
-        parts = []
+    def _generate_markdown(self, elements: List[Any], document_id: str = "") -> str:
+        """Generate Markdown with YAML frontmatter and HTML page markers."""
+        lines = []
+        # YAML frontmatter
+        lines.append("---")
+        lines.append(f'document_id: "{document_id}"')
+        lines.append(f"total_pages: {max((e.page for e in elements if hasattr(e, 'page')), default=0)}")
+        lines.append("---")
+        lines.append("")
+
+        current_page = 0
         for elem in elements:
+            page = getattr(elem, "page", 1)
+            if page != current_page:
+                lines.append(f"<!-- page: {page} -->")
+                current_page = page
+
             if isinstance(elem, TextElement):
                 if elem.is_heading:
-                    level = min(elem.heading_level, 6)
-                    parts.append(f"{'#' * level} {elem.text}")
+                    level = min(elem.heading_level + 1, 6)  # # or ##
+                    lines.append(f"{'#' * level} {elem.text}")
                 else:
-                    parts.append(elem.text)
+                    lines.append(elem.text)
             elif isinstance(elem, TableElement):
-                parts.append(self._table_to_markdown(elem))
-            parts.append("")  # Blank line between elements
-        return "\n".join(parts)
+                lines.append(self._table_to_markdown(elem))
+            lines.append("")
+
+        return "\n".join(lines)
 
     def _table_to_markdown(self, table: TableElement) -> str:
-        """Convert TableElement to Markdown table."""
         if not table.cells:
             return ""
-        
-        # Group cells by row
         rows = defaultdict(list)
         for cell in table.cells:
             rows[cell.row_index].append(cell)
-        
+
         md_lines = []
         for row_idx in sorted(rows.keys()):
             row_cells = sorted(rows[row_idx], key=lambda c: c.column_index)
-            cell_texts = [c.text.replace("|", "\\|") for c in row_cells]
+            cell_texts = [c.text.replace("|", "\|").replace("\n", " ") for c in row_cells]
             md_lines.append("| " + " | ".join(cell_texts) + " |")
-            
-            # Add separator after first row (header)
             if row_idx == 1:
-                md_lines.append("|" + "|".join(["---"] * len(row_cells)) + "|")
-        
+                md_lines.append("|" + "|".join([" --- "] * len(row_cells)) + "|")
         return "\n".join(md_lines)
-
-    # -----------------------------------------------------------------------
-    # Legacy compatibility
-    # -----------------------------------------------------------------------
 
     @staticmethod
     def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[str, str]:
-        """
-        Legacy wrapper for backward compatibility.
-        Uses the enhanced parser internally.
-        """
         manager = TextractManager()
         doc = manager.parse_document(blocks)
         return doc.plain_text, doc.markdown_text
-######################################
-@staticmethod
-def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str, str]:
-    """
-    Parse Textract blocks into structured blocks + plain text + Markdown.
-    Groups WORDs into LINEs, then LINEs into PARAGRAPHs for coherent output.
-    """
-    structured_blocks = []
-    plain_text_parts = []
-    markdown_text_parts = []
 
-    # --- Step 1: Group WORDs into LINEs (if no LINEs exist) ---
-    lines = [b for b in blocks if b["BlockType"] == "LINE"]
-    words = [b for b in blocks if b["BlockType"] == "WORD"]
-
-    if words and not lines:
-        # Group WORDs into LINEs by Y-coordinate (same line = similar Y)
-        line_groups = {}
-        for word in words:
-            y = word["Geometry"]["BoundingBox"]["Top"]
-            if y not in line_groups:
-                line_groups[y] = []
-            line_groups[y].append(word)
-
-        # Create LINE blocks from WORD groups
-        lines = []
-        for y, group in line_groups.items():
-            group.sort(key=lambda w: w["Geometry"]["BoundingBox"]["Left"])  # Sort by X
-            line_text = " ".join(w["Text"] for w in group)
-            first_word = group[0]
-            lines.append({
-                "BlockType": "LINE",
-                "Text": line_text,
-                "Geometry": first_word["Geometry"],
-                "Page": first_word["Page"],
-                "Id": f"line_{y}"
-            })
-
-    # --- Step 2: Group LINEs into PARAGRAPHs ---
-    if lines:
-        # Sort LINEs by Y, then X
-        lines.sort(key=lambda l: (
-            l["Geometry"]["BoundingBox"]["Top"],
-            l["Geometry"]["BoundingBox"]["Left"]
-        ))
-
-        # Group LINEs into paragraphs (Y distance > 0.05 = new paragraph)
-        paragraphs = []
-        current_para_lines = []
-        prev_y = None
-
-        for line in lines:
-            current_y = line["Geometry"]["BoundingBox"]["Top"]
-            if prev_y is not None and (current_y - prev_y) > 0.05:  # 5% of page height
-                if current_para_lines:
-                    paragraphs.append(current_para_lines)
-                    current_para_lines = []
-            current_para_lines.append(line)
-            prev_y = current_y
-
-        if current_para_lines:
-            paragraphs.append(current_para_lines)
-
-        # Flatten paragraphs into text
-        for para_lines in paragraphs:
-            para_text = " ".join(line["Text"] for line in para_lines)
-            para_page = para_lines[0]["Page"]
-            para_bbox = [
-                min(l["Geometry"]["BoundingBox"]["Left"] for l in para_lines),
-                min(l["Geometry"]["BoundingBox"]["Top"] for l in para_lines),
-                max(l["Geometry"]["BoundingBox"]["Left"] + l["Geometry"]["BoundingBox"]["Width"] for l in para_lines),
-                max(l["Geometry"]["BoundingBox"]["Top"] + l["Geometry"]["BoundingBox"]["Height"] for l in para_lines)
-            ]
-
-            # Check if this paragraph is a heading
-            if TextractManager._is_heading(para_text):
-                structured_block = {
-                    "type": "heading",
-                    "content": para_text,
-                    "metadata": {
-                        "page": para_page,
-                        "bbox": para_bbox,
-                        "level": TextractManager._guess_heading_level(para_text)
-                    }
-                }
-                plain_text_parts.append(f"\n{para_text}\n")
-                markdown_text_parts.append(f"\n{'#' * structured_block['metadata']['level']} {para_text}\n")
-            else:
-                structured_block = {
-                    "type": "text",
-                    "content": para_text,
-                    "metadata": {
-                        "page": para_page,
-                        "bbox": para_bbox,
-                        "element_type": "paragraph"
-                    }
-                }
-                plain_text_parts.append(para_text)
-                markdown_text_parts.append(para_text)
-
-            structured_blocks.append(structured_block)
-
-    # --- Step 3: Handle TABLEs ---
-    tables = [b for b in blocks if b["BlockType"] == "TABLE"]
-    for table in tables:
-        table_md = TextractManager._parse_table(table, blocks)
-        headers = TextractManager._extract_table_headers(table, blocks)
-        structured_block = {
-            "type": "table",
-            "content": table_md,
-            "metadata": {
-                "page": table.get("Page", 1),
-                "bbox": [
-                    table["Geometry"]["BoundingBox"]["Left"],
-                    table["Geometry"]["BoundingBox"]["Top"],
-                    table["Geometry"]["BoundingBox"]["Width"],
-                    table["Geometry"]["BoundingBox"]["Height"]
-                ],
-                "headers": headers
-            }
-        }
-        structured_blocks.append(structured_block)
-        plain_text_parts.append("\n[TABLE]\n")
-        markdown_text_parts.append(f"\n{table_md}\n")
-
-    # --- Step 4: Sort all blocks by reading order ---
-    structured_blocks.sort(key=lambda x: (
-        x["metadata"]["bbox"][1],  # Top (Y)
-        x["metadata"]["bbox"][0]   # Left (X)
-    ))
-
-    return structured_blocks, "\n\n".join(plain_text_parts), "\n\n".join(markdown_text_parts)
-##########
-S3_CONFIG: Dict[str, str] = {
-    "bucket_name": S3_BUCKET_NAME,
-    "source_prefix": os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"),
-    "textract_output": os.getenv("S3_TEXTRACT_OUTPUT", "ecmc_org/RAG/textract-output/"),
-    "parsed_documents": os.getenv("S3_PARSED_DOCUMENTS", "ecmc_org/RAG/parsed-documents/"),
-    "logs": os.getenv("S3_LOGS_PATH", "ecmc_org/RAG/logs/"),  # <-- S3_LOGS_PATH is here
-    "chunking_output": os.getenv("S3_CHUNKING_OUTPUT", "ecmc_org/RAG/chunking-output/"),
-}
-############
-AWS_REGION=us-east-1
-S3_BUCKET_NAME=bankrupcy-data-bkt
-S3_SOURCE_PREFIX=ecmc_org/RAG/Source_data/
-S3_TEXTRACT_OUTPUT=ecmc_org/RAG/textract-output/
-S3_LOGS_PATH=ecmc_org/RAG/logs/
-
-
-boto3>=1.26.0
-botocore>=1.29.0
-
-###########
+#####################################
 """
-Reusable utilities for S3, Textract, logging, and document processing.
-Follows PEP 8, type hints, and best practices for maintainability.
+Main pipeline: Discover all documents in S3, run Textract analysis,
+post-process with enhanced parsing, and save structured outputs back to S3.
+Supports both sequential and parallel execution.
 """
 
-import os
-import re
-import time
+import json
 import logging
-from typing import Dict, List, Optional, Any, Tuple
-import boto3
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import List, Optional, Tuple
+
 from botocore.exceptions import ClientError, BotoCoreError
 
-# Import Config from config.py
-from config import Config
+from config import config
+from utility import S3Manager, TextractManager, ParsedDocument
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),  # Log to stdout
-    ]
 )
 logger = logging.getLogger(__name__)
 
-class S3Manager:
-    """Handles all S3 operations (upload, download, list, validate)."""
 
-    def __init__(self, bucket_name: str = Config.S3_CONFIG["bucket_name"], region: str = Config.AWS_REGION):
-        """Initialize S3 client."""
-        self.bucket_name = bucket_name
-        self.s3_client = boto3.client("s3", region_name=region)
-        logger.info(f"Initialized S3Manager for bucket: {bucket_name}")
+class TextractPipeline:
+    """End-to-end pipeline for batch Textract processing."""
 
-    def upload_file(
-        self,
-        local_file_path: str,
-        s3_key: str,
-        extra_args: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """
-        Upload a file to S3.
-
-        Args:
-            local_file_path: Local path of the file to upload.
-            s3_key: S3 key (path within the bucket, e.g., "ecmc_org/RAG/output/file.txt").
-            extra_args: Additional arguments (e.g., ACL, ContentType).
-
-        Returns:
-            bool: True if upload succeeded, False otherwise.
-        """
-        try:
-            self.s3_client.upload_file(
-                local_file_path,
-                self.bucket_name,
-                s3_key,
-                ExtraArgs=extra_args or {},
-            )
-            logger.info(f"Uploaded {local_file_path} to s3://{self.bucket_name}/{s3_key}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to upload {local_file_path} to {s3_key}: {e}")
-            return False
-
-    def download_file(self, s3_key: str, local_file_path: str) -> bool:
-        """
-        Download a file from S3.
-
-        Args:
-            s3_key: S3 key (path within the bucket).
-            local_file_path: Local path to save the file.
-
-        Returns:
-            bool: True if download succeeded, False otherwise.
-        """
-        try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-            self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
-            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} to {local_file_path}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to download {s3_key} to {local_file_path}: {e}")
-            return False
-
-    def list_objects(self, prefix: str = "") -> List[str]:
-        """
-        List all objects under a prefix in the S3 bucket.
-
-        Args:
-            prefix: S3 prefix to filter objects (e.g., "ecmc_org/RAG/Source_data/").
-
-        Returns:
-            List[str]: List of S3 keys (paths within the bucket).
-        """
-        try:
-            paginator = self.s3_client.get_paginator("list_objects_v2")
-            objects = []
-            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
-                objects.extend([obj["Key"] for obj in page.get("Contents", [])])
-            logger.info(f"Listed {len(objects)} objects under prefix: {prefix}")
-            return objects
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to list objects under {prefix}: {e}")
-            return []
-
-    def validate_path(self, s3_key: str) -> bool:
-        """
-        Validate if an S3 object exists.
-
-        Args:
-            s3_key: S3 key (path within the bucket).
-
-        Returns:
-            bool: True if the object exists, False otherwise.
-        """
-        try:
-            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
-            return True
-        except (ClientError, BotoCoreError):
-            return False
-
-class TextractManager:
-    """Handles Amazon Textract operations (job management, result parsing)."""
-
-    def __init__(self, region: str = Config.AWS_REGION):
-        """Initialize Textract client."""
-        self.textract_client = boto3.client("textract", region_name=region)
-        logger.info("Initialized TextractManager")
-
-    def start_document_analysis(
-        self,
-        s3_key: str,
-        features: List[str] = Config.TEXTRACT_FEATURES,
-    ) -> str:
-        """
-        Start a Textract document analysis job.
-
-        Args:
-            s3_key: S3 key of the document to analyze (e.g., "ecmc_org/RAG/Source_data/file.pdf").
-            features: List of Textract features to enable (e.g., ["FORMS", "TABLES"]).
-
-        Returns:
-            str: Job ID for tracking the analysis.
-
-        Raises:
-            ClientError: If Textract job fails to start.
-        """
-        try:
-            response = self.textract_client.start_document_analysis(
-                DocumentLocation={
-                    "S3Object": {
-                        "Bucket": Config.S3_CONFIG["bucket_name"],
-                        "Name": s3_key,
-                    }
-                },
-                FeatureTypes=features,
-            )
-            job_id = response["JobId"]
-            logger.info(f"Started Textract job {job_id} for {s3_key}")
-            return job_id
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to start Textract job for {s3_key}: {e}")
-            raise
-
-    def get_job_status(self, job_id: str) -> str:
-        """
-        Get the status of a Textract job.
-
-        Args:
-            job_id: Textract job ID.
-
-        Returns:
-            str: Job status (e.g., "SUCCEEDED", "FAILED", "IN_PROGRESS").
-
-        Raises:
-            ClientError: If job status cannot be retrieved.
-        """
-        try:
-            response = self.textract_client.get_document_analysis(JobId=job_id)
-            return response["JobStatus"]
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to get job status for {job_id}: {e}")
-            raise
-
-    def wait_for_job_completion(self, job_id: str, max_retries: int = Config.TEXTRACT_MAX_RETRIES, delay: int = Config.TEXTRACT_RETRY_DELAY) -> bool:
-        """
-        Poll Textract job status until completion.
-
-        Args:
-            job_id: Textract job ID.
-            max_retries: Maximum number of retries.
-            delay: Delay between retries in seconds.
-
-        Returns:
-            bool: True if job succeeded, False otherwise.
-        """
-        for attempt in range(max_retries):
-            try:
-                status = self.get_job_status(job_id)
-                if status == "SUCCEEDED":
-                    logger.info(f"Textract job {job_id} succeeded.")
-                    return True
-                elif status == "FAILED":
-                    logger.error(f"Textract job {job_id} failed.")
-                    return False
-                logger.info(f"Job {job_id} status: {status}. Retry {attempt + 1}/{max_retries} in {delay} seconds...")
-                time.sleep(delay)
-            except (ClientError, BotoCoreError) as e:
-                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for job {job_id}: {e}")
-                time.sleep(delay)
-        logger.error(f"Textract job {job_id} timed out after {max_retries * delay} seconds.")
-        return False
-
-    def get_job_results(self, job_id: str) -> Dict[str, Any]:
-        """
-        Retrieve results from a completed Textract job.
-
-        Args:
-            job_id: Textract job ID.
-
-        Returns:
-            Dict[str, Any]: Parsed Textract response.
-
-        Raises:
-            ClientError: If results cannot be retrieved.
-        """
-        try:
-            response = self.textract_client.get_document_analysis(JobId=job_id)
-            return response
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to get results for job {job_id}: {e}")
-            raise
-
-    @staticmethod
-    def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str, str]:
-        """
-        Parse Textract blocks into:
-        1. Structured blocks (with metadata for RAG)
-        2. Plain text
-        3. Markdown text
-
-        Args:
-            blocks: List of Textract blocks.
-
-        Returns:
-            Tuple[List[Dict], str, str]:
-                - Structured blocks (with type, content, metadata)
-                - Plain text
-                - Markdown text
-        """
-        structured_blocks = []
-        plain_text_parts = []
-        markdown_text_parts = []
-
-        # Sort blocks by reading order (top-to-bottom, left-to-right)
-        sorted_blocks = sorted(
-            blocks,
-            key=lambda x: (
-                x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0),
-                x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0),
-            ),
+    def __init__(self):
+        self.s3 = S3Manager(
+            bucket_name=config.S3_BUCKET_NAME,
+            region=config.AWS_REGION,
         )
+        self.textract = TextractManager(region=config.AWS_REGION)
 
-        for block in sorted_blocks:
-            block_type = block["BlockType"]
-            text = block.get("Text", "")
-            page = block.get("Page", 1)
-            bbox = block.get("Geometry", {}).get("BoundingBox", {})
-            block_id = block.get("Id", "")
+    def discover_documents(self, prefix: Optional[str] = None) -> List[str]:
+        """List all supported documents under the source S3 prefix."""
+        prefix = prefix or config.S3_SOURCE_PREFIX
+        all_keys = self.s3.list_objects(prefix=prefix)
+        docs = [
+            key for key in all_keys
+            if key.lower().endswith(config.SUPPORTED_EXTENSIONS)
+        ]
+        logger.info(f"Discovered {len(docs)} documents under {prefix}")
+        return docs
 
-            # Create structured block
-            structured_block = {
-                "type": "text",
-                "content": text,
-                "metadata": {
-                    "page": page,
-                    "bbox": [
-                        bbox.get("Left", 0),
-                        bbox.get("Top", 0),
-                        bbox.get("Width", 0),
-                        bbox.get("Height", 0)
-                    ],
-                    "element_type": block_type.lower(),
-                    "block_id": block_id,
-                }
-            }
-
-            # --- Handle different block types ---
-            if block_type in ["LINE", "WORD"]:
-                structured_block["type"] = "text"
-                plain_text_parts.append(text)
-                markdown_text_parts.append(text)
-
-            elif block_type == "TABLE":
-                table_md = TextractManager._parse_table(block, sorted_blocks)
-                headers = TextractManager._extract_table_headers(block, sorted_blocks)
-                structured_block["type"] = "table"
-                structured_block["content"] = table_md
-                structured_block["metadata"]["headers"] = headers
-                plain_text_parts.append("[TABLE]")
-                markdown_text_parts.append(table_md)
-
-            elif block_type == "KEY_VALUE_SET":
-                key = block.get("Key", {}).get("Text", "")
-                value = block.get("Value", {}).get("Text", "")
-                structured_block["type"] = "key_value"
-                structured_block["content"] = f"{key}: {value}"
-                structured_block["metadata"]["key"] = key
-                structured_block["metadata"]["value"] = value
-                plain_text_parts.append(f"{key}: {value}")
-                markdown_text_parts.append(f"**{key}**: {value}")
-
-            elif block_type == "SELECTION_ELEMENT":
-                structured_block["type"] = "selection"
-                structured_block["metadata"]["status"] = block.get("SelectionStatus", "NOT_SELECTED")
-                if block.get("SelectionStatus") == "SELECTED":
-                    structured_block["content"] = f"[x] {text}"
-                    plain_text_parts.append(f"[x] {text}")
-                    markdown_text_parts.append(f"- [x] {text}")
-                else:
-                    structured_block["content"] = f"[ ] {text}"
-                    plain_text_parts.append(f"[ ] {text}")
-                    markdown_text_parts.append(f"- [ ] {text}")
-
-            # --- Detect headings ---
-            if block_type in ["LINE", "WORD"] and TextractManager._is_heading(text):
-                structured_block["type"] = "heading"
-                structured_block["metadata"]["level"] = TextractManager._guess_heading_level(text)
-                plain_text_parts[-1] = f"\n{text}\n"  # Add newlines for headings
-                markdown_text_parts[-1] = f"\n{'#' * structured_block['metadata']['level']} {text}\n"
-
-            structured_blocks.append(structured_block)
-
-        return structured_blocks, "\n".join(plain_text_parts), "\n".join(markdown_text_parts)
-
-    @staticmethod
-    def _parse_table(table_block: Dict[str, Any], all_blocks: List[Dict[str, Any]]) -> str:
+    def process_single_document(self, s3_key: str) -> Tuple[str, bool, str]:
         """
-        Parse a Textract TABLE block into Markdown.
-
-        Args:
-            table_block: Textract TABLE block.
-            all_blocks: All blocks in the document (for resolving relationships).
+        Process one document: Textract → parse → save .md, .txt, .json outputs.
 
         Returns:
-            str: Markdown-formatted table.
+            Tuple of (s3_key, success: bool, message: str).
         """
-        # Find all cells in the table
-        cells = []
-        for rel in table_block.get("Relationships", []):
-            if rel["Type"] == "CHILD":
-                for cell_id in rel["Ids"]:
-                    cell = next((b for b in all_blocks if b["Id"] == cell_id), None)
-                    if cell:
-                        cells.append(cell)
+        doc_name = Path(s3_key).stem
+        logger.info(f"Processing: {s3_key}")
 
-        # Sort cells by row and column indices
-        cells.sort(key=lambda x: (x.get("RowIndex", 0), x.get("ColumnIndex", 0)))
+        try:
+            # 1. Start Textract job
+            job_id = self.textract.start_document_analysis(
+                s3_bucket=config.S3_BUCKET_NAME,
+                s3_key=s3_key,
+                features=config.TEXTRACT_FEATURES,
+            )
 
-        # Extract text from each cell
-        rows = []
-        current_row = []
-        prev_row_index = None
-        for cell in cells:
-            row_index = cell.get("RowIndex", 0)
-            if row_index != prev_row_index and current_row:
-                rows.append(current_row)
-                current_row = []
-            prev_row_index = row_index
+            # 2. Wait for completion
+            success = self.textract.wait_for_job_completion(
+                job_id=job_id,
+                max_retries=config.MAX_RETRIES,
+                sleep_sec=config.POLL_INTERVAL_SEC,
+            )
+            if not success:
+                return s3_key, False, f"Textract job {job_id} failed or timed out"
 
-            # Get cell text (from child blocks)
-            cell_text = []
-            for rel in cell.get("Relationships", []):
-                if rel["Type"] == "CHILD":
-                    for content_id in rel["Ids"]:
-                        content_block = next(
-                            (b for b in all_blocks if b["Id"] == content_id), None
-                        )
-                        if content_block and content_block["BlockType"] in ["LINE", "WORD"]:
-                            cell_text.append(content_block.get("Text", ""))
-            current_row.append(" | ".join(cell_text))
-        if current_row:
-            rows.append(current_row)
+            # 3. Retrieve and parse blocks
+            blocks = self.textract.get_job_results(job_id=job_id)
+            parsed: ParsedDocument = self.textract.parse_document(
+                blocks, document_id=doc_name
+            )
 
-        # Format as Markdown table
-        if not rows:
-            return ""
+            # 4. Save outputs to S3
+            base_output_key = f"{config.S3_TEXTRACT_OUTPUT_PREFIX}{doc_name}"
+            saved = []
 
-        markdown_table = []
-        markdown_table.append("| " + " | ".join(rows[0]) + " |")
-        markdown_table.append("|" + "|".join(["---"] * len(rows[0])) + "|")
-        for row in rows[1:]:
-            markdown_table.append("| " + " | ".join(row) + " |")
+            # 4a. Structured JSON (full document with elements + metadata)
+            json_key = f"{base_output_key}.json"
+            self.s3.put_string(
+                json_key,
+                json.dumps(parsed.to_dict(), indent=2, ensure_ascii=False),
+                content_type="application/json",
+            )
+            saved.append(json_key)
 
-        return "\n".join(markdown_table)
+            # 4b. Markdown (with YAML frontmatter + page markers)
+            if "md" in config.OUTPUT_FORMATS:
+                md_key = f"{base_output_key}.md"
+                self.s3.put_string(
+                    md_key,
+                    parsed.markdown_text,
+                    content_type="text/markdown; charset=utf-8",
+                )
+                saved.append(md_key)
 
-    @staticmethod
-    def _extract_table_headers(table_block: Dict[str, Any], all_blocks: List[Dict[str, Any]]) -> List[str]:
-        """Extract headers from a TABLE block (first row)."""
-        headers = []
-        for rel in table_block.get("Relationships", []):
-            if rel["Type"] == "CHILD":
-                for cell_id in rel["Ids"]:
-                    cell = next((b for b in all_blocks if b["Id"] == cell_id), None)
-                    if cell and cell.get("RowIndex") == 1:  # First row = headers
-                        headers.append(cell.get("Text", ""))
-        return headers
+            # 4c. Plain text
+            if "txt" in config.OUTPUT_FORMATS:
+                txt_key = f"{base_output_key}.txt"
+                self.s3.put_string(
+                    txt_key,
+                    parsed.plain_text,
+                    content_type="text/plain; charset=utf-8",
+                )
+                saved.append(txt_key)
 
-    @staticmethod
-    def _is_heading(text: str) -> bool:
-        """Check if text is a heading (short, numbered, or all-caps)."""
-        if not text or len(text.split()) > 8:
-            return False
-        # Numbered headings (e.g., "1.", "A.")
-        if re.match(r'^[0-9A-Za-z]\.\s', text) or re.match(r'^[IVXivx]+\.\s', text):
-            return True
-        # All caps or title case
-        if text.isupper() or (text.istitle() and len(text.split()) <= 5):
-            return True
-        return False
+            logger.info(f"Saved {len(saved)} outputs for {doc_name}")
+            return s3_key, True, f"OK → {saved}"
 
-    @staticmethod
-    def _guess_heading_level(text: str) -> int:
-        """Guess heading level (1-6) from text."""
-        if re.match(r'^#\s', text):
-            return len(text.split()[0])  # Count # symbols
-        elif re.match(r'^[0-9]+\.\s', text):
-            return 1
-        elif text.isupper():
-            return 1
-        else:
-            return 2
-############
-#config.py
-"""
-Centralized configuration for the Textract RAG pipeline.
-Loads environment variables and defines S3 paths, chunking settings, and metadata schema.
-"""
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"AWS error processing {s3_key}: {e}")
+            return s3_key, False, str(e)
+        except Exception as e:
+            logger.error(f"Unexpected error processing {s3_key}: {e}")
+            return s3_key, False, str(e)
 
-import os
-from typing import Dict, List, Any
+    def run_sequential(self, prefix: Optional[str] = None) -> List[Tuple[str, bool, str]]:
+        """Process all documents one by one."""
+        docs = self.discover_documents(prefix)
+        results = []
+        for doc in docs:
+            result = self.process_single_document(doc)
+            results.append(result)
+        return results
 
-class Config:
-    """Centralized configuration for the Textract RAG pipeline."""
+    def run_parallel(
+        self, prefix: Optional[str] = None, max_workers: Optional[int] = None
+    ) -> List[Tuple[str, bool, str]]:
+        """Process documents in parallel using ThreadPoolExecutor."""
+        docs = self.discover_documents(prefix)
+        max_workers = max_workers or 3  # Conservative for Textract quotas
+        results = []
 
-    # --- AWS Configuration ---
-    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_doc = {
+                executor.submit(self.process_single_document, doc): doc
+                for doc in docs
+            }
+            for future in as_completed(future_to_doc):
+                doc = future_to_doc[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logger.error(f"Exception for {doc}: {e}")
+                    result = (doc, False, str(e))
+                results.append(result)
 
-    # --- S3 Paths (relative to bucket) ---
-    S3_CONFIG: Dict[str, str] = {
-        "bucket_name": S3_BUCKET_NAME,
-        "source_prefix": os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"),
-        "textract_output": os.getenv("S3_TEXTRACT_OUTPUT", "ecmc_org/RAG/textract-output/"),
-        "parsed_documents": os.getenv("S3_PARSED_DOCUMENTS", "ecmc_org/RAG/parsed-documents/"),
-        "logs": os.getenv("S3_LOGS_PATH", "ecmc_org/RAG/logs/"),
-        "chunking_output": os.getenv("S3_CHUNKING_OUTPUT", "ecmc_org/RAG/chunking-output/"),
-    }
-    S3_CONFIG: Dict[str, str] = {
-    "bucket_name": S3_BUCKET_NAME,
-    "source_prefix": "ecmc_org/RAG/Source_data/",
-    "textract_output":  "ecmc_org/RAG/textract-output/",
-    "parsed_documents":  "ecmc_org/RAG/parsed-documents/",
-    "logs": "ecmc_org/RAG/logs/",  # <-- S3_LOGS_PATH is here
-    "chunking_output": "ecmc_org/RAG/chunking-output/",
-}
+        return results
 
-    # --- Textract Configuration ---
-    TEXTRACT_FEATURES: List[str] = ["FORMS", "TABLES", "LAYOUT"]
-    TEXTRACT_MAX_RETRIES: int = 30
-    TEXTRACT_RETRY_DELAY: int = 5  # seconds
+    def generate_report(self, results: List[Tuple[str, bool, str]]) -> str:
+        """Generate a simple processing report and save to S3."""
+        total = len(results)
+        success = sum(1 for _, ok, _ in results if ok)
+        failed = total - success
 
-    # --- Chunking Configuration ---
-    CHUNKING_CONFIG: Dict[str, Any] = {
-        "token_limit": 512,                # Target chunk size (tokens)
-        "text_overlap": 50,                # Token overlap for text chunks
-        "table_overlap_rows": 2,           # Rows to overlap in table chunks
-        "min_table_rows": 2,              # Minimum rows to consider a table
-        "inject_headers": True,           # Prepend headers to table chunks
-        "table_title_lookup": 5,          # Lines to scan for table titles
-        "fallback_to_text": True,         # Treat unparseable tables as text
-    }
-
-    # --- Metadata Schema ---
-    METADATA_SCHEMA: Dict[str, List[str]] = {
-        "required": [
-            "document_id",
-            "chunk_id",
-            "element_type",  # "heading", "table", "text", "key_value", "selection"
-            "page_number",
-            "position",      # Sequential order in document
-        ],
-        "optional": [
-            "section",        # Parent section header
-            "parent_id",      # ID of parent chunk (e.g., heading)
-            "neighbors",      # List of adjacent chunk IDs
-            "table_id",       # Unique ID for tables
-            "headers",        # Column headers (for tables)
-            "level",         # Heading level (1-6)
-            "row_range",      # For split tables (e.g., "rows 1-10")
+        lines = [
+            "=" * 70,
+            "TEXTRACT BATCH PROCESSING REPORT",
+            "=" * 70,
+            f"Total documents : {total}",
+            f"Successful      : {success}",
+            f"Failed          : {failed}",
+            f"Success rate    : {success / total * 100:.1f}%" if total else "N/A",
+            "-" * 70,
         ]
-    }
 
-    # --- Vector DB Configuration ---
-    VECTOR_DB_CONFIG: Dict[str, Any] = {
-        "provider": os.getenv("VECTOR_DB_PROVIDER", "weaviate"),  # "weaviate" or "pinecone"
-        "embedding_model": os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002"),
-        "enable_graph_queries": True,
-    }
+        for s3_key, ok, msg in results:
+            status = "PASS" if ok else "FAIL"
+            lines.append(f"[{status}] {Path(s3_key).name:<45} {msg}")
+
+        lines.append("=" * 70)
+        report = "\n".join(lines)
+        logger.info("\n" + report)
+
+        report_key = f"{config.S3_LOGS_PREFIX}textract_report_{int(time.time())}.txt"
+        self.s3.put_string(report_key, report)
+        return report
+
+
+def main():
+    """CLI / Notebook entry point."""
+    pipeline = TextractPipeline()
+    results = pipeline.run_sequential()
+    pipeline.generate_report(results)
+
+
+if __name__ == "__main__":
+    main()
 
 ###############################
 """
-Main pipeline for processing PDFs with Amazon Textract.
-Generates Markdown and TXT outputs, and saves to S3.
+Main pipeline: Discover all documents in S3, run Textract analysis,
+post-process with enhanced parsing, and save structured outputs back to S3.
+Supports both sequential and parallel execution.
 """
 
-import os
-import re
-import time
+import json
 import logging
-from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
-from config import Config
-from utility import S3Manager, TextractManager
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import List, Optional, Tuple
 
-# Configure logging
+from botocore.exceptions import ClientError, BotoCoreError
+
+from config import config
+from utility import S3Manager, TextractManager, ParsedDocument
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+
 class TextractPipeline:
-    """Orchestrates the Textract RAG pipeline."""
+    """End-to-end pipeline for batch Textract processing."""
 
     def __init__(self):
-        """Initialize pipeline components."""
-        self.s3_manager = S3Manager(Config.S3_CONFIG["bucket_name"])
-        self.textract_manager = TextractManager()
-        self.temp_dir = os.path.join(os.path.expanduser("~"), "textract_temp")
-        os.makedirs(self.temp_dir, exist_ok=True)
+        self.s3 = S3Manager(
+            bucket_name=config.S3_BUCKET_NAME,
+            region=config.AWS_REGION,
+        )
+        self.textract = TextractManager(region=config.AWS_REGION)
 
-    def process_pdf(self, s3_key: str) -> bool:
+    def discover_documents(self, prefix: Optional[str] = None) -> List[str]:
+        """List all supported documents under the source S3 prefix."""
+        prefix = prefix or config.S3_SOURCE_PREFIX
+        all_keys = self.s3.list_objects(prefix=prefix)
+        docs = [
+            key for key in all_keys
+            if key.lower().endswith(config.SUPPORTED_EXTENSIONS)
+        ]
+        logger.info(f"Discovered {len(docs)} documents under {prefix}")
+        return docs
+
+    def process_single_document(self, s3_key: str) -> Tuple[str, bool, str]:
         """
-        Process a single PDF file from S3.
-        Steps:
-        1. Start Textract job.
-        2. Wait for completion.
-        3. Parse blocks into structured format + TXT/Markdown.
-        4. Upload outputs to S3.
-        5. Log results.
-
-        Args:
-            s3_key: S3 key of the PDF (e.g., "ecmc_org/RAG/Source_data/BK_team.pdf").
+        Process one document: Textract → parse → save .md, .txt, .json outputs.
 
         Returns:
-            bool: True if successful, False otherwise.
+            Tuple of (s3_key, success: bool, message: str).
         """
-        document_id = os.path.splitext(os.path.basename(s3_key))[0]
-        logger.info(f"Processing PDF: {s3_key}")
+        doc_name = Path(s3_key).stem
+        logger.info(f"Processing: {s3_key}")
 
         try:
-            # Step 1: Start Textract job
-            job_id = self.textract_manager.start_document_analysis(s3_key)
-            if not self.textract_manager.wait_for_job_completion(job_id):
-                logger.error(f"Textract job {job_id} failed for {s3_key}")
-                return False
+            # 1. Start Textract job
+            job_id = self.textract.start_document_analysis(
+                s3_bucket=config.S3_BUCKET_NAME,
+                s3_key=s3_key,
+                features=config.TEXTRACT_FEATURES,
+            )
 
-            # Step 2: Retrieve and parse results
-            results = self.textract_manager.get_job_results(job_id)
-            blocks = results.get("Blocks", [])
+            # 2. Wait for completion
+            success = self.textract.wait_for_job_completion(
+                job_id=job_id,
+                max_retries=config.MAX_RETRIES,
+                sleep_sec=config.POLL_INTERVAL_SEC,
+            )
+            if not success:
+                return s3_key, False, f"Textract job {job_id} failed or timed out"
 
-            # Step 3: Parse into structured blocks + TXT/Markdown
-            structured_blocks, plain_text, markdown_text = self.textract_manager.parse_blocks(blocks)
+            # 3. Retrieve and parse blocks
+            blocks = self.textract.get_job_results(job_id=job_id)
+            parsed: ParsedDocument = self.textract.parse_document(
+                blocks, document_id=doc_name
+            )
 
-            # Step 4: Generate output filenames
-            output_key_base = f"{Config.S3_CONFIG['textract_output']}{document_id}"
+            # 4. Save outputs to S3
+            base_output_key = f"{config.S3_TEXTRACT_OUTPUT_PREFIX}{doc_name}"
+            saved = []
 
-            # Step 5: Save outputs to S3
-            self._upload_outputs(document_id, plain_text, markdown_text, output_key_base)
+            # 4a. Structured JSON (full document with elements + metadata)
+            json_key = f"{base_output_key}.json"
+            self.s3.put_string(
+                json_key,
+                json.dumps(parsed.to_dict(), indent=2, ensure_ascii=False),
+                content_type="application/json",
+            )
+            saved.append(json_key)
 
-            logger.info(f"Successfully processed {s3_key}")
-            return True
+            # 4b. Markdown (with YAML frontmatter + page markers)
+            if "md" in config.OUTPUT_FORMATS:
+                md_key = f"{base_output_key}.md"
+                self.s3.put_string(
+                    md_key,
+                    parsed.markdown_text,
+                    content_type="text/markdown; charset=utf-8",
+                )
+                saved.append(md_key)
 
+            # 4c. Plain text
+            if "txt" in config.OUTPUT_FORMATS:
+                txt_key = f"{base_output_key}.txt"
+                self.s3.put_string(
+                    txt_key,
+                    parsed.plain_text,
+                    content_type="text/plain; charset=utf-8",
+                )
+                saved.append(txt_key)
+
+            logger.info(f"Saved {len(saved)} outputs for {doc_name}")
+            return s3_key, True, f"OK → {saved}"
+
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"AWS error processing {s3_key}: {e}")
+            return s3_key, False, str(e)
         except Exception as e:
-            logger.error(f"Failed to process {s3_key}: {e}", exc_info=True)
-            return False
+            logger.error(f"Unexpected error processing {s3_key}: {e}")
+            return s3_key, False, str(e)
 
-    def _upload_outputs(self, document_id: str, plain_text: str, markdown_text: str, output_key_base: str) -> None:
-        """
-        Upload TXT and Markdown outputs to S3.
+    def run_sequential(self, prefix: Optional[str] = None) -> List[Tuple[str, bool, str]]:
+        """Process all documents one by one."""
+        docs = self.discover_documents(prefix)
+        results = []
+        for doc in docs:
+            result = self.process_single_document(doc)
+            results.append(result)
+        return results
 
-        Args:
-            document_id: Base filename (without extension).
-            plain_text: Plain text content.
-            markdown_text: Markdown content.
-            output_key_base: Base S3 key (e.g., "ecmc_org/RAG/textract-output/BK_team").
-        """
-        # Save TXT
-        txt_path = os.path.join(self.temp_dir, f"{document_id}.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(plain_text)
-        self.s3_manager.upload_file(txt_path, f"{output_key_base}.txt")
+    def run_parallel(
+        self, prefix: Optional[str] = None, max_workers: Optional[int] = None
+    ) -> List[Tuple[str, bool, str]]:
+        """Process documents in parallel using ThreadPoolExecutor."""
+        docs = self.discover_documents(prefix)
+        max_workers = max_workers or 3  # Conservative for Textract quotas
+        results = []
 
-        # Save Markdown
-        md_path = os.path.join(self.temp_dir, f"{document_id}.md")
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(markdown_text)
-        self.s3_manager.upload_file(md_path, f"{output_key_base}.md")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_doc = {
+                executor.submit(self.process_single_document, doc): doc
+                for doc in docs
+            }
+            for future in as_completed(future_to_doc):
+                doc = future_to_doc[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logger.error(f"Exception for {doc}: {e}")
+                    result = (doc, False, str(e))
+                results.append(result)
 
-        # Clean up
-        for path in [txt_path, md_path]:
-            if os.path.exists(path):
-                os.unlink(path)
+        return results
 
-    def process_all_pdfs(self) -> None:
-        """Process all PDFs in S3_SOURCE_PREFIX."""
-        prefix = Config.S3_CONFIG["source_prefix"]
-        s3_keys = self.s3_manager.list_objects(prefix)
-        pdf_keys = [key for key in s3_keys if key.lower().endswith(".pdf")]
+    def generate_report(self, results: List[Tuple[str, bool, str]]) -> str:
+        """Generate a simple processing report and save to S3."""
+        total = len(results)
+        success = sum(1 for _, ok, _ in results if ok)
+        failed = total - success
 
-        logger.info(f"Found {len(pdf_keys)} PDFs to process in {prefix}")
+        lines = [
+            "=" * 70,
+            "TEXTRACT BATCH PROCESSING REPORT",
+            "=" * 70,
+            f"Total documents : {total}",
+            f"Successful      : {success}",
+            f"Failed          : {failed}",
+            f"Success rate    : {success / total * 100:.1f}%" if total else "N/A",
+            "-" * 70,
+        ]
 
-        for s3_key in pdf_keys:
-            self.process_pdf(s3_key)
+        for s3_key, ok, msg in results:
+            status = "PASS" if ok else "FAIL"
+            lines.append(f"[{status}] {Path(s3_key).name:<45} {msg}")
 
-    def upload_logs(self) -> None:
-        """Upload logs to S3."""
-        log_files = [f for f in os.listdir(self.temp_dir) if f.endswith(".log")]
-        for log_file in log_files:
-            log_path = os.path.join(self.temp_dir, log_file)
-            log_key = f"{Config.S3_CONFIG['logs']}{log_file}"
-            self.s3_manager.upload_file(log_path, log_key)
-            logger.info(f"Uploaded logs to s3://{Config.S3_CONFIG['bucket_name']}/{log_key}")
+        lines.append("=" * 70)
+        report = "\n".join(lines)
+        logger.info("\n" + report)
 
-def lambda_handler(event, context):
-    """
-    AWS Lambda handler for the Textract pipeline.
-    Processes PDFs from S3 and saves outputs + logs to S3.
-    """
-    try:
-        logger.info("Lambda function started")
-        pipeline = TextractPipeline()
-        pipeline.process_all_pdfs()
-        pipeline.upload_logs()
-        logger.info("Lambda function completed successfully")
-        return {
-            "statusCode": 200,
-            "body": f"Processed {len(pipeline.s3_manager.list_objects(Config.S3_CONFIG['source_prefix']))} PDFs",
-        }
-    except Exception as e:
-        logger.error(f"Lambda function failed: {e}", exc_info=True)
-        return {
-            "statusCode": 500,
-            "body": f"Error: {str(e)}",
-        }
+        report_key = f"{config.S3_LOGS_PREFIX}textract_report_{int(time.time())}.txt"
+        self.s3.put_string(report_key, report)
+        return report
+
+
+def main():
+    """CLI / Notebook entry point."""
+    pipeline = TextractPipeline()
+    results = pipeline.run_sequential()
+    pipeline.generate_report(results)
+
 
 if __name__ == "__main__":
-    # For local testing
-    pipeline = TextractPipeline()
-    pipeline.process_all_pdfs()
-    pipeline.upload_logs()
-
-
-
+    main()
 
 #########################
-S3_CONFIG = {
-    "bucket_name": "bankrupcy-data-bkt",
-    "source_prefix": "ecmc_org/RAG/Source_data/",
-    "parsed_documents": "ecmc_org/RAG/parsed-documents/",
-    "logs": "ecmc_org/RAG/logs/",
-}
+# ── Core AWS SDK ──────────────────────────────────────────────
+boto3>=1.34.0
+botocore>=1.34.0
 
-import tempfile
-print(tempfile.gettempdir())  # Should print a valid path like C:\Users\...\AppData\Local\Temp
+# ── Text Splitting (chunking_engine.py) ───────────────────────
+langchain-text-splitters>=0.0.1
 
-processor = EnhancedTextractPostProcessor(Config)
-processor.process_pdf("ecmc_org/RAG/Source_data/BK_team.pdf")
-############
-"""
-Enhanced Textract Post-Processor for ECMC Financial Documents.
-Fixes:
-- Cross-platform temp directory (Windows/Linux/macOS)
-- Spaces in filenames (e.g., "BK team.pdf")
-- Robust S3 download/upload
-- Better error handling
-- Debug logging
-"""
-
-import os
-import re
-import json
-import logging
-import tempfile
-import boto3
-from typing import List, Dict, Any, Optional, Tuple
-from config import Config
-
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG for detailed logs
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-class EnhancedTextractPostProcessor:
-    """Post-processes Textract output into structured, high-quality blocks."""
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.s3_client = boto3.client(
-            "s3",
-            region_name=config.AWS_REGION
-        )
-        self.textract_client = boto3.client(
-            "textract",
-            region_name=config.AWS_REGION
-        )
-        # Use system's temp directory (works on Windows/Linux/macOS)
-        self.temp_dir = tempfile.gettempdir()
-        logger.info(f"Using temp directory: {self.temp_dir}")
-
-    def process_pdf(self, s3_key: str) -> Dict[str, Any]:
-        """
-        Process a PDF from S3 using Textract and post-process into structured blocks.
-        Args:
-            s3_key: S3 key of the PDF (e.g., "ecmc_org/RAG/Source_data/BK_team.pdf").
-        Returns:
-            {
-                "document_id": str,
-                "blocks": List[Dict[str, Any]]  # Structured blocks with metadata
-            }
-        """
-        # Sanitize filename for local storage (replace spaces, special chars)
-        sanitized_filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', os.path.basename(s3_key))
-        local_path = os.path.join(self.temp_dir, sanitized_filename)
-        document_id = os.path.splitext(sanitized_filename)[0]
-
-        try:
-            logger.info(f"Processing PDF: {s3_key}")
-
-            # Step 1: Download from S3
-            self._download_from_s3(s3_key, local_path)
-
-            # Step 2: Call Textract
-            with open(local_path, "rb") as f:
-                response = self.textract_client.analyze_document(
-                    Document={"Bytes": f.read()},
-                    FeatureTypes=["TABLES", "FORMS", "LAYOUT"]
-                )
-
-            # Step 3: Post-process Textract output
-            blocks = self._post_process_textract(response, document_id)
-
-            return {
-                "document_id": document_id,
-                "blocks": blocks
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to process {s3_key}: {e}", exc_info=True)
-            raise
-        finally:
-            if os.path.exists(local_path):
-                os.unlink(local_path)
-
-    def _download_from_s3(self, s3_key: str, local_path: str) -> None:
-        """Download file from S3 to a local path."""
-        bucket = self.config.S3_CONFIG["bucket_name"]
-        try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            self.s3_client.download_file(bucket, s3_key, local_path)
-            logger.info(f"Downloaded {s3_key} to {local_path}")
-        except Exception as e:
-            logger.error(f"Failed to download {s3_key} to {local_path}: {e}")
-            raise
-
-    def _post_process_textract(self, textract_json: Dict[str, Any], document_id: str) -> List[Dict[str, Any]]:
-        """
-        Post-process Textract JSON into structured blocks.
-        Steps:
-        1. Group WORDs into LINEs, then LINEs into PARAGRAPHs.
-        2. Detect HEADINGS from LINEs (heuristics + layout).
-        3. Parse TABLEs from CELL blocks.
-        4. Sort all blocks by reading order (top-to-bottom, left-to-right).
-        """
-        # Group blocks by type
-        words = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "WORD"]
-        lines = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "LINE"]
-        tables = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "TABLE"]
-        cells = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "CELL"]
-
-        # Step 1: Group words into lines (Textract may split lines into words)
-        grouped_lines = self._group_words_into_lines(words, lines)
-
-        # Step 2: Group lines into paragraphs
-        paragraphs = self._group_lines_into_paragraphs(grouped_lines)
-
-        # Step 3: Detect headings from lines
-        headings = self._detect_headings(grouped_lines)
-
-        # Step 4: Parse tables
-        parsed_tables = self._parse_tables(tables, cells, textract_json)
-
-        # Step 5: Combine all blocks
-        blocks = headings + parsed_tables + paragraphs
-
-        # Step 6: Sort by reading order (using bounding boxes)
-        blocks = self._sort_by_reading_order(blocks)
-
-        # Step 7: Assign final metadata (positions, chunk IDs)
-        for i, block in enumerate(blocks):
-            block["metadata"]["position"] = i
-            block["metadata"]["chunk_id"] = f"{document_id}_{block['type']}_{i}"
-
-        return blocks
-
-    def _group_words_into_lines(self, words: List[Dict[str, Any]], existing_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Group WORD blocks into LINE blocks (Textract may split lines into words).
-        Uses bounding box Y-coordinates to group words horizontally.
-        """
-        if existing_lines:
-            # If Textract already provides lines, use them
-            return existing_lines
-
-        # Group words by Y-coordinate (same line = similar Y)
-        lines = []
-        word_groups = {}
-        for word in words:
-            y = word["Geometry"]["BoundingBox"]["Top"]
-            if y not in word_groups:
-                word_groups[y] = []
-            word_groups[y].append(word)
-
-        # Sort groups by Y, then X
-        for y, group in word_groups.items():
-            group.sort(key=lambda w: w["Geometry"]["BoundingBox"]["Left"])
-            line_text = " ".join(w["Text"] for w in group)
-            # Use the first word's bbox as the line's bbox
-            first_word = group[0]
-            lines.append({
-                "BlockType": "LINE",
-                "Text": line_text,
-                "Geometry": first_word["Geometry"],
-                "Page": first_word["Page"],
-                "Id": f"line_{y}"  # Temporary ID
-            })
-        return lines
-
-    def _group_lines_into_paragraphs(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Group LINE blocks into PARAGRAPH blocks.
-        Uses bounding box Y-coordinates to group lines vertically.
-        """
-        if not lines:
-            return []
-
-        # Sort lines by Y, then X
-        lines.sort(key=lambda l: (
-            l["Geometry"]["BoundingBox"]["Top"],
-            l["Geometry"]["BoundingBox"]["Left"]
-        ))
-
-        paragraphs = []
-        current_para = {
-            "type": "text",
-            "content": "",
-            "metadata": {
-                "page": lines[0]["Page"],
-                "bbox": [
-                    lines[0]["Geometry"]["BoundingBox"]["Left"],
-                    lines[0]["Geometry"]["BoundingBox"]["Top"],
-                    lines[0]["Geometry"]["BoundingBox"]["Width"],
-                    lines[0]["Geometry"]["BoundingBox"]["Height"]
-                ],
-                "lines": []
-            }
-        }
-
-        for line in lines:
-            # Check if this line is on the same "paragraph" (Y distance < threshold)
-            y_diff = line["Geometry"]["BoundingBox"]["Top"] - current_para["metadata"]["bbox"][1]
-            if y_diff > 0.05:  # Threshold: 5% of page height = new paragraph
-                if current_para["content"].strip():
-                    paragraphs.append(current_para)
-                current_para = {
-                    "type": "text",
-                    "content": line["Text"] + " ",
-                    "metadata": {
-                        "page": line["Page"],
-                        "bbox": [
-                            line["Geometry"]["BoundingBox"]["Left"],
-                            line["Geometry"]["BoundingBox"]["Top"],
-                            line["Geometry"]["BoundingBox"]["Width"],
-                            line["Geometry"]["BoundingBox"]["Height"]
-                        ],
-                        "lines": [line["Text"]]
-                    }
-                }
-            else:
-                current_para["content"] += line["Text"] + " "
-                current_para["metadata"]["lines"].append(line["Text"])
-                # Expand bbox to include this line
-                current_para["metadata"]["bbox"] = [
-                    min(current_para["metadata"]["bbox"][0], line["Geometry"]["BoundingBox"]["Left"]),
-                    min(current_para["metadata"]["bbox"][1], line["Geometry"]["BoundingBox"]["Top"]),
-                    max(current_para["metadata"]["bbox"][0] + current_para["metadata"]["bbox"][2],
-                        line["Geometry"]["BoundingBox"]["Left"] + line["Geometry"]["BoundingBox"]["Width"]),
-                    max(current_para["metadata"]["bbox"][1] + current_para["metadata"]["bbox"][3],
-                        line["Geometry"]["BoundingBox"]["Top"] + line["Geometry"]["BoundingBox"]["Height"])
-                ]
-
-        if current_para["content"].strip():
-            paragraphs.append(current_para)
-
-        # Clean up content (remove extra spaces)
-        for para in paragraphs:
-            para["content"] = re.sub(r'\s+', ' ', para["content"]).strip()
-
-        return paragraphs
-
-    def _detect_headings(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Detect headings from LINE blocks using heuristics:
-        - Short lines (< 10 words)
-        - All caps or title case
-        - Numbered (e.g., "1.", "A.")
-        - Bold/large font (if Textract provides font info)
-        """
-        headings = []
-        for line in lines:
-            text = line["Text"].strip()
-            if not text:
-                continue
-
-            # Heuristic 1: Short lines (likely headings)
-            if len(text.split()) <= 8:
-                # Heuristic 2: Starts with a number/letter (e.g., "1.", "A.")
-                if re.match(r'^[0-9A-Za-z]\.\s', text) or re.match(r'^[IVXivx]+\.\s', text):
-                    headings.append({
-                        "type": "heading",
-                        "content": text,
-                        "metadata": {
-                            "page": line["Page"],
-                            "bbox": self._normalize_bbox(line["Geometry"]["BoundingBox"]),
-                            "level": self._guess_heading_level(text)
-                        }
-                    })
-                    continue
-
-                # Heuristic 3: All caps or title case
-                if text.isupper() or text.istitle():
-                    headings.append({
-                        "type": "heading",
-                        "content": text,
-                        "metadata": {
-                            "page": line["Page"],
-                            "bbox": self._normalize_bbox(line["Geometry"]["BoundingBox"]),
-                            "level": self._guess_heading_level(text)
-                        }
-                    })
-                    continue
-
-        return headings
-
-    def _guess_heading_level(self, text: str) -> int:
-        """Guess heading level (1-6) from text."""
-        if re.match(r'^#\s', text):
-            return 1
-        elif re.match(r'^##\s', text):
-            return 2
-        elif re.match(r'^[0-9]+\.\s', text):
-            return 1  # Assume top-level if numbered
-        elif text.isupper():
-            return 1
-        else:
-            return 2  # Default to level 2
-
-    def _parse_tables(self, tables: List[Dict[str, Any]], cells: List[Dict[str, Any]], textract_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Parse TABLE blocks into structured tables with headers/rows.
-        Uses CELL blocks to reconstruct table content.
-        """
-        parsed_tables = []
-        for table in tables:
-            # Get all cells in this table
-            cell_ids = []
-            for rel in table.get("Relationships", []):
-                if rel["Type"] == "CHILD":
-                    cell_ids.extend(rel["Ids"])
-
-            # Map cell IDs to cell blocks
-            cell_map = {c["Id"]: c for c in cells if c["Id"] in cell_ids}
-
-            # Group cells by row
-            rows = {}
-            for cell_id in cell_ids:
-                if cell_id in cell_map:
-                    cell = cell_map[cell_id]
-                    row_idx = cell.get("RowIndex", 0)
-                    if row_idx not in rows:
-                        rows[row_idx] = []
-                    rows[row_idx].append(cell)
-
-            # Sort rows by RowIndex, then cells by ColumnIndex
-            for row_idx in sorted(rows.keys()):
-                rows[row_idx].sort(key=lambda c: c.get("ColumnIndex", 0))
-
-            # Extract headers (first row) and data rows
-            headers = []
-            data_rows = []
-            for row_idx in sorted(rows.keys()):
-                row_cells = rows[row_idx]
-                cell_texts = [c["Text"].strip() for c in row_cells]
-                if row_idx == 1:  # First row = headers
-                    headers = cell_texts
-                else:
-                    data_rows.append(cell_texts)
-
-            table_text = self._reconstruct_table_text(headers, data_rows)
-            parsed_tables.append({
-                "type": "table",
-                "content": table_text,
-                "metadata": {
-                    "page": table["Page"],
-                    "bbox": self._normalize_bbox(table["Geometry"]["BoundingBox"]),
-                    "headers": headers,
-                    "rows": data_rows
-                }
-            })
-        return parsed_tables
-
-    def _reconstruct_table_text(self, headers: List[str], rows: List[List[str]]) -> str:
-        """Reconstruct table as pipe-delimited Markdown."""
-        if not headers:
-            return ""
-        lines = [
-            "| " + " | ".join(headers) + " |",
-            "|" + "|".join(["---"] * len(headers)) + "|"
-        ]
-        for row in rows:
-            lines.append("| " + " | ".join(row) + " |")
-        return "\n".join(lines)
-
-    def _normalize_bbox(self, bbox: Dict[str, float]) -> List[float]:
-        """Convert Textract's normalized bbox to [x, y, width, height]."""
-        return [
-            bbox["Left"],
-            bbox["Top"],
-            bbox["Width"],
-            bbox["Height"]
-        ]
-
-    def _sort_by_reading_order(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Sort blocks by reading order (top-to-bottom, left-to-right)."""
-        return sorted(
-            blocks,
-            key=lambda x: (
-                x["metadata"]["bbox"][1],  # Top (Y)
-                x["metadata"]["bbox"][0]   # Left (X)
-            )
-        )
-
-    def process_all_pdfs(self, prefix: str = "") -> None:
-        """Process all PDFs in the S3 prefix."""
-        s3_keys = self._list_s3_keys(prefix)
-        for s3_key in s3_keys:
-            if s3_key.lower().endswith('.pdf'):
-                try:
-                    result = self.process_pdf(s3_key)
-                    output_key = f"{self.config.S3_CONFIG['parsed_documents']}{os.path.basename(s3_key)}.json"
-                    self._upload_to_s3(result, output_key)
-                    logger.info(f"Processed and uploaded: {s3_key} -> {output_key}")
-                except Exception as e:
-                    logger.error(f"Failed to process {s3_key}: {e}")
-
-    def _list_s3_keys(self, prefix: str) -> List[str]:
-        """List all S3 keys under a prefix."""
-        paginator = self.s3_client.get_paginator('list_objects_v2')
-        keys = []
-        for page in paginator.paginate(Bucket=self.config.S3_CONFIG["bucket_name"], Prefix=prefix):
-            keys.extend([obj['Key'] for obj in page.get('Contents', [])])
-        return keys
-
-    def _upload_to_s3(self, data: Dict, s3_key: str) -> None:
-        """Upload structured blocks to S3."""
-        sanitized_key = re.sub(r'[^a-zA-Z0-9_\-\./]', '_', s3_key)
-        temp_file = os.path.join(self.temp_dir, f"structured_{os.path.basename(sanitized_key)}.json")
-        try:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            self.s3_client.upload_file(
-                temp_file,
-                self.config.S3_CONFIG["bucket_name"],
-                s3_key
-            )
-            logger.info(f"Uploaded to: s3://{self.config.S3_CONFIG['bucket_name']}/{s3_key}")
-        except Exception as e:
-            logger.error(f"Failed to upload {s3_key}: {e}")
-            raise
-        finally:
-            if os.path.exists(temp_file):
-                os.unlink(temp_file)
-
-if __name__ == "__main__":
-    from config import Config
-    processor = EnhancedTextractPostProcessor(Config)
-    processor.process_all_pdfs(Config.S3_CONFIG["source_prefix"])
-########################
-"""
-Main pipeline for processing PDFs with Amazon Textract.
-Generates Markdown and plain text outputs, and saves logs to S3.
-"""
-
-import os
-import tempfile
-import logging
-from datetime import datetime
-from typing import Optional
-from config import Config
-from utility import S3Manager, TextractManager, logger
-
-# Configure logging to a file (in addition to stdout)
-temp_dir = tempfile.gettempdir()
-log_file = os.path.join(temp_dir, f"textract_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-
-# Use mode='w' to ensure the file is writable
-file_handler = logging.FileHandler(log_file, mode='w')
-stream_handler = logging.StreamHandler()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[file_handler, stream_handler]  # Both handlers in one call
-)
-
-class TextractPipeline:
-    """Orchestrates the Textract RAG pipeline."""
-
-    def __init__(self):
-        """Initialize pipeline components."""
-        self.s3_manager = S3Manager(Config.S3_CONFIG["bucket_name"])
-        self.textract_manager = TextractManager()
-
-    def upload_logs(self) -> None:
-        """Upload the log file to S3."""
-        log_key = Config.S3_CONFIG["logs"].replace(
-            f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
-        ) + f"textract_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-        if os.path.exists(log_file) and os.path.getsize(log_file) > 0:  # Check file is not empty
-            self.s3_manager.upload_file(log_file, log_key)
-            logger.info(f"Uploaded logs to s3://{Config.S3_CONFIG['bucket_name']}/{log_key}")
-        else:
-            logger.error(f"Log file is empty or missing: {log_file}")
-
-    def process_pdf(self, s3_key: str) -> None:
-        """
-        Process a single PDF file from S3.
-        Extracts content using Textract, generates Markdown and text outputs,
-        and saves them to S3.
-        """
-        logger.info(f"Processing PDF: {s3_key}")
-
-        # Step 1: Start Textract job
-        job_id = self.textract_manager.start_document_analysis(s3_key)
-        if not self.textract_manager.wait_for_job_completion(job_id):
-            logger.error(f"Textract job {job_id} failed or timed out for {s3_key}")
-            return
-
-        # Step 2: Retrieve and parse results
-        results = self.textract_manager.get_job_results(job_id)
-        blocks = results.get("Blocks", [])
-        plain_text, markdown = TextractManager.parse_blocks(blocks)
-
-        # Step 3: Generate output filenames
-        base_name = os.path.splitext(os.path.basename(s3_key))[0]
-        textract_output_path = Config.S3_CONFIG["textract_output"].replace(
-            f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
-        )
-        output_key_base = f"{textract_output_path}{base_name}"
-
-        # Step 4: Save outputs to S3
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as txt_file:
-            txt_file.write(plain_text)
-            txt_file_path = txt_file.name
-
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".md", delete=False) as md_file:
-            md_file.write(markdown)
-            md_file_path = md_file.name
-
-        self.s3_manager.upload_file(txt_file_path, f"{output_key_base}.txt")
-        self.s3_manager.upload_file(md_file_path, f"{output_key_base}.md")
-
-        # Clean up temp files
-        os.unlink(txt_file_path)
-        os.unlink(md_file_path)
-
-        logger.info(f"Successfully processed and saved outputs to {output_key_base}")
-
-    def process_all_pdfs(self) -> None:
-        """Process all PDFs in the source S3 prefix."""
-        source_prefix = Config.S3_CONFIG["source_prefix"]
-        pdf_keys = [
-            key for key in self.s3_manager.list_objects(source_prefix)
-            if key.lower().endswith(".pdf")
-        ]
-        logger.info(f"Found {len(pdf_keys)} PDFs to process in {source_prefix}")
-
-        for s3_key in pdf_keys:
-            self.process_pdf(s3_key)
-
-        # Upload logs to S3
-        self.upload_logs()
-
-def lambda_handler(event, context):
-    """
-    AWS Lambda handler for the Textract RAG pipeline.
-    Processes PDFs from S3 and saves outputs + logs to S3.
-    """
-    try:
-        logger.info("Lambda function started")
-        pipeline = TextractPipeline()
-        pipeline.process_all_pdfs()
-        logger.info("Lambda function completed successfully")
-        return {
-            "statusCode": 200,
-            "body": "PDF processing completed successfully",
-        }
-    except Exception as e:
-        logger.error(f"Lambda function failed: {e}", exc_info=True)
-        return {
-            "statusCode": 500,
-            "body": f"Error: {str(e)}",
-        }
-
-if __name__ == "__main__":
-    # For local testing
-    pipeline = TextractPipeline()
-    pipeline.process_all_pdfs()
-######################
-"""
-Centralized configuration for the Textract RAG pipeline.
-"""
-
-import os
-from typing import Dict, List
-
-class Config:
-    """Centralized configuration for the Textract RAG pipeline."""
-
-    # AWS Configuration
-    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
-
-    # S3 Paths
-    S3_CONFIG: Dict[str, str] = {
-        "bucket_name": S3_BUCKET_NAME,
-        "source_prefix": os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"),
-        "source_path": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/Source_data/",
-        "textract_output": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/textract-output/",
-        "logs": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/logs/",
-        "parsed_documents": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/parsed-documents/",
-        "chunking_output": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/chunking-output/",
-        "enriched_chunks": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/chunking-output/enriched/",
-        "vector_db_backup": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/vector-db-backup/",
-    }
-
-    # Chunking Configuration
-    CHUNKING_CONFIG: Dict[str, Any] = {
-        "token_limit": 512,                # Target chunk size (tokens)
-        "text_overlap": 50,                # Token overlap for text chunks
-        "table_overlap_rows": 2,           # Rows to overlap in table chunks
-        "min_table_rows": 2,              # Minimum rows to consider a table
-        "inject_headers": True,           # Prepend headers to table chunks
-        "table_title_lookup": 5,          # Lines to scan for table titles
-        "fallback_to_text": True,         # Treat unparseable tables as text
-        "vector_db": "weaviate",          # or "pinecone"
-        "embedding_model": "text-embedding-ada-002",
-        "enable_graph_queries": True,     # For parent/child relationships
-    }
-
-    # Metadata Schema
-    METADATA_SCHEMA: Dict[str, List[str]] = {
-        "required": [
-            "document_id",
-            "chunk_id",
-            "element_type",  # "heading", "table", "text"
-            "page_number",
-            "position",      # Sequential order in document
-        ],
-        "optional": [
-            "section",        # Parent section header
-            "parent_id",      # ID of parent chunk (e.g., heading)
-            "neighbors",      # List of adjacent chunk IDs
-            "table_id",        # Unique ID for tables
-            "headers",         # Column headers (for tables)
-            "row_range",       # For split tables (e.g., "rows 1-10")
-        ]
-    }
-
-    # Textract Features
-    TEXTRACT_FEATURES: List[str] = ["FORMS", "TABLES", "LAYOUT"]
-##################
-"""
-Centralized configuration module for the Textract RAG pipeline.
-Loads environment variables and defines S3 paths, chunking, and metadata schema.
-"""
-
-import os
-from typing import Dict, List
-
-class Config:
-    """Centralized configuration for the Textract RAG pipeline."""
-
-    # AWS Configuration
-    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
-
-    # S3 Paths
-    S3_CONFIG: Dict[str, str] = {
-        "bucket_name": S3_BUCKET_NAME,
-        "source_prefix": os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"),
-        "source_path": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/Source_data/",
-        "textract_output": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/textract-output/",
-        "logs": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/logs/",
-        "parsed_documents": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/parsed-documents/",
-        "chunking_output": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/chunking-output/",
-        "enriched_chunks": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/chunking-output/enriched/",
-        "vector_db_backup": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/vector-db-backup/",
-    }
-
-    # Chunking Configuration
-    CHUNKING_CONFIG: Dict[str, Any] = {
-        "token_limit": 512,                # Target chunk size (tokens)
-        "text_overlap": 50,                # Token overlap for text chunks
-        "table_overlap_rows": 2,           # Rows to overlap in table chunks
-        "min_table_rows": 2,              # Minimum rows to consider a table
-        "inject_headers": True,           # Prepend headers to table chunks
-        "table_title_lookup": 5,          # Lines to scan for table titles
-        "fallback_to_text": True,         # Treat unparseable tables as text
-        "vector_db": "weaviate",          # or "pinecone"
-        "embedding_model": "text-embedding-ada-002",
-        "enable_graph_queries": True,     # For parent/child relationships
-    }
-
-    # Metadata Schema
-    METADATA_SCHEMA: Dict[str, List[str]] = {
-        "required": [
-            "document_id",
-            "chunk_id",
-            "element_type",  # "heading", "table", "text"
-            "page_number",
-            "position",      # Sequential order in document
-        ],
-        "optional": [
-            "section",        # Parent section header
-            "parent_id",      # ID of parent chunk (e.g., heading)
-            "neighbors",      # List of adjacent chunk IDs
-            "table_id",        # Unique ID for tables
-            "headers",         # Column headers (for tables)
-            "row_range",       # For split tables (e.g., "rows 1-10")
-        ]
-    }
-
-    # Textract Features
-    TEXTRACT_FEATURES: List[str] = ["FORMS", "TABLES", "LAYOUT"]
-#######################
-CHUNKING_CONFIG = {
-    # Token limits
-    "token_limit": 512,                # Target chunk size (tokens)
-    "text_overlap": 50,                # Token overlap for text chunks
-    "table_overlap_rows": 2,           # Rows to overlap in table chunks
-
-    # Table handling
-    "min_table_rows": 2,              # Minimum rows to consider a table
-    "inject_headers": True,           # Prepend headers to table chunks
-    "table_title_lookup": 5,          # Lines to scan for table titles
-    "fallback_to_text": True,         # Treat unparseable tables as text
-
-    # Storage
-    "vector_db": "weaviate",          # or "pinecone"
-    "embedding_model": "text-embedding-ada-002",
-    "enable_graph_queries": True,     # For parent/child relationships
-}
-
-# ======================
-# METADATA SCHEMA
-# ======================
-METADATA_SCHEMA = {
-    "required": [
-        "document_id",
-        "chunk_id",
-        "element_type",  # "heading", "table", "text"
-        "page_number",
-        "position",      # Sequential order in document
-    ],
-    "optional": [
-        "section",        # Parent section header
-        "parent_id",      # ID of parent chunk (e.g., heading)
-        "neighbors",      # List of adjacent chunk IDs
-        "table_id",        # Unique ID for tables
-        "headers",         # Column headers (for tables)
-        "row_range",       # For split tables (e.g., "rows 1-10")
-    ]
-}
-
-# ======================
-# S3 PATHS
-# ======================
-S3_CONFIG = {
-    "bucket_name": "bankrupcy-data-bkt",
-    "parsed_documents": "ecmc_org/RAG/parsed-documents/",
-    "chunking_output": "ecmc_org/RAG/chunking-output/",
-    "enriched_chunks": "ecmc_org/RAG/chunking-output/enriched/",
-    "vector_db_backup": "ecmc_org/RAG/vector-db-backup/",
-    "logs": "ecmc_org/RAG/logs/",
-}
-
-######################
-processor = EnhancedTextractPostProcessor(Config)
-processor.process_pdf("ecmc_org/RAG/Source_data/BK_team.pdf")
-################
-"""
-Enhanced Textract Post-Processor for ECMC Financial Documents.
-Fixes:
-- Cross-platform temp directory (Windows/Linux/macOS)
-- Spaces in filenames (e.g., "BK team.pdf")
-- Robust S3 download/upload
-- Better error handling
-"""
-
-import os
-import re
-import json
-import logging
-import tempfile
-import boto3
-from typing import List, Dict, Any, Optional, Tuple
-from config import Config
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-class EnhancedTextractPostProcessor:
-    """Post-processes Textract output into structured, high-quality blocks."""
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.s3_client = boto3.client(
-            "s3",
-            region_name=config.AWS_REGION
-        )
-        self.textract_client = boto3.client(
-            "textract",
-            region_name=config.AWS_REGION
-        )
-        # Use system's temp directory (works on Windows/Linux/macOS)
-        self.temp_dir = tempfile.gettempdir()
-        logger.info(f"Using temp directory: {self.temp_dir}")
-
-    def process_pdf(self, s3_key: str) -> Dict[str, Any]:
-        """
-        Process a PDF from S3 using Textract and post-process into structured blocks.
-        Args:
-            s3_key: S3 key of the PDF (e.g., "ecmc_org/RAG/Source_data/BK team.pdf").
-        Returns:
-            {
-                "document_id": str,
-                "blocks": List[Dict[str, Any]]  # Structured blocks with metadata
-            }
-        """
-        # Sanitize filename for local storage (replace spaces, special chars)
-        sanitized_filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', os.path.basename(s3_key))
-        local_path = os.path.join(self.temp_dir, sanitized_filename)
-        document_id = os.path.splitext(sanitized_filename)[0]
-
-        try:
-            logger.info(f"Processing PDF: {s3_key}")
-
-            # Step 1: Download from S3
-            self._download_from_s3(s3_key, local_path)
-
-            # Step 2: Call Textract
-            with open(local_path, "rb") as f:
-                response = self.textract_client.analyze_document(
-                    Document={"Bytes": f.read()},
-                    FeatureTypes=["TABLES", "FORMS", "LAYOUT"]
-                )
-
-            # Step 3: Post-process Textract output
-            blocks = self._post_process_textract(response, document_id)
-
-            return {
-                "document_id": document_id,
-                "blocks": blocks
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to process {s3_key}: {e}", exc_info=True)
-            raise
-        finally:
-            if os.path.exists(local_path):
-                os.unlink(local_path)
-
-    def _download_from_s3(self, s3_key: str, local_path: str) -> None:
-        """Download file from S3 to a local path."""
-        bucket = self.config.S3_CONFIG["bucket_name"]
-        try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            self.s3_client.download_file(bucket, s3_key, local_path)
-            logger.info(f"Downloaded {s3_key} to {local_path}")
-        except Exception as e:
-            logger.error(f"Failed to download {s3_key} to {local_path}: {e}")
-            raise
-
-    def _post_process_textract(self, textract_json: Dict[str, Any], document_id: str) -> List[Dict[str, Any]]:
-        """
-        Post-process Textract JSON into structured blocks.
-        Steps:
-        1. Group WORDs into LINEs, then LINEs into PARAGRAPHs.
-        2. Detect HEADINGS from LINEs (heuristics + layout).
-        3. Parse TABLEs from CELL blocks.
-        4. Sort all blocks by reading order (top-to-bottom, left-to-right).
-        """
-        # Group blocks by type
-        words = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "WORD"]
-        lines = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "LINE"]
-        tables = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "TABLE"]
-        cells = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "CELL"]
-
-        # Step 1: Group words into lines (Textract may split lines into words)
-        grouped_lines = self._group_words_into_lines(words, lines)
-
-        # Step 2: Group lines into paragraphs
-        paragraphs = self._group_lines_into_paragraphs(grouped_lines)
-
-        # Step 3: Detect headings from lines
-        headings = self._detect_headings(grouped_lines)
-
-        # Step 4: Parse tables
-        parsed_tables = self._parse_tables(tables, cells, textract_json)
-
-        # Step 5: Combine all blocks
-        blocks = headings + parsed_tables + paragraphs
-
-        # Step 6: Sort by reading order (using bounding boxes)
-        blocks = self._sort_by_reading_order(blocks)
-
-        # Step 7: Assign final metadata (positions, chunk IDs)
-        for i, block in enumerate(blocks):
-            block["metadata"]["position"] = i
-            block["metadata"]["chunk_id"] = f"{document_id}_{block['type']}_{i}"
-
-        return blocks
-
-    def _group_words_into_lines(self, words: List[Dict[str, Any]], existing_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Group WORD blocks into LINE blocks using bounding boxes."""
-        if existing_lines:
-            return existing_lines
-
-        lines = []
-        word_groups = {}
-        for word in words:
-            y = word["Geometry"]["BoundingBox"]["Top"]
-            if y not in word_groups:
-                word_groups[y] = []
-            word_groups[y].append(word)
-
-        for y, group in word_groups.items():
-            group.sort(key=lambda w: w["Geometry"]["BoundingBox"]["Left"])
-            line_text = " ".join(w["Text"] for w in group)
-            first_word = group[0]
-            lines.append({
-                "BlockType": "LINE",
-                "Text": line_text,
-                "Geometry": first_word["Geometry"],
-                "Page": first_word["Page"],
-                "Id": f"line_{y}"
-            })
-        return lines
-
-    def _group_lines_into_paragraphs(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Group LINE blocks into PARAGRAPH blocks using bounding boxes."""
-        if not lines:
-            return []
-
-        lines.sort(key=lambda l: (
-            l["Geometry"]["BoundingBox"]["Top"],
-            l["Geometry"]["BoundingBox"]["Left"]
-        ))
-
-        paragraphs = []
-        current_para = {
-            "type": "text",
-            "content": "",
-            "metadata": {
-                "page": lines[0]["Page"],
-                "bbox": [
-                    lines[0]["Geometry"]["BoundingBox"]["Left"],
-                    lines[0]["Geometry"]["BoundingBox"]["Top"],
-                    lines[0]["Geometry"]["BoundingBox"]["Width"],
-                    lines[0]["Geometry"]["BoundingBox"]["Height"]
-                ],
-                "lines": []
-            }
-        }
-
-        for line in lines:
-            y_diff = line["Geometry"]["BoundingBox"]["Top"] - current_para["metadata"]["bbox"][1]
-            if y_diff > 0.05:  # Threshold: 5% of page height = new paragraph
-                if current_para["content"].strip():
-                    paragraphs.append(current_para)
-                current_para = {
-                    "type": "text",
-                    "content": line["Text"] + " ",
-                    "metadata": {
-                        "page": line["Page"],
-                        "bbox": [
-                            line["Geometry"]["BoundingBox"]["Left"],
-                            line["Geometry"]["BoundingBox"]["Top"],
-                            line["Geometry"]["BoundingBox"]["Width"],
-                            line["Geometry"]["BoundingBox"]["Height"]
-                        ],
-                        "lines": [line["Text"]]
-                    }
-                }
-            else:
-                current_para["content"] += line["Text"] + " "
-                current_para["metadata"]["lines"].append(line["Text"])
-                current_para["metadata"]["bbox"] = [
-                    min(current_para["metadata"]["bbox"][0], line["Geometry"]["BoundingBox"]["Left"]),
-                    min(current_para["metadata"]["bbox"][1], line["Geometry"]["BoundingBox"]["Top"]),
-                    max(
-                        current_para["metadata"]["bbox"][0] + current_para["metadata"]["bbox"][2],
-                        line["Geometry"]["BoundingBox"]["Left"] + line["Geometry"]["BoundingBox"]["Width"]
-                    ),
-                    max(
-                        current_para["metadata"]["bbox"][1] + current_para["metadata"]["bbox"][3],
-                        line["Geometry"]["BoundingBox"]["Top"] + line["Geometry"]["BoundingBox"]["Height"]
-                    )
-                ]
-
-        if current_para["content"].strip():
-            paragraphs.append(current_para)
-
-        for para in paragraphs:
-            para["content"] = re.sub(r'\s+', ' ', para["content"]).strip()
-
-        return paragraphs
-
-    def _detect_headings(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Detect headings from LINE blocks using heuristics."""
-        headings = []
-        for line in lines:
-            text = line["Text"].strip()
-            if not text:
-                continue
-
-            if len(text.split()) <= 8:
-                if re.match(r'^[0-9A-Za-z]\.\s', text) or re.match(r'^[IVXivx]+\.\s', text):
-                    headings.append({
-                        "type": "heading",
-                        "content": text,
-                        "metadata": {
-                            "page": line["Page"],
-                            "bbox": self._normalize_bbox(line["Geometry"]["BoundingBox"]),
-                            "level": self._guess_heading_level(text)
-                        }
-                    })
-                    continue
-                if text.isupper() or text.istitle():
-                    headings.append({
-                        "type": "heading",
-                        "content": text,
-                        "metadata": {
-                            "page": line["Page"],
-                            "bbox": self._normalize_bbox(line["Geometry"]["BoundingBox"]),
-                            "level": self._guess_heading_level(text)
-                        }
-                    })
-        return headings
-
-    def _guess_heading_level(self, text: str) -> int:
-        """Guess heading level (1-6) from text."""
-        if re.match(r'^#\s', text):
-            return 1
-        elif re.match(r'^##\s', text):
-            return 2
-        elif re.match(r'^[0-9]+\.\s', text):
-            return 1
-        elif text.isupper():
-            return 1
-        else:
-            return 2
-
-    def _parse_tables(self, tables: List[Dict[str, Any]], cells: List[Dict[str, Any]], textract_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Parse TABLE blocks into structured tables with headers/rows."""
-        parsed_tables = []
-        for table in tables:
-            cell_ids = []
-            for rel in table.get("Relationships", []):
-                if rel["Type"] == "CHILD":
-                    cell_ids.extend(rel["Ids"])
-
-            cell_map = {c["Id"]: c for c in cells if c["Id"] in cell_ids}
-            rows = {}
-            for cell_id in cell_ids:
-                if cell_id in cell_map:
-                    cell = cell_map[cell_id]
-                    row_idx = cell.get("RowIndex", 0)
-                    if row_idx not in rows:
-                        rows[row_idx] = []
-                    rows[row_idx].append(cell)
-
-            for row_idx in sorted(rows.keys()):
-                rows[row_idx].sort(key=lambda c: c.get("ColumnIndex", 0))
-
-            headers = []
-            data_rows = []
-            for row_idx in sorted(rows.keys()):
-                row_cells = rows[row_idx]
-                cell_texts = [c["Text"].strip() for c in row_cells]
-                if row_idx == 1:
-                    headers = cell_texts
-                else:
-                    data_rows.append(cell_texts)
-
-            table_text = self._reconstruct_table_text(headers, data_rows)
-            parsed_tables.append({
-                "type": "table",
-                "content": table_text,
-                "metadata": {
-                    "page": table["Page"],
-                    "bbox": self._normalize_bbox(table["Geometry"]["BoundingBox"]),
-                    "headers": headers,
-                    "rows": data_rows
-                }
-            })
-        return parsed_tables
-
-    def _reconstruct_table_text(self, headers: List[str], rows: List[List[str]]) -> str:
-        """Reconstruct table as pipe-delimited Markdown."""
-        if not headers:
-            return ""
-        lines = [
-            "| " + " | ".join(headers) + " |",
-            "|" + "|".join(["---"] * len(headers)) + "|"
-        ]
-        for row in rows:
-            lines.append("| " + " | ".join(row) + " |")
-        return "\n".join(lines)
-
-    def _normalize_bbox(self, bbox: Dict[str, float]) -> List[float]:
-        """Convert Textract's normalized bbox to [x, y, width, height]."""
-        return [
-            bbox["Left"],
-            bbox["Top"],
-            bbox["Width"],
-            bbox["Height"]
-        ]
-
-    def _sort_by_reading_order(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Sort blocks by reading order (top-to-bottom, left-to-right)."""
-        return sorted(
-            blocks,
-            key=lambda x: (
-                x["metadata"]["bbox"][1],  # Top (Y)
-                x["metadata"]["bbox"][0]   # Left (X)
-            )
-        )
-
-    def process_all_pdfs(self, prefix: str = "") -> None:
-        """Process all PDFs in the S3 prefix."""
-        s3_keys = self._list_s3_keys(prefix)
-        for s3_key in s3_keys:
-            if s3_key.lower().endswith('.pdf'):
-                try:
-                    result = self.process_pdf(s3_key)
-                    output_key = f"{self.config.S3_CONFIG['parsed_documents']}{os.path.basename(s3_key)}.json"
-                    self._upload_to_s3(result, output_key)
-                    logger.info(f"Processed and uploaded: {s3_key} -> {output_key}")
-                except Exception as e:
-                    logger.error(f"Failed to process {s3_key}: {e}")
-
-    def _list_s3_keys(self, prefix: str) -> List[str]:
-        """List all S3 keys under a prefix."""
-        paginator = self.s3_client.get_paginator('list_objects_v2')
-        keys = []
-        for page in paginator.paginate(Bucket=self.config.S3_CONFIG["bucket_name"], Prefix=prefix):
-            keys.extend([obj['Key'] for obj in page.get('Contents', [])])
-        return keys
-
-    def _upload_to_s3(self, data: Dict, s3_key: str) -> None:
-        """Upload structured blocks to S3."""
-        sanitized_key = re.sub(r'[^a-zA-Z0-9_\-\./]', '_', s3_key)
-        temp_file = os.path.join(self.temp_dir, f"structured_{os.path.basename(sanitized_key)}.json")
-        try:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            self.s3_client.upload_file(
-                temp_file,
-                self.config.S3_CONFIG["bucket_name"],
-                s3_key
-            )
-            logger.info(f"Uploaded to: s3://{self.config.S3_CONFIG['bucket_name']}/{s3_key}")
-        except Exception as e:
-            logger.error(f"Failed to upload {s3_key}: {e}")
-            raise
-        finally:
-            if os.path.exists(temp_file):
-                os.unlink(temp_file)
-
-if __name__ == "__main__":
-    from config import Config
-    processor = EnhancedTextractPostProcessor(Config)
-    processor.process_all_pdfs(Config.S3_CONFIG["source_prefix"])
-#######################
-"""
-Enhanced Textract Post-Processor for ECMC Financial Documents.
-Fixes:
-- Fragmented text (groups into paragraphs)
-- Missing structure (detects headings/tables)
-- Layout issues (sorts by reading order)
-- Metadata gaps (preserves page, bbox, etc.)
-"""
-
-import os
-import re
-import json
-import logging
-import boto3
-from typing import List, Dict, Any, Optional, Tuple
-from config import Config
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-class EnhancedTextractPostProcessor:
-    """Post-processes Textract output into structured, high-quality blocks."""
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.s3_client = boto3.client(
-            "s3",
-            region_name=config.AWS_REGION
-        )
-        self.textract_client = boto3.client(
-            "textract",
-            region_name=config.AWS_REGION
-        )
-
-    def process_pdf(self, s3_key: str) -> Dict[str, Any]:
-        """
-        Process a PDF from S3 using Textract and post-process into structured blocks.
-        Args:
-            s3_key: S3 key of the PDF (e.g., "ecmc_org/RAG/Source_data/loan_agreement.pdf").
-        Returns:
-            {
-                "document_id": str,
-                "blocks": List[Dict[str, Any]]  # Structured blocks with metadata
-            }
-        """
-        document_id = os.path.splitext(os.path.basename(s3_key))[0]
-        local_path = self._download_to_temp(s3_key)
-
-        try:
-            logger.info(f"Processing PDF: {s3_key}")
-
-            # Step 1: Call Textract
-            with open(local_path, "rb") as f:
-                response = self.textract_client.analyze_document(
-                    Document={"Bytes": f.read()},
-                    FeatureTypes=["TABLES", "FORMS", "LAYOUT"]
-                )
-
-            # Step 2: Post-process Textract output
-            blocks = self._post_process_textract(response, document_id)
-
-            return {
-                "document_id": document_id,
-                "blocks": blocks
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to process {s3_key}: {e}", exc_info=True)
-            raise
-        finally:
-            if os.path.exists(local_path):
-                os.unlink(local_path)
-
-    def _download_to_temp(self, s3_key: str) -> str:
-        """Download file from S3 to a temporary location."""
-        bucket = self.config.S3_CONFIG["bucket_name"]
-        local_path = f"/tmp/{os.path.basename(s3_key)}"
-        try:
-            self.s3_client.download_file(bucket, s3_key, local_path)
-            return local_path
-        except Exception as e:
-            logger.error(f"Failed to download {s3_key}: {e}")
-            raise
-
-    def _post_process_textract(self, textract_json: Dict[str, Any], document_id: str) -> List[Dict[str, Any]]:
-        """
-        Post-process Textract JSON into structured blocks.
-        Steps:
-        1. Group WORDs into LINEs, then LINEs into PARAGRAPHs.
-        2. Detect HEADINGS from LINEs (heuristics + layout).
-        3. Parse TABLEs from CELL blocks.
-        4. Sort all blocks by reading order (top-to-bottom, left-to-right).
-        """
-        # Group blocks by type
-        words = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "WORD"]
-        lines = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "LINE"]
-        tables = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "TABLE"]
-        cells = [b for b in textract_json.get("Blocks", []) if b["BlockType"] == "CELL"]
-
-        # Step 1: Group words into lines (Textract may split lines into words)
-        grouped_lines = self._group_words_into_lines(words, lines)
-
-        # Step 2: Group lines into paragraphs
-        paragraphs = self._group_lines_into_paragraphs(grouped_lines)
-
-        # Step 3: Detect headings from lines
-        headings = self._detect_headings(grouped_lines)
-
-        # Step 4: Parse tables
-        parsed_tables = self._parse_tables(tables, cells, textract_json)
-
-        # Step 5: Combine all blocks
-        blocks = headings + parsed_tables + paragraphs
-
-        # Step 6: Sort by reading order (using bounding boxes)
-        blocks = self._sort_by_reading_order(blocks)
-
-        # Step 7: Assign final metadata (positions, chunk IDs)
-        for i, block in enumerate(blocks):
-            block["metadata"]["position"] = i
-            block["metadata"]["chunk_id"] = f"{document_id}_{block['type']}_{i}"
-
-        return blocks
-
-    def _group_words_into_lines(self, words: List[Dict[str, Any]], existing_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Group WORD blocks into LINE blocks (Textract may split lines into words).
-        Uses bounding box Y-coordinates to group words horizontally.
-        """
-        if existing_lines:
-            # If Textract already provides lines, use them
-            return existing_lines
-
-        # Group words by Y-coordinate (same line = similar Y)
-        lines = []
-        word_groups = {}
-        for word in words:
-            y = word["Geometry"]["BoundingBox"]["Top"]
-            if y not in word_groups:
-                word_groups[y] = []
-            word_groups[y].append(word)
-
-        # Sort groups by Y, then X
-        for y, group in word_groups.items():
-            group.sort(key=lambda w: w["Geometry"]["BoundingBox"]["Left"])
-            line_text = " ".join(w["Text"] for w in group)
-            # Use the first word's bbox as the line's bbox
-            first_word = group[0]
-            lines.append({
-                "BlockType": "LINE",
-                "Text": line_text,
-                "Geometry": first_word["Geometry"],
-                "Page": first_word["Page"],
-                "Id": f"line_{y}"  # Temporary ID
-            })
-
-        return lines
-
-    def _group_lines_into_paragraphs(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Group LINE blocks into PARAGRAPH blocks.
-        Uses bounding box Y-coordinates to group lines vertically.
-        """
-        if not lines:
-            return []
-
-        # Sort lines by Y, then X
-        lines.sort(key=lambda l: (
-            l["Geometry"]["BoundingBox"]["Top"],
-            l["Geometry"]["BoundingBox"]["Left"]
-        ))
-
-        paragraphs = []
-        current_para = {
-            "type": "text",
-            "content": "",
-            "metadata": {
-                "page": lines[0]["Page"],
-                "bbox": [
-                    lines[0]["Geometry"]["BoundingBox"]["Left"],
-                    lines[0]["Geometry"]["BoundingBox"]["Top"],
-                    lines[0]["Geometry"]["BoundingBox"]["Width"],
-                    lines[0]["Geometry"]["BoundingBox"]["Height"]
-                ],
-                "lines": []
-            }
-        }
-
-        for line in lines:
-            # Check if this line is on the same "paragraph" (Y distance < threshold)
-            y_diff = line["Geometry"]["BoundingBox"]["Top"] - current_para["metadata"]["bbox"][1]
-            if y_diff > 0.05:  # Threshold: 5% of page height = new paragraph
-                if current_para["content"].strip():
-                    paragraphs.append(current_para)
-                current_para = {
-                    "type": "text",
-                    "content": line["Text"] + " ",
-                    "metadata": {
-                        "page": line["Page"],
-                        "bbox": [
-                            line["Geometry"]["BoundingBox"]["Left"],
-                            line["Geometry"]["BoundingBox"]["Top"],
-                            line["Geometry"]["BoundingBox"]["Width"],
-                            line["Geometry"]["BoundingBox"]["Height"]
-                        ],
-                        "lines": [line["Text"]]
-                    }
-                }
-            else:
-                current_para["content"] += line["Text"] + " "
-                current_para["metadata"]["lines"].append(line["Text"])
-                # Expand bbox to include this line
-                current_para["metadata"]["bbox"] = [
-                    min(current_para["metadata"]["bbox"][0], line["Geometry"]["BoundingBox"]["Left"]),
-                    min(current_para["metadata"]["bbox"][1], line["Geometry"]["BoundingBox"]["Top"]),
-                    max(current_para["metadata"]["bbox"][0] + current_para["metadata"]["bbox"][2],
-                        line["Geometry"]["BoundingBox"]["Left"] + line["Geometry"]["BoundingBox"]["Width"]),
-                    max(current_para["metadata"]["bbox"][1] + current_para["metadata"]["bbox"][3],
-                        line["Geometry"]["BoundingBox"]["Top"] + line["Geometry"]["BoundingBox"]["Height"])
-                ]
-
-        if current_para["content"].strip():
-            paragraphs.append(current_para)
-
-        # Clean up content (remove extra spaces)
-        for para in paragraphs:
-            para["content"] = re.sub(r'\s+', ' ', para["content"]).strip()
-
-        return paragraphs
-
-    def _detect_headings(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Detect headings from LINE blocks using heuristics:
-        - Short lines (< 10 words)
-        - All caps or title case
-        - Numbered (e.g., "1.", "A.")
-        - Bold/large font (if Textract provides font info)
-        """
-        headings = []
-        for line in lines:
-            text = line["Text"].strip()
-            if not text:
-                continue
-
-            # Heuristic 1: Short lines (likely headings)
-            if len(text.split()) <= 8:
-                # Heuristic 2: Starts with a number/letter (e.g., "1.", "A.")
-                if re.match(r'^[0-9A-Za-z]\.\s', text) or re.match(r'^[IVXivx]+\.\s', text):
-                    headings.append({
-                        "type": "heading",
-                        "content": text,
-                        "metadata": {
-                            "page": line["Page"],
-                            "bbox": self._normalize_bbox(line["Geometry"]["BoundingBox"]),
-                            "level": self._guess_heading_level(text)
-                        }
-                    })
-                    continue
-
-                # Heuristic 3: All caps or title case
-                if text.isupper() or text.istitle():
-                    headings.append({
-                        "type": "heading",
-                        "content": text,
-                        "metadata": {
-                            "page": line["Page"],
-                            "bbox": self._normalize_bbox(line["Geometry"]["BoundingBox"]),
-                            "level": self._guess_heading_level(text)
-                        }
-                    })
-                    continue
-
-        return headings
-
-    def _guess_heading_level(self, text: str) -> int:
-        """Guess heading level (1-6) from text."""
-        if re.match(r'^#\s', text):
-            return 1
-        elif re.match(r'^##\s', text):
-            return 2
-        elif re.match(r'^[0-9]+\.\s', text):
-            return 1  # Assume top-level if numbered
-        elif text.isupper():
-            return 1
-        else:
-            return 2  # Default to level 2
-
-    def _parse_tables(self, tables: List[Dict[str, Any]], cells: List[Dict[str, Any]], textract_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Parse TABLE blocks into structured tables with headers/rows.
-        Uses CELL blocks to reconstruct table content.
-        """
-        parsed_tables = []
-        for table in tables:
-            # Get all cells in this table
-            cell_ids = []
-            for rel in table.get("Relationships", []):
-                if rel["Type"] == "CHILD":
-                    cell_ids.extend(rel["Ids"])
-
-            # Map cell IDs to cell blocks
-            cell_map = {c["Id"]: c for c in cells if c["Id"] in cell_ids}
-
-            # Group cells by row
-            rows = {}
-            for cell_id in cell_ids:
-                if cell_id in cell_map:
-                    cell = cell_map[cell_id]
-                    row_idx = cell.get("RowIndex", 0)
-                    if row_idx not in rows:
-                        rows[row_idx] = []
-                    rows[row_idx].append(cell)
-
-            # Sort rows by RowIndex, then cells by ColumnIndex
-            for row_idx in sorted(rows.keys()):
-                rows[row_idx].sort(key=lambda c: c.get("ColumnIndex", 0))
-
-            # Extract headers (first row) and data rows
-            headers = []
-            data_rows = []
-            for row_idx in sorted(rows.keys()):
-                row_cells = rows[row_idx]
-                cell_texts = [c["Text"].strip() for c in row_cells]
-                if row_idx == 1:  # First row = headers
-                    headers = cell_texts
-                else:
-                    data_rows.append(cell_texts)
-
-            # Reconstruct table text (pipe-delimited)
-            table_text = self._reconstruct_table_text(headers, data_rows)
-
-            parsed_tables.append({
-                "type": "table",
-                "content": table_text,
-                "metadata": {
-                    "page": table["Page"],
-                    "bbox": self._normalize_bbox(table["Geometry"]["BoundingBox"]),
-                    "headers": headers,
-                    "rows": data_rows
-                }
-            })
-
-        return parsed_tables
-
-    def _reconstruct_table_text(self, headers: List[str], rows: List[List[str]]) -> str:
-        """Reconstruct table as pipe-delimited Markdown."""
-        if not headers:
-            return ""
-
-        lines = []
-        # Header row
-        lines.append("| " + " | ".join(headers) + " |")
-        # Separator row
-        lines.append("|" + "|".join(["---"] * len(headers)) + "|")
-        # Data rows
-        for row in rows:
-            lines.append("| " + " | ".join(row) + " |")
-
-        return "\n".join(lines)
-
-    def _normalize_bbox(self, bbox: Dict[str, float]) -> List[float]:
-        """Convert Textract's normalized bbox to [x, y, width, height]."""
-        return [
-            bbox["Left"],
-            bbox["Top"],
-            bbox["Width"],
-            bbox["Height"]
-        ]
-
-    def _sort_by_reading_order(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Sort blocks by reading order (top-to-bottom, left-to-right).
-        Uses the top-left corner of each block's bounding box.
-        """
-        return sorted(
-            blocks,
-            key=lambda x: (
-                x["metadata"]["bbox"][1],  # Top (Y)
-                x["metadata"]["bbox"][0]   # Left (X)
-            )
-        )
-
-    def process_all_pdfs(self, prefix: str = "") -> None:
-        """Process all PDFs in the S3 prefix."""
-        s3_keys = self._list_s3_keys(prefix)
-        for s3_key in s3_keys:
-            if s3_key.lower().endswith('.pdf'):
-                try:
-                    result = self.process_pdf(s3_key)
-                    output_key = f"{self.config.S3_CONFIG['parsed_documents']}{os.path.basename(s3_key)}.json"
-                    self._upload_to_s3(result, output_key)
-                    logger.info(f"Processed and uploaded: {s3_key} -> {output_key}")
-                except Exception as e:
-                    logger.error(f"Failed to process {s3_key}: {e}")
-
-    def _list_s3_keys(self, prefix: str) -> List[str]:
-        """List all S3 keys under a prefix."""
-        paginator = self.s3_client.get_paginator('list_objects_v2')
-        keys = []
-        for page in paginator.paginate(Bucket=self.config.S3_CONFIG["bucket_name"], Prefix=prefix):
-            keys.extend([obj['Key'] for obj in page.get('Contents', [])])
-        return keys
-
-    def _upload_to_s3(self, data: Dict, s3_key: str) -> None:
-        """Upload structured blocks to S3."""
-        temp_file = "/tmp/structured_blocks.json"
-        try:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            self.s3_client.upload_file(
-                temp_file,
-                self.config.S3_CONFIG["bucket_name"],
-                s3_key
-            )
-            logger.info(f"Uploaded to: s3://{self.config.S3_CONFIG['bucket_name']}/{s3_key}")
-        except Exception as e:
-            logger.error(f"Failed to upload {s3_key}: {e}")
-            raise
-        finally:
-            if os.path.exists(temp_file):
-                os.unlink(temp_file)
-
-if __name__ == "__main__":
-    from config import Config
-    processor = EnhancedTextractPostProcessor(Config)
-    processor.process_all_pdfs(Config.S3_CONFIG["source_prefix"])
-#################
-class Config:
-    """Centralized configuration for the Textract RAG pipeline."""
-
-    # --- Existing Config ---
-    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
-    S3_CONFIG: Dict[str, str] = {
-        "bucket_name": S3_BUCKET_NAME,
-        "source_prefix": os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"),
-        "source_path": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/Source_data/",
-        "textract_output": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/textract-output/",
-        "logs": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/logs/",
-        # ✅ NEW: Chunking output path
-        "chunking_output": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/chunking-output/",
-    }
-
-    # --- Output Format Config ---
-    # ✅ NEW: Toggle between "txt" or "md" (or both)
-    OUTPUT_FORMAT: str = os.getenv("OUTPUT_FORMAT", "md")  # Default: Markdown
-
-    # --- Chunking Config ---
-    # ✅ NEW: Chunking parameters
-    CHUNKING_CONFIG: Dict[str, Any] = {
-        "chunk_size": 1024,          # Token size for regular text
-        "overlap": 200,              # Overlap between chunks
-        "table_aware": True,          # Enable table-aware chunking
-        "header_splitters": ["#", "##", "###"],  # Split by these headers
-        "inject_table_metadata": True,  # Prepend table title/headers to chunks
-    }
-
-    # --- Textract Features ---
-    TEXTRACT_FEATURES: List[str] = ["FORMS", "TABLES", "LAYOUT"]
-###############
-"""
-Main pipeline for processing PDFs with Amazon Textract.
-Generates Markdown and plain text outputs, and saves logs to S3.
-"""
-
-import os
-import tempfile
-import logging
-from datetime import datetime
-from typing import Optional
-from config import Config
-from utility import S3Manager, TextractManager, logger
-
-# ✅ FIX: Use tempfile.gettempdir() for cross-platform compatibility
-temp_dir = tempfile.gettempdir()
-log_file = os.path.join(temp_dir, f"textract_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-
-# Configure logging to a file (in addition to stdout)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(log_file),  # Log to a file
-        logging.StreamHandler()          # Also log to stdout (for Lambda)
-    ]
-)
-
-class TextractPipeline:
-    """Orchestrates the Textract RAG pipeline."""
-
-    def __init__(self):
-        """Initialize pipeline components."""
-        self.s3_manager = S3Manager(Config.S3_CONFIG["bucket_name"])
-        self.textract_manager = TextractManager()
-
-    def upload_logs(self) -> None:
-        """Upload the log file to S3."""
-        log_key = Config.S3_CONFIG["logs"].replace(
-            f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
-        ) + f"textract_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-        if os.path.exists(log_file):
-            self.s3_manager.upload_file(log_file, log_key)
-            logger.info(f"Uploaded logs to s3://{Config.S3_CONFIG['bucket_name']}/{log_key}")
-        else:
-            logger.error(f"Log file not found: {log_file}")
-
-    def process_pdf(self, s3_key: str) -> None:
-        """Process a single PDF and save outputs to S3."""
-        logger.info(f"Processing PDF: {s3_key}")
-
-        # ... (rest of the process_pdf method remains the same)
-
-    def process_all_pdfs(self) -> None:
-        """Process all PDFs in the source S3 prefix."""
-        source_prefix = Config.S3_CONFIG["source_prefix"]
-        pdf_keys = [
-            key for key in self.s3_manager.list_objects(source_prefix)
-            if key.lower().endswith(".pdf")
-        ]
-        logger.info(f"Found {len(pdf_keys)} PDFs to process in {source_prefix}")
-
-        for s3_key in pdf_keys:
-            self.process_pdf(s3_key)
-
-        # Upload logs to S3
-        self.upload_logs()
-
-def lambda_handler(event, context):
-    """AWS Lambda handler."""
-    try:
-        logger.info("Lambda function started")
-        pipeline = TextractPipeline()
-        pipeline.process_all_pdfs()
-        logger.info("Lambda function completed successfully")
-        return {
-            "statusCode": 200,
-            "body": "PDF processing completed successfully",
-        }
-    except Exception as e:
-        logger.error(f"Lambda function failed: {e}", exc_info=True)
-        return {
-            "statusCode": 500,
-            "body": f"Error: {str(e)}",
-        }
-
-if __name__ == "__main__":
-    pipeline = TextractPipeline()
-    pipeline.process_all_pdfs()
-###############
-"""
-Main pipeline for processing PDFs with Amazon Textract.
-Generates Markdown and plain text outputs, and saves logs to S3.
-"""
-
-import os
-import tempfile
-import logging
-from datetime import datetime
-from typing import Optional
-from config import Config
-from utility import S3Manager, TextractManager, logger
-
-# Configure logging to a file (in addition to stdout)
-log_file = f"/tmp/textract_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(log_file),  # Log to a file
-        logging.StreamHandler()          # Also log to stdout (for Lambda)
-    ]
-)
-
-class TextractPipeline:
-    """Orchestrates the Textract RAG pipeline."""
-
-    def __init__(self):
-        """Initialize pipeline components."""
-        self.s3_manager = S3Manager(Config.S3_CONFIG["bucket_name"])
-        self.textract_manager = TextractManager()
-
-    def upload_logs(self) -> None:
-        """Upload the log file to S3."""
-        log_key = Config.S3_CONFIG["logs"].replace(
-            f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
-        ) + f"textract_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-        if os.path.exists(log_file):
-            self.s3_manager.upload_file(log_file, log_key)
-            logger.info(f"Uploaded logs to s3://{Config.S3_CONFIG['bucket_name']}/{log_key}")
-
-    def process_pdf(self, s3_key: str) -> None:
-        """
-        Process a single PDF file from S3.
-        Extracts content using Textract, generates Markdown and text outputs,
-        and saves them to S3.
-        """
-        logger.info(f"Processing PDF: {s3_key}")
-
-        # Step 1: Start Textract job
-        job_id = self.textract_manager.start_document_analysis(s3_key)
-        if not self.textract_manager.wait_for_job_completion(job_id):
-            logger.error(f"Textract job {job_id} failed or timed out for {s3_key}")
-            return
-
-        # Step 2: Retrieve and parse results
-        results = self.textract_manager.get_job_results(job_id)
-        blocks = results.get("Blocks", [])
-        plain_text, markdown = TextractManager.parse_blocks(blocks)
-
-        # Step 3: Generate output filenames
-        base_name = os.path.splitext(os.path.basename(s3_key))[0]
-        textract_output_path = Config.S3_CONFIG["textract_output"].replace(
-            f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
-        )
-        output_key_base = f"{textract_output_path}{base_name}"
-
-        # Step 4: Save outputs to S3
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as txt_file:
-            txt_file.write(plain_text)
-            txt_file_path = txt_file.name
-
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".md", delete=False) as md_file:
-            md_file.write(markdown)
-            md_file_path = md_file.name
-
-        self.s3_manager.upload_file(txt_file_path, f"{output_key_base}.txt")
-        self.s3_manager.upload_file(md_file_path, f"{output_key_base}.md")
-
-        # Clean up temp files
-        os.unlink(txt_file_path)
-        os.unlink(md_file_path)
-
-        logger.info(f"Successfully processed and saved outputs to {output_key_base}")
-
-    def process_all_pdfs(self) -> None:
-        """Process all PDFs in the source S3 prefix."""
-        source_prefix = Config.S3_CONFIG["source_prefix"]
-        pdf_keys = [
-            key for key in self.s3_manager.list_objects(source_prefix)
-            if key.lower().endswith(".pdf")
-        ]
-        logger.info(f"Found {len(pdf_keys)} PDFs to process in {source_prefix}")
-
-        for s3_key in pdf_keys:
-            self.process_pdf(s3_key)
-
-        # ✅ Upload logs to S3 after processing all PDFs
-        self.upload_logs()
-
-def lambda_handler(event, context):
-    """
-    AWS Lambda handler for the Textract RAG pipeline.
-    Processes PDFs from S3 and saves outputs + logs to S3.
-    """
-    try:
-        logger.info("Lambda function started")
-        pipeline = TextractPipeline()
-        pipeline.process_all_pdfs()
-        logger.info("Lambda function completed successfully")
-        return {
-            "statusCode": 200,
-            "body": "PDF processing completed successfully",
-        }
-    except Exception as e:
-        logger.error(f"Lambda function failed: {e}", exc_info=True)
-        return {
-            "statusCode": 500,
-            "body": f"Error: {str(e)}",
-        }
-
-if __name__ == "__main__":
-    # For local testing
-    pipeline = TextractPipeline()
-    pipeline.process_all_pdfs()
-#############
-def process_pdf(self, s3_key: str) -> None:
-    """
-    Process a single PDF file from S3.
-    Extracts content using Textract, generates Markdown and text outputs,
-    and saves them to the correct S3 path.
-    """
-    logger.info(f"Processing PDF: {s3_key}")
-
-    # Step 1: Start Textract job
-    job_id = self.textract_manager.start_document_analysis(s3_key)
-    if not self.textract_manager.wait_for_job_completion(job_id):
-        logger.error(f"Textract job {job_id} failed or timed out for {s3_key}")
-        return
-
-    # Step 2: Retrieve and parse results
-    results = self.textract_manager.get_job_results(job_id)
-    blocks = results.get("Blocks", [])
-    plain_text, markdown = TextractManager.parse_blocks(blocks)
-
-    # Step 3: Generate output filenames
-    base_name = os.path.splitext(os.path.basename(s3_key))[0]
-
-    # ✅ FIX: Use the full textract_output path (remove s3://bucket_name/ prefix)
-    textract_output_path = Config.S3_CONFIG["textract_output"].replace(
-        f"s3://{Config.S3_CONFIG['bucket_name']}/", ""
-    )
-    output_key_base = f"{textract_output_path}{base_name}"
-
-    # Step 4: Save outputs to S3
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as txt_file:
-        txt_file.write(plain_text)
-        txt_file_path = txt_file.name
-
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".md", delete=False) as md_file:
-        md_file.write(markdown)
-        md_file_path = md_file.name
-
-    # Upload to S3 with the correct full path
-    self.s3_manager.upload_file(txt_file_path, f"{output_key_base}.txt")
-    self.s3_manager.upload_file(md_file_path, f"{output_key_base}.md")
-
-    # Clean up temp files
-    os.unlink(txt_file_path)
-    os.unlink(md_file_path)
-
-    logger.info(f"Successfully processed and saved outputs to {output_key_base}")
-#########
-"""
-Reusable utilities for S3, Textract, logging, and document processing.
-"""
-
-import os
-import logging
-import time
-from typing import Dict, List, Optional, Any, Tuple
-import boto3
-from botocore.exceptions import ClientError, BotoCoreError
-
-# Import Config from config.py
-from config import Config
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-class S3Manager:
-    """Handles all S3 operations (upload, download, list, validate)."""
-
-    def __init__(self, bucket_name: str, region: str = Config.AWS_REGION):
-        """Initialize S3 client."""
-        self.bucket_name = bucket_name
-        self.s3_client = boto3.client("s3", region_name=region)
-
-    def upload_file(
-        self,
-        local_file_path: str,
-        s3_key: str,
-        extra_args: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """
-        Upload a file to S3.
-
-        Args:
-            local_file_path: Local path of the file to upload.
-            s3_key: S3 key (path) where the file will be stored.
-            extra_args: Additional arguments (e.g., ACL, ContentType).
-
-        Returns:
-            bool: True if upload succeeded, False otherwise.
-        """
-        try:
-            self.s3_client.upload_file(
-                local_file_path,
-                self.bucket_name,
-                s3_key,
-                ExtraArgs=extra_args or {},
-            )
-            logger.info(f"Uploaded {local_file_path} to s3://{self.bucket_name}/{s3_key}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to upload {local_file_path}: {e}")
-            return False
-
-    def download_file(self, s3_key: str, local_file_path: str) -> bool:
-        """
-        Download a file from S3.
-
-        Args:
-            s3_key: S3 key (path) of the file to download.
-            local_file_path: Local path to save the file.
-
-        Returns:
-            bool: True if download succeeded, False otherwise.
-        """
-        try:
-            self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
-            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} to {local_file_path}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to download {s3_key}: {e}")
-            return False
-
-    def list_objects(self, prefix: str = "") -> List[str]:
-        """
-        List all objects under a prefix in the S3 bucket.
-
-        Args:
-            prefix: S3 prefix to filter objects.
-
-        Returns:
-            List[str]: List of S3 keys (paths).
-        """
-        try:
-            paginator = self.s3_client.get_paginator("list_objects_v2")
-            objects = []
-            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
-                objects.extend([obj["Key"] for obj in page.get("Contents", [])])
-            return objects
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to list objects: {e}")
-            return []
-
-    def validate_path(self, s3_key: str) -> bool:
-        """
-        Validate if an S3 object exists.
-
-        Args:
-            s3_key: S3 key (path) to validate.
-
-        Returns:
-            bool: True if the object exists, False otherwise.
-        """
-        try:
-            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
-            return True
-        except (ClientError, BotoCoreError):
-            return False
-
-class TextractManager:
-    """Handles Amazon Textract operations (job management, result parsing)."""
-
-    def __init__(self, region: str = Config.AWS_REGION):
-        """Initialize Textract client."""
-        self.textract_client = boto3.client("textract", region_name=region)
-
-    def start_document_analysis(
-        self,
-        s3_key: str,
-        features: List[str] = Config.TEXTRACT_FEATURES,
-    ) -> str:
-        """
-        Start a Textract document analysis job.
-
-        Args:
-            s3_key: S3 key of the document to analyze.
-            features: List of Textract features to enable (e.g., ["FORMS", "TABLES"]).
-
-        Returns:
-            str: Job ID for tracking the analysis.
-        """
-        try:
-            response = self.textract_client.start_document_analysis(
-                DocumentLocation={
-                    "S3Object": {
-                        "Bucket": Config.S3_CONFIG["bucket_name"],
-                        "Name": s3_key,
-                    }
-                },
-                FeatureTypes=features,
-            )
-            job_id = response["JobId"]
-            logger.info(f"Started Textract job {job_id} for {s3_key}")
-            return job_id
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to start Textract job for {s3_key}: {e}")
-            raise
-
-    def get_job_status(self, job_id: str) -> str:
-        """
-        Get the status of a Textract job.
-
-        Args:
-            job_id: Textract job ID.
-
-        Returns:
-            str: Job status (e.g., "SUCCEEDED", "FAILED", "IN_PROGRESS").
-        """
-        try:
-            response = self.textract_client.get_document_analysis(JobId=job_id)
-            return response["JobStatus"]
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to get job status for {job_id}: {e}")
-            raise
-
-    def wait_for_job_completion(self, job_id: str, max_retries: int = 30, delay: int = 5) -> bool:
-        """
-        Poll Textract job status until completion.
-
-        Args:
-            job_id: Textract job ID.
-            max_retries: Maximum number of retries.
-            delay: Delay between retries in seconds.
-
-        Returns:
-            bool: True if job succeeded, False otherwise.
-        """
-        for _ in range(max_retries):
-            status = self.get_job_status(job_id)
-            if status == "SUCCEEDED":
-                logger.info(f"Textract job {job_id} succeeded.")
-                return True
-            elif status == "FAILED":
-                logger.error(f"Textract job {job_id} failed.")
-                return False
-            logger.info(f"Job {job_id} status: {status}. Retrying in {delay} seconds...")
-            time.sleep(delay)
-        logger.error(f"Textract job {job_id} timed out after {max_retries * delay} seconds.")
-        return False
-
-    def get_job_results(self, job_id: str) -> Dict[str, Any]:
-        """
-        Retrieve results from a completed Textract job.
-
-        Args:
-            job_id: Textract job ID.
-
-        Returns:
-            Dict[str, Any]: Parsed Textract response.
-        """
-        try:
-            response = self.textract_client.get_document_analysis(JobId=job_id)
-            return response
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to get results for job {job_id}: {e}")
-            raise
-
-    @staticmethod
-    def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[str, str]:
-        """
-        Parse Textract blocks into plain text and Markdown.
-        Preserves reading order, headings, tables, and lists.
-
-        Args:
-            blocks: List of Textract blocks.
-
-        Returns:
-            Tuple[str, str]: (plain_text, markdown_text)
-        """
-        plain_text = []
-        markdown_text = []
-
-        # Sort blocks by their position (top to bottom, left to right)
-        sorted_blocks = sorted(
-            blocks,
-            key=lambda x: (
-                x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0),
-                x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0),
-            ),
-        )
-
-        for block in sorted_blocks:
-            block_type = block["BlockType"]
-            text = block.get("Text", "")
-
-            if block_type == "LINE" or block_type == "WORD":
-                plain_text.append(text)
-                markdown_text.append(text)
-            elif block_type == "TABLE":
-                # Placeholder: Extract table as Markdown (simplified)
-                table_md = TextractManager._parse_table(block, sorted_blocks)
-                plain_text.append("[TABLE]")
-                markdown_text.append(table_md)
-            elif block_type == "KEY_VALUE_SET":
-                # Placeholder: Format key-value pairs
-                key = block.get("Key", {}).get("Text", "")
-                value = block.get("Value", {}).get("Text", "")
-                plain_text.append(f"{key}: {value}")
-                markdown_text.append(f"**{key}**: {value}")
-            elif block_type == "SELECTION_ELEMENT":
-                # Placeholder: Format selection elements (e.g., checkboxes)
-                if block.get("SelectionStatus") == "SELECTED":
-                    plain_text.append(f"[x] {text}")
-                    markdown_text.append(f"- [x] {text}")
-                else:
-                    plain_text.append(f"[ ] {text}")
-                    markdown_text.append(f"- [ ] {text}")
-
-        return "\n".join(plain_text), "\n".join(markdown_text)
-
-    @staticmethod
-    def _parse_table(table_block: Dict[str, Any], all_blocks: List[Dict[str, Any]]) -> str:
-        """
-        Parse a Textract TABLE block into Markdown.
-
-        Args:
-            table_block: Textract TABLE block.
-            all_blocks: All blocks in the document (for resolving relationships).
-
-        Returns:
-            str: Markdown-formatted table.
-        """
-        # Find all cells in the table
-        cells = []
-        for rel in table_block.get("Relationships", []):
-            if rel["Type"] == "CHILD":
-                for cell_id in rel["Ids"]:
-                    cell = next((b for b in all_blocks if b["Id"] == cell_id), None)
-                    if cell:
-                        cells.append(cell)
-
-        # Sort cells by row and column indices
-        cells.sort(key=lambda x: (x.get("RowIndex", 0), x.get("ColumnIndex", 0)))
-
-        # Extract text from each cell
-        rows = []
-        current_row = []
-        prev_row_index = None
-        for cell in cells:
-            row_index = cell.get("RowIndex", 0)
-            if row_index != prev_row_index and current_row:
-                rows.append(current_row)
-                current_row = []
-            prev_row_index = row_index
-
-            # Get cell text (from child blocks)
-            cell_text = []
-            for rel in cell.get("Relationships", []):
-                if rel["Type"] == "CHILD":
-                    for content_id in rel["Ids"]:
-                        content_block = next(
-                            (b for b in all_blocks if b["Id"] == content_id), None
-                        )
-                        if content_block and content_block["BlockType"] in ["LINE", "WORD"]:
-                            cell_text.append(content_block.get("Text", ""))
-            current_row.append(" | ".join(cell_text))
-        if current_row:
-            rows.append(current_row)
-
-        # Format as Markdown table
-        if not rows:
-            return ""
-
-        markdown_table = []
-        markdown_table.append("| " + " | ".join(rows[0]) + " |")
-        markdown_table.append("|" + "|".join(["---"] * len(rows[0])) + "|")
-        for row in rows[1:]:
-            markdown_table.append("| " + " | ".join(row) + " |")
-
-        return "\n".join(markdown_table)
-
-
-
-
-#################
-# AWS Configuration 📄 1. .env (Environment Variables)
-AWS_REGION=us-east-1
-S3_BUCKET_NAME=bankrupcy-data-bkt
-S3_SOURCE_PREFIX=ecmc_org/RAG/Source_data/
-S3_TEXTRACT_OUTPUT=ecmc_org/RAG/textract-output/
-S3_LOGS_PATH=ecmc_org/RAG/logs/
-##############
-#📄 2. config.py (Centralized Configuration)
-"""
-Centralized configuration module for the Textract RAG pipeline.
-Loads environment variables and defines S3 paths.
-"""
-
-import os
-from typing import Dict, List
-
-class Config:
-    """Centralized configuration for the Textract RAG pipeline."""
-
-    # AWS Configuration
-    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
-
-    # S3 Paths
-    S3_CONFIG: Dict[str, str] = {
-        "bucket_name": S3_BUCKET_NAME,
-        "source_prefix": os.getenv("S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"),
-        "source_path": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/Source_data/",
-        "textract_output": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/textract-output/",
-        "logs": f"s3://{S3_BUCKET_NAME}/ecmc_org/RAG/logs/",
-    }
-############
-#3. utility.py (Reusable Utilities)
-"""
-Reusable utilities for S3, Textract, logging, and document processing.
-"""
-
-import os
-import logging
-from typing import Dict, List, Optional, Any, Tuple
-import boto3
-from botocore.exceptions import ClientError, BotoCoreError
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-class S3Manager:
-    """Handles all S3 operations (upload, download, list, validate)."""
-
-    def __init__(self, bucket_name: str, region: str = Config.AWS_REGION):
-        """Initialize S3 client."""
-        self.bucket_name = bucket_name
-        self.s3_client = boto3.client("s3", region_name=region)
-
-    def upload_file(
-        self,
-        local_file_path: str,
-        s3_key: str,
-        extra_args: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """
-        Upload a file to S3.
-
-        Args:
-            local_file_path: Local path of the file to upload.
-            s3_key: S3 key (path) where the file will be stored.
-            extra_args: Additional arguments (e.g., ACL, ContentType).
-
-        Returns:
-            bool: True if upload succeeded, False otherwise.
-        """
-        try:
-            self.s3_client.upload_file(
-                local_file_path,
-                self.bucket_name,
-                s3_key,
-                ExtraArgs=extra_args or {},
-            )
-            logger.info(f"Uploaded {local_file_path} to s3://{self.bucket_name}/{s3_key}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to upload {local_file_path}: {e}")
-            return False
-
-    def download_file(self, s3_key: str, local_file_path: str) -> bool:
-        """
-        Download a file from S3.
-
-        Args:
-            s3_key: S3 key (path) of the file to download.
-            local_file_path: Local path to save the file.
-
-        Returns:
-            bool: True if download succeeded, False otherwise.
-        """
-        try:
-            self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
-            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} to {local_file_path}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to download {s3_key}: {e}")
-            return False
-
-    def list_objects(self, prefix: str = "") -> List[str]:
-        """
-        List all objects under a prefix in the S3 bucket.
-
-        Args:
-            prefix: S3 prefix to filter objects.
-
-        Returns:
-            List[str]: List of S3 keys (paths).
-        """
-        try:
-            paginator = self.s3_client.get_paginator("list_objects_v2")
-            objects = []
-            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
-                objects.extend([obj["Key"] for obj in page.get("Contents", [])])
-            return objects
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to list objects: {e}")
-            return []
-
-    def validate_path(self, s3_key: str) -> bool:
-        """
-        Validate if an S3 object exists.
-
-        Args:
-            s3_key: S3 key (path) to validate.
-
-        Returns:
-            bool: True if the object exists, False otherwise.
-        """
-        try:
-            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
-            return True
-        except (ClientError, BotoCoreError):
-            return False
-
-class TextractManager:
-    """Handles Amazon Textract operations (job management, result parsing)."""
-
-    def __init__(self, region: str = Config.AWS_REGION):
-        """Initialize Textract client."""
-        self.textract_client = boto3.client("textract", region_name=region)
-
-    def start_document_analysis(
-        self,
-        s3_key: str,
-        features: List[str] = Config.TEXTRACT_FEATURES,
-    ) -> str:
-        """
-        Start a Textract document analysis job.
-
-        Args:
-            s3_key: S3 key of the document to analyze.
-            features: List of Textract features to enable (e.g., ["FORMS", "TABLES"]).
-
-        Returns:
-            str: Job ID for tracking the analysis.
-        """
-        try:
-            response = self.textract_client.start_document_analysis(
-                DocumentLocation={
-                    "S3Object": {
-                        "Bucket": Config.S3_CONFIG["bucket_name"],
-                        "Name": s3_key,
-                    }
-                },
-                FeatureTypes=features,
-            )
-            job_id = response["JobId"]
-            logger.info(f"Started Textract job {job_id} for {s3_key}")
-            return job_id
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to start Textract job for {s3_key}: {e}")
-            raise
-
-    def get_job_status(self, job_id: str) -> str:
-        """
-        Get the status of a Textract job.
-
-        Args:
-            job_id: Textract job ID.
-
-        Returns:
-            str: Job status (e.g., "SUCCEEDED", "FAILED", "IN_PROGRESS").
-        """
-        try:
-            response = self.textract_client.get_document_analysis_results(JobId=job_id)
-            return response["JobStatus"]
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to get job status for {job_id}: {e}")
-            raise
-
-    def wait_for_job_completion(self, job_id: str, max_retries: int = 30) -> bool:
-        """
-        Poll Textract job status until completion.
-
-        Args:
-            job_id: Textract job ID.
-            max_retries: Maximum number of retries.
-
-        Returns:
-            bool: True if job succeeded, False otherwise.
-        """
-        for _ in range(max_retries):
-            status = self.get_job_status(job_id)
-            if status == "SUCCEEDED":
-                logger.info(f"Textract job {job_id} succeeded.")
-                return True
-            elif status == "FAILED":
-                logger.error(f"Textract job {job_id} failed.")
-                return False
-            logger.info(f"Job {job_id} status: {status}. Retrying...")
-        logger.error(f"Textract job {job_id} timed out after {max_retries} retries.")
-        return False
-
-    def get_job_results(self, job_id: str) -> Dict[str, Any]:
-        """
-        Retrieve results from a completed Textract job.
-
-        Args:
-            job_id: Textract job ID.
-
-        Returns:
-            Dict[str, Any]: Parsed Textract response.
-        """
-        try:
-            response = self.textract_client.get_document_analysis_results(JobId=job_id)
-            return response
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to get results for job {job_id}: {e}")
-            raise
-
-    @staticmethod
-    def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[str, str]:
-        """
-        Parse Textract blocks into plain text and Markdown.
-        Preserves reading order, headings, tables, and lists.
-
-        Args:
-            blocks: List of Textract blocks.
-
-        Returns:
-            Tuple[str, str]: (plain_text, markdown_text)
-        """
-        plain_text = []
-        markdown_text = []
-
-        # Sort blocks by their position (top to bottom, left to right)
-        sorted_blocks = sorted(
-            blocks,
-            key=lambda x: (
-                x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0),
-                x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0),
-            ),
-        )
-
-        for block in sorted_blocks:
-            block_type = block["BlockType"]
-            text = block.get("Text", "")
-
-            if block_type == "LINE" or block_type == "WORD":
-                plain_text.append(text)
-                markdown_text.append(text)
-            elif block_type == "TABLE":
-                # Placeholder: Extract table as Markdown (simplified)
-                table_md = TextractManager._parse_table(block, sorted_blocks)
-                plain_text.append("[TABLE]")
-                markdown_text.append(table_md)
-            elif block_type == "KEY_VALUE_SET":
-                # Placeholder: Format key-value pairs
-                key = block.get("Key", {}).get("Text", "")
-                value = block.get("Value", {}).get("Text", "")
-                plain_text.append(f"{key}: {value}")
-                markdown_text.append(f"**{key}**: {value}")
-            elif block_type == "SELECTION_ELEMENT":
-                # Placeholder: Format selection elements (e.g., checkboxes)
-                if block.get("SelectionStatus") == "SELECTED":
-                    plain_text.append(f"[x] {text}")
-                    markdown_text.append(f"- [x] {text}")
-                else:
-                    plain_text.append(f"[ ] {text}")
-                    markdown_text.append(f"- [ ] {text}")
-
-        return "\n".join(plain_text), "\n".join(markdown_text)
-
-    @staticmethod
-    def _parse_table(table_block: Dict[str, Any], all_blocks: List[Dict[str, Any]]) -> str:
-        """
-        Parse a Textract TABLE block into Markdown.
-
-        Args:
-            table_block: Textract TABLE block.
-            all_blocks: All blocks in the document (for resolving relationships).
-
-        Returns:
-            str: Markdown-formatted table.
-        """
-        # Find all cells in the table
-        cells = []
-        for rel in table_block.get("Relationships", []):
-            if rel["Type"] == "CHILD":
-                for cell_id in rel["Ids"]:
-                    cell = next((b for b in all_blocks if b["Id"] == cell_id), None)
-                    if cell:
-                        cells.append(cell)
-
-        # Sort cells by row and column indices
-        cells.sort(key=lambda x: (x.get("RowIndex", 0), x.get("ColumnIndex", 0)))
-
-        # Extract text from each cell
-        rows = []
-        current_row = []
-        prev_row_index = None
-        for cell in cells:
-            row_index = cell.get("RowIndex", 0)
-            if row_index != prev_row_index and current_row:
-                rows.append(current_row)
-                current_row = []
-            prev_row_index = row_index
-
-            # Get cell text (from child blocks)
-            cell_text = []
-            for rel in cell.get("Relationships", []):
-                if rel["Type"] == "CHILD":
-                    for content_id in rel["Ids"]:
-                        content_block = next(
-                            (b for b in all_blocks if b["Id"] == content_id), None
-                        )
-                        if content_block and content_block["BlockType"] in ["LINE", "WORD"]:
-                            cell_text.append(content_block.get("Text", ""))
-            current_row.append(" | ".join(cell_text))
-        if current_row:
-            rows.append(current_row)
-
-        # Format as Markdown table
-        if not rows:
-            return ""
-
-        markdown_table = []
-        markdown_table.append("| " + " | ".join(rows[0]) + " |")
-        markdown_table.append("|" + "|".join(["---"] * len(rows[0])) + "|")
-        for row in rows[1:]:
-            markdown_table.append("| " + " | ".join(row) + " |")
-
-        return "\n".join(markdown_table)
-###############
-#4. textract_processor.py (Main Pipeline Logic)
-"""
-Main pipeline for processing PDFs with Amazon Textract.
-Generates Markdown and plain text outputs, and saves them to S3.
-"""
-
-import os
-import tempfile
-from typing import Optional
-from config import Config
-from utility import S3Manager, TextractManager, logger
-
-class TextractPipeline:
-    """Orchestrates the Textract RAG pipeline."""
-
-    def __init__(self):
-        """Initialize pipeline components."""
-        self.s3_manager = S3Manager(Config.S3_CONFIG["bucket_name"])
-        self.textract_manager = TextractManager()
-
-    def process_pdf(self, s3_key: str) -> None:
-        """
-        Process a single PDF file from S3.
-        Extracts content using Textract, generates Markdown and text outputs,
-        and saves them to S3.
-
-        Args:
-            s3_key: S3 key of the PDF file.
-        """
-        logger.info(f"Processing PDF: {s3_key}")
-
-        # Step 1: Start Textract job
-        job_id = self.textract_manager.start_document_analysis(s3_key)
-        if not self.textract_manager.wait_for_job_completion(job_id):
-            logger.error(f"Textract job {job_id} failed or timed out for {s3_key}")
-            return
-
-        # Step 2: Retrieve and parse results
-        results = self.textract_manager.get_job_results(job_id)
-        blocks = results.get("Blocks", [])
-        plain_text, markdown = TextractManager.parse_blocks(blocks)
-
-        # Step 3: Generate output filenames
-        base_name = os.path.splitext(os.path.basename(s3_key))[0]
-        textract_output_prefix = Config.S3_CONFIG["textract_output"].split("s3://")[1].split("/")[1]
-        output_prefix = f"{textract_output_prefix}/{base_name}"
-
-        # Step 4: Save outputs to S3
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as txt_file:
-            txt_file.write(plain_text)
-            txt_file_path = txt_file.name
-
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".md", delete=False) as md_file:
-            md_file.write(markdown)
-            md_file_path = md_file.name
-
-        # Upload to S3
-        self.s3_manager.upload_file(txt_file_path, f"{output_prefix}.txt")
-        self.s3_manager.upload_file(md_file_path, f"{output_prefix}.md")
-
-        # Clean up temp files
-        os.unlink(txt_file_path)
-        os.unlink(md_file_path)
-
-        logger.info(f"Successfully processed and saved outputs for {s3_key}")
-
-    def process_all_pdfs(self) -> None:
-        """Process all PDFs in the source S3 prefix."""
-        source_prefix = Config.S3_CONFIG["source_prefix"]
-        pdf_keys = [
-            key for key in self.s3_manager.list_objects(source_prefix)
-            if key.lower().endswith(".pdf")
-        ]
-        logger.info(f"Found {len(pdf_keys)} PDFs to process in {source_prefix}")
-
-        for s3_key in pdf_keys:
-            self.process_pdf(s3_key)
-
-def lambda_handler(event, context):
-    """
-    AWS Lambda handler for the Textract RAG pipeline.
-    Processes PDFs from S3 and saves outputs to another S3 location.
-    """
-    try:
-        logger.info("Lambda function started")
-        pipeline = TextractPipeline()
-        pipeline.process_all_pdfs()
-        logger.info("Lambda function completed successfully")
-        return {
-            "statusCode": 200,
-            "body": "PDF processing completed successfully",
-        }
-    except Exception as e:
-        logger.error(f"Lambda function failed: {e}", exc_info=True)
-        return {
-            "statusCode": 500,
-            "body": f"Error: {str(e)}",
-        }
-
-if __name__ == "__main__":
-    # For local testing
-    pipeline = TextractPipeline()
-    pipeline.process_all_pdfs()
-
-#################
-# 5. requirements.txt
-boto3>=1.26.0
-botocore>=1.29.0
+# ── Environment variable loading (optional) ───────────────────
 python-dotenv>=1.0.0
 
-
-
-
-
-
-
-
-
-
-
-
-
-    # Textract Features
-    TEXTRACT_FEATURES: List[str] = ["FORMS", "TABLES", "LAYOUT"]
+# ── Future / Optional ─────────────────────────────────────────
+# tiktoken>=0.6.0          # Exact OpenAI token counting (optional)
+# unstructured>=0.12.0     # Advanced PDF parsing (if needed later)
+# docling>=1.0.0           # Alternative to Textract (if needed later)
