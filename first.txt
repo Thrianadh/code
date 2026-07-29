@@ -1,3 +1,14 @@
+AWS_REGION=us-east-1
+S3_BUCKET_NAME=bankrupcy-data-bkt
+S3_SOURCE_PREFIX=ecmc_org/RAG/Source_data/
+S3_TEXTRACT_OUTPUT=ecmc_org/RAG/textract-output/
+S3_LOGS_PATH=ecmc_org/RAG/logs/
+
+
+boto3>=1.26.0
+botocore>=1.29.0
+
+###########
 """
 Reusable utilities for S3, Textract, logging, and document processing.
 Follows PEP 8, type hints, and best practices for maintainability.
@@ -458,6 +469,14 @@ class Config:
         "logs": os.getenv("S3_LOGS_PATH", "ecmc_org/RAG/logs/"),
         "chunking_output": os.getenv("S3_CHUNKING_OUTPUT", "ecmc_org/RAG/chunking-output/"),
     }
+    S3_CONFIG: Dict[str, str] = {
+    "bucket_name": S3_BUCKET_NAME,
+    "source_prefix": "ecmc_org/RAG/Source_data/",
+    "textract_output":  "ecmc_org/RAG/textract-output/",
+    "parsed_documents":  "ecmc_org/RAG/parsed-documents/",
+    "logs": "ecmc_org/RAG/logs/",  # <-- S3_LOGS_PATH is here
+    "chunking_output": "ecmc_org/RAG/chunking-output/",
+}
 
     # --- Textract Configuration ---
     TEXTRACT_FEATURES: List[str] = ["FORMS", "TABLES", "LAYOUT"]
