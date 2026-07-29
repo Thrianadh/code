@@ -1,3 +1,54 @@
+from faiss_vector_store import FAISSVectorStore
+from retrieval_engine import RetrievalEngine
+
+# Build index
+store = FAISSVectorStore()
+store.build_from_s3()
+
+# Retrieve
+retriever = RetrievalEngine(vector_store=store)
+result = retriever.retrieve("What is income-driven repayment?", top_k=5)
+
+# result["chunks"] is already a list of chunk dicts
+for chunk in result["chunks"]:
+    print(f"{chunk['chunk_id']} score={chunk['score']:.4f}")
+    print(chunk["text"][:200])
+
+####### vector_store.py
+def search(
+    self,
+    query_embedding: List[float],
+    k: int = 0,
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Generic search interface — delegates to hybrid search.
+    Returns chunk dicts (same format as FAISS).
+    """
+    hits = self.search_hybrid(
+        query_text="",  # Not used in pure vector fallback
+        query_embedding=query_embedding,
+        k=k,
+        filters=filters,
+    )
+    # Convert OpenSearch hits to chunk dicts
+    return [
+        {
+            "chunk_id": hit["_source"].get("chunk_id", ""),
+            "text": hit["_source"].get("text", ""),
+            "score": hit.get("_rrf_score", hit.get("_score", 0)),
+            "metadata": {
+                "document_id": hit["_source"].get("document_id", ""),
+                "page_number": hit["_source"].get("page_number", 0),
+                "section": hit["_source"].get("section", ""),
+                "prev_chunk_id": hit["_source"].get("prev_chunk_id", ""),
+                "next_chunk_id": hit["_source"].get("next_chunk_id", ""),
+                "contains_table": hit["_source"].get("contains_table", False),
+            }
+        }
+        for hit in hits
+    ]
+#######
 """
 Retrieval engine for RAG pipeline.
 Orchestrates query embedding, vector search, and context expansion
