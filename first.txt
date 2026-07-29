@@ -1,3 +1,203 @@
+"""
+Terminal-based chat interface for the RAG ChatBot.
+Displays conversation like a real chatbot in the terminal.
+
+Commands:
+  /new      — Start a new chat (clear history, keep session)
+  /history  — Show conversation history
+  /sources  — Show sources used in last response
+  /quit     — Exit
+
+Usage:
+    python chat_cli.py
+"""
+
+import os
+import sys
+import textwrap
+from datetime import datetime
+
+from rag_chatbot import RAGChatBot
+
+
+# ── Terminal Colors ─────────────────────────────────────────────
+class Colors:
+    HEADER = "\033[95m"      # Purple
+    BLUE = "\033[94m"       # Blue
+    CYAN = "\033[96m"       # Cyan
+    GREEN = "\033[92m"      # Green
+    YELLOW = "\033[93m"     # Yellow
+    RED = "\033[91m"        # Red
+    BOLD = "\033[1m"        # Bold
+    UNDERLINE = "\033[4m"   # Underline
+    END = "\033[0m"         # Reset
+
+
+def print_banner():
+    """Print welcome banner."""
+    banner = f"""
+{Colors.CYAN}{Colors.BOLD}╔══════════════════════════════════════════════════════════════╗
+║                  ECMC RAG CHATBOT                              ║
+║         Student Loan & Financial Aid Assistant                ║
+╚══════════════════════════════════════════════════════════════╝{Colors.END}
+
+{Colors.YELLOW}Commands:{Colors.END}
+  {Colors.GREEN}/new{Colors.END}      — Start a new chat
+  {Colors.GREEN}/history{Colors.END}  — Show conversation history
+  {Colors.GREEN}/sources{Colors.END}  — Show sources from last response
+  {Colors.GREEN}/quit{Colors.END}     — Exit
+
+{Colors.CYAN}Type your question below...{Colors.END}
+"""
+    print(banner)
+
+
+def print_user(msg: str):
+    """Print user message."""
+    width = 60
+    wrapped = textwrap.fill(msg, width=width)
+    lines = wrapped.split("\n")
+    print(f"\n{Colors.GREEN}┌─ You ─{'─' * 52}┐{Colors.END}")
+    for line in lines:
+        print(f"{Colors.GREEN}│{Colors.END}  {line:<{width}}  {Colors.GREEN}│{Colors.END}")
+    print(f"{Colors.GREEN}└{'─' * 60}┘{Colors.END}")
+
+
+def print_bot(msg: str, sources: list = None):
+    """Print bot response."""
+    width = 60
+    wrapped = textwrap.fill(msg, width=width)
+    lines = wrapped.split("\n")
+    print(f"\n{Colors.BLUE}┌─ ECMC Bot ─{'─' * 47}┐{Colors.END}")
+    for line in lines:
+        print(f"{Colors.BLUE}│{Colors.END}  {line:<{width}}  {Colors.BLUE}│{Colors.END}")
+    print(f"{Colors.BLUE}└{'─' * 60}┘{Colors.END}")
+
+    if sources:
+        print(f"{Colors.YELLOW}   📚 Sources: {', '.join(sources[:3])}{Colors.END}")
+
+
+def print_system(msg: str):
+    """Print system message."""
+    print(f"\n{Colors.YELLOW}⚡ {msg}{Colors.END}")
+
+
+def print_history(history: list):
+    """Print conversation history."""
+    if not history:
+        print_system("No conversation history yet.")
+        return
+
+    print(f"\n{Colors.CYAN}{Colors.BOLD}─── Conversation History ───{Colors.END}")
+    for i, msg in enumerate(history, 1):
+        role = msg["role"]
+        content = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+        if role == "user":
+            print(f"{Colors.GREEN}  [{i}] You:{Colors.END} {content}")
+        elif role == "assistant":
+            print(f"{Colors.BLUE}  [{i}] Bot:{Colors.END} {content}")
+    print(f"{Colors.CYAN}{'─' * 30}{Colors.END}")
+
+
+def print_sources(chunks: list):
+    """Print source chunks."""
+    if not chunks:
+        print_system("No sources available.")
+        return
+
+    print(f"\n{Colors.CYAN}{Colors.BOLD}─── Sources ───{Colors.END}")
+    for i, chunk in enumerate(chunks[:5], 1):
+        meta = chunk.get("metadata", chunk)
+        doc = meta.get("document_id", "unknown")
+        page = meta.get("page_number", 0)
+        section = meta.get("section", "")[:40]
+        score = chunk.get("score", 0)
+        print(f"{Colors.YELLOW}  [{i}]{Colors.END} {doc} | Page {page} | {section}")
+        print(f"       Score: {score:.4f} | {chunk.get('text', '')[:80]}...")
+    print(f"{Colors.CYAN}{'─' * 30}{Colors.END}")
+
+
+# ── Main Chat Loop ──────────────────────────────────────────────
+
+def main():
+    print_banner()
+
+    # Initialize bot
+    print_system("Loading RAG ChatBot...")
+    try:
+        bot = RAGChatBot()
+        print_system("✅ Bot ready! Session started.")
+    except Exception as e:
+        print(f"{Colors.RED}❌ Failed to initialize bot: {e}{Colors.END}")
+        sys.exit(1)
+
+    session_id = None
+    last_chunks = []
+
+    while True:
+        try:
+            # Get user input
+            user_input = input(f"\n{Colors.GREEN}You > {Colors.END}").strip()
+
+            if not user_input:
+                continue
+
+            # ── Commands ──
+            if user_input.lower() == "/quit":
+                print_system("Goodbye! 👋")
+                break
+
+            elif user_input.lower() == "/new":
+                session_id = bot.new_chat(session_id)
+                print_system("🆕 New chat started. History cleared.")
+                continue
+
+            elif user_input.lower() == "/history":
+                history = bot.get_history(session_id) if session_id else []
+                print_history(history)
+                continue
+
+            elif user_input.lower() == "/sources":
+                print_sources(last_chunks)
+                continue
+
+            # ── Normal Chat ──
+            print_user(user_input)
+
+            # Show thinking indicator
+            print(f"{Colors.YELLOW}   🤖 Thinking...{Colors.END}", end="", flush=True)
+
+            # Get response
+            response = bot.chat(
+                user_message=user_input,
+                session_id=session_id,
+                top_k=5,
+                expand_context=True,
+            )
+
+            # Clear thinking indicator
+            print("\r" + " " * 20 + "\r", end="")
+
+            # Store session ID for continuity
+            session_id = response["session_id"]
+            last_chunks = response.get("chunks", [])
+
+            # Print response
+            sources = [c.get("chunk_id", "") for c in last_chunks]
+            print_bot(response["answer"], sources=sources if sources else None)
+
+            # Show session info
+            print(f"{Colors.CYAN}   📋 Session: {session_id[:8]}... | History: {response['history_length']} msgs{Colors.END}")
+
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}\n⚡ Interrupted. Type /quit to exit.{Colors.END}")
+        except Exception as e:
+            print(f"{Colors.RED}❌ Error: {e}{Colors.END}")
+
+
+if __name__ == "__main__":
+    main()
+###########################
 #chat_memory.py
 """
 Chat session memory with sliding window.
