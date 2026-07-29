@@ -1,4 +1,803 @@
-#retrieval_engine.py
+"""
+Centralized configuration for the Textract RAG pipeline.
+Loads environment variables and defines S3 paths, chunking, embedding,
+vector store, retrieval, and Lambda settings.
+"""
+
+import os
+from typing import Dict, List
+
+
+class Config:
+    """Centralized configuration for the Textract RAG pipeline."""
+
+    # ── AWS ──────────────────────────────────────────────────────
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
+
+    # ── S3 Paths ─────────────────────────────────────────────────
+    S3_SOURCE_PREFIX: str = os.getenv(
+        "S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"
+    )
+    S3_TEXTRACT_OUTPUT_PREFIX: str = os.getenv(
+        "S3_TEXTRACT_OUTPUT_PREFIX", "ecmc_org/RAG/textract-output/"
+    )
+    S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
+        "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
+    )
+    S3_EMBEDDINGS_PREFIX: str = os.getenv(
+        "S3_EMBEDDINGS_PREFIX", "ecmc_org/RAG/embeddings/"
+    )
+    S3_VECTORSTORE_PREFIX: str = os.getenv(
+        "S3_VECTORSTORE_PREFIX", "ecmc_org/RAG/vectorstore/"
+    )
+    S3_LOGS_PREFIX: str = os.getenv(
+        "S3_LOGS_PREFIX", "ecmc_org/RAG/logs/"
+    )
+
+    # ── Textract ─────────────────────────────────────────────────
+    TEXTRACT_FEATURES: List[str] = ["TABLES", "FORMS", "LAYOUT"]
+    SUPPORTED_EXTENSIONS: tuple = (".pdf", ".png", ".jpg", ".jpeg", ".tiff")
+    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "60"))
+    POLL_INTERVAL_SEC: int = int(os.getenv("POLL_INTERVAL_SEC", "5"))
+
+    # ── Output from Textract ─────────────────────────────────────
+    OUTPUT_FORMATS: List[str] = ["md", "txt"]
+
+    # ── Chunking ─────────────────────────────────────────────────
+    CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
+    CHUNK_SIZE_TOKENS: int = int(os.getenv("CHUNK_SIZE_TOKENS", "512"))
+    CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "128"))
+    CHUNK_SIZE_CHARS: int = CHUNK_SIZE_TOKENS * 4
+    CHUNK_OVERLAP_CHARS: int = CHUNK_OVERLAP_TOKENS * 4
+    MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
+
+    CHUNK_METADATA_FIELDS: List[str] = [
+        "chunk_id", "document_id", "source_s3_key", "page_number",
+        "section", "section_level", "element_type", "parent_id",
+        "prev_chunk_id", "next_chunk_id", "contains_table",
+        "table_headers", "char_count", "token_estimate",
+    ]
+
+    # ── Embedding (Bedrock Titan) ────────────────────────────────
+    BEDROCK_EMBED_MODEL_ID: str = os.getenv(
+        "BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0"
+    )
+    EMBED_DIMENSIONS: int = int(os.getenv("EMBED_DIMENSIONS", "1024"))
+    EMBED_BATCH_SIZE: int = int(os.getenv("EMBED_BATCH_SIZE", "24"))
+    EMBED_MAX_RETRIES: int = int(os.getenv("EMBED_MAX_RETRIES", "5"))
+    EMBED_MAX_WORKERS: int = int(os.getenv("EMBED_MAX_WORKERS", "10"))
+    EMBED_NORMALIZE: bool = os.getenv("EMBED_NORMALIZE", "true").lower() == "true"
+
+    # ── Vector Store (OpenSearch Serverless) ─────────────────────
+    OPENSEARCH_ENDPOINT: str = os.getenv("OPENSEARCH_ENDPOINT", "")
+    OPENSEARCH_INDEX_NAME: str = os.getenv(
+        "OPENSEARCH_INDEX_NAME", "ecmc-rag-chunks"
+    )
+    OPENSEARCH_VECTOR_FIELD: str = os.getenv(
+        "OPENSEARCH_VECTOR_FIELD", "embedding"
+    )
+
+    # ── Retrieval ────────────────────────────────────────────────
+    RETRIEVAL_TOP_K: int = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+    RETRIEVAL_RRF_K: int = int(os.getenv("RETRIEVAL_RRF_K", "60"))
+    ENABLE_HYBRID_SEARCH: bool = os.getenv(
+        "ENABLE_HYBRID_SEARCH", "true"
+    ).lower() == "true"
+    ENABLE_CONTEXT_EXPANSION: bool = os.getenv(
+        "ENABLE_CONTEXT_EXPANSION", "true"
+    ).lower() == "true"
+
+    # ── Lambda / Deployment ──────────────────────────────────────
+    LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
+    LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
+
+    @classmethod
+    def get_all_s3_paths(cls) -> Dict[str, str]:
+        """Return all S3 folder paths for debugging / logging."""
+        return {
+            "source": cls.S3_SOURCE_PREFIX,
+            "textract_output": cls.S3_TEXTRACT_OUTPUT_PREFIX,
+            "chunking": cls.S3_CHUNKING_OUTPUT_PREFIX,
+            "embeddings": cls.S3_EMBEDDINGS_PREFIX,
+            "vectorstore": cls.S3_VECTORSTORE_PREFIX,
+            "logs": cls.S3_LOGS_PREFIX,
+        }
+
+
+# Singleton instance
+config = Config()
+
+###############
+"""
+Embedding engine for RAG pipeline.
+Generates dense vector embeddings using Amazon Bedrock Titan Embed v2.0.
+Supports single-text, batch, and S3 JSONL chunk processing with
+auto-ingestion to OpenSearch Serverless.
+"""
+
+import json
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+from config import config
+from utility import S3Manager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingEngine:
+    """Generates embeddings via Amazon Bedrock Titan Embed Text v2."""
+
+    def __init__(self, region: str = ""):
+        self.region = region or config.AWS_REGION
+        self.bedrock_runtime = boto3.client(
+            "bedrock-runtime", region_name=self.region
+        )
+        self.model_id = config.BEDROCK_EMBED_MODEL_ID
+        self.dimensions = config.EMBED_DIMENSIONS
+        self.normalize = config.EMBED_NORMALIZE
+        self.max_retries = config.EMBED_MAX_RETRIES
+        self.max_workers = config.EMBED_MAX_WORKERS
+
+    # ------------------------------------------------------------------
+    # Core embedding methods
+    # ------------------------------------------------------------------
+
+    def embed_text(self, text: str) -> List[float]:
+        """
+        Embed a single text string.
+
+        Args:
+            text: Raw text to embed (max 8K tokens for Titan v2).
+
+        Returns:
+            List of float values (length = EMBED_DIMENSIONS).
+        """
+        if not text or not text.strip():
+            logger.warning("Empty text passed to embed_text; returning zero vector.")
+            return [0.0] * self.dimensions
+
+        body = json.dumps({
+            "inputText": text.strip(),
+            "dimensions": self.dimensions,
+            "normalize": self.normalize,
+        })
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.bedrock_runtime.invoke_model(
+                    body=body,
+                    modelId=self.model_id,
+                    accept="application/json",
+                    contentType="application/json",
+                )
+                result = json.loads(response["body"].read())
+                embedding = result.get("embedding", [])
+                if not embedding:
+                    raise ValueError("Empty embedding returned by Bedrock.")
+                return embedding
+
+            except ClientError as e:
+                error_code = e.response["Error"]["Code"]
+                if error_code in ("ThrottlingException", "ServiceUnavailable"):
+                    wait = 2 ** attempt
+                    logger.warning(
+                        f"Bedrock throttled (attempt {attempt}/{self.max_retries}). "
+                        f"Retrying in {wait}s..."
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(f"Bedrock ClientError: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected error during embedding: {e}")
+                raise
+
+        raise RuntimeError(f"Failed to embed text after {self.max_retries} retries.")
+
+    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """
+        Embed a batch of texts in parallel using ThreadPoolExecutor.
+
+        Args:
+            texts: List of text strings.
+
+        Returns:
+            List of embeddings (same order as input texts).
+        """
+        if not texts:
+            return []
+
+        results = [None] * len(texts)
+        logger.info(f"Embedding batch of {len(texts)} texts with {self.max_workers} workers")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self.embed_text, txt): idx
+                for idx, txt in enumerate(texts)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    logger.error(f"Failed to embed text at index {idx}: {e}")
+                    results[idx] = [0.0] * self.dimensions
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Chunk-oriented helpers
+    # ------------------------------------------------------------------
+
+    def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Attach embeddings to a list of chunk dicts in-place.
+
+        Args:
+            chunks: List of chunk dicts (must have "text" key).
+
+        Returns:
+            Same list with "embedding" field added to each chunk.
+        """
+        texts = [c.get("text", "") for c in chunks]
+        embeddings = self.embed_batch(texts)
+
+        for chunk, emb in zip(chunks, embeddings):
+            chunk["embedding"] = emb
+
+        logger.info(f"Embedded {len(chunks)} chunks")
+        return chunks
+
+    def embed_chunks_from_s3(self, jsonl_s3_key: str) -> List[Dict[str, Any]]:
+        """
+        Read a .jsonl file from S3, embed all chunks, and return enriched list.
+
+        Args:
+            jsonl_s3_key: S3 key of the .jsonl chunk file.
+
+        Returns:
+            List of chunk dicts with "embedding" field.
+        """
+        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=self.region)
+        raw = s3.get_string(jsonl_s3_key)
+        if raw is None:
+            raise ValueError(f"Could not read {jsonl_s3_key} from S3")
+
+        chunks = []
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if line:
+                chunks.append(json.loads(line))
+
+        logger.info(f"Loaded {len(chunks)} chunks from {jsonl_s3_key}")
+        return self.embed_chunks(chunks)
+
+    def save_embedded_chunks(
+        self,
+        chunks: List[Dict[str, Any]],
+        document_id: str,
+    ) -> str:
+        """
+        Save embedded chunks as .jsonl to S3 embeddings/ folder.
+
+        Returns:
+            S3 key of the saved embedded .jsonl file.
+        """
+        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=self.region)
+        key = f"{config.S3_EMBEDDINGS_PREFIX}{document_id}_embedded.jsonl"
+        body = "\n".join(json.dumps(c, ensure_ascii=False) for c in chunks)
+        s3.put_string(key, body, content_type="application/jsonlines")
+        logger.info(f"Saved embedded chunks → s3://{config.S3_BUCKET_NAME}/{key}")
+        return key
+
+
+# ------------------------------------------------------------------
+# Standalone batch pipeline: embed + ingest to OpenSearch
+# ------------------------------------------------------------------
+
+def run_embedding_pipeline(
+    jsonl_s3_prefix: Optional[str] = None,
+    ingest_to_opensearch: bool = True,
+    opensearch_store: Optional[Any] = None,
+):
+    """
+    End-to-end batch pipeline:
+      1. Discover all .jsonl chunk files under the chunking prefix
+      2. Embed each chunk via Bedrock Titan
+      3. Save _embedded.jsonl to S3 (embeddings/ folder)
+      4. Ingest embedded chunks into OpenSearch (optional)
+      5. Save index metadata backup to S3 (vectorstore/ folder)
+      6. Save batch report to S3 (logs/ folder)
+
+    Args:
+        jsonl_s3_prefix: S3 prefix to scan for raw .jsonl chunks.
+            Defaults to config.S3_CHUNKING_OUTPUT_PREFIX.
+        ingest_to_opensearch: If True, bulk-ingest into OpenSearch after embedding.
+        opensearch_store: Optional OpenSearchVectorStore instance.
+            If None and ingest_to_opensearch=True, a new one is created.
+
+    Returns:
+        List of result tuples:
+        (jsonl_key, success, embedded_key_or_error, chunk_count, ingest_status)
+    """
+    from vector_store import OpenSearchVectorStore
+
+    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
+    engine = EmbeddingEngine()
+    store = opensearch_store or (OpenSearchVectorStore() if ingest_to_opensearch else None)
+
+    # Ensure index exists before ingestion
+    if store and not store.index_exists():
+        logger.info("OpenSearch index does not exist; creating...")
+        store.create_index()
+
+    prefix = jsonl_s3_prefix or config.S3_CHUNKING_OUTPUT_PREFIX
+    keys = [
+        k for k in s3.list_objects(prefix=prefix)
+        if k.endswith(".jsonl") and not k.endswith("_embedded.jsonl")
+    ]
+
+    logger.info(f"Found {len(keys)} chunk files to embed under {prefix}")
+    results = []
+
+    for key in keys:
+        doc_name = key.split("/")[-1].replace(".jsonl", "")
+        embedded_key = ""
+        ingest_ok = False
+        chunk_count = 0
+
+        try:
+            # Step 1: Embed
+            chunks = engine.embed_chunks_from_s3(key)
+            chunk_count = len(chunks)
+
+            # Step 2: Save to S3 embeddings/ folder
+            embedded_key = engine.save_embedded_chunks(chunks, doc_name)
+
+            # Step 3: Ingest to OpenSearch
+            if store and ingest_to_opensearch:
+                ingest_result = store.bulk_ingest(chunks)
+                ingest_ok = not ingest_result.get("errors", True)
+                logger.info(
+                    f"Ingested {chunk_count} chunks into OpenSearch "
+                    f"(errors={ingest_result.get('errors', 'N/A')})"
+                )
+
+            results.append((key, True, embedded_key, chunk_count, ingest_ok))
+
+        except Exception as e:
+            logger.error(f"Embedding/ingest failed for {key}: {e}")
+            results.append((key, False, str(e), chunk_count, False))
+
+    # Step 4: Save index metadata backup to S3 vectorstore/ folder
+    if store:
+        try:
+            store.save_index_metadata_to_s3(
+                extra={"pipeline": "run_embedding_pipeline", "documents_processed": len(keys)}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save index metadata: {e}")
+
+    # Step 5: Save batch report to S3 logs/ folder
+    report_lines = [
+        "EMBEDDING + VECTOR STORE BATCH REPORT",
+        "=" * 70,
+        f"Scanned prefix : {prefix}",
+        f"Total files    : {len(keys)}",
+        f"Ingest to OS   : {ingest_to_opensearch}",
+        "-" * 70,
+    ]
+    for k, ok, msg, count, ingested in results:
+        status = "PASS" if ok else "FAIL"
+        ingest_tag = "[INGESTED]" if ingested else "[NOT_INGESTED]"
+        report_lines.append(
+            f"[{status}] {ingest_tag} {k.split('/')[-1]:<35} → {msg} ({count} chunks)"
+        )
+    report_lines.append("=" * 70)
+    report = "\n".join(report_lines)
+
+    report_key = f"{config.S3_LOGS_PREFIX}embedding_pipeline_report_{int(time.time())}.txt"
+    s3.put_string(report_key, report)
+    logger.info(f"Batch report saved to {report_key}")
+    return results
+
+###########
+"""
+OpenSearch Serverless vector store manager.
+Handles index creation, bulk ingestion, and hybrid search (vector + BM25).
+Uses AWS Signature V4 auth for IAM-based access to OpenSearch Serverless.
+Index metadata backups are saved to S3 vectorstore/ folder.
+"""
+
+import json
+import logging
+import time
+from typing import Any, Dict, List, Optional
+
+import boto3
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
+
+from config import config
+from utility import S3Manager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class OpenSearchVectorStore:
+    """
+    Manages OpenSearch Serverless index for RAG chunks.
+    Supports k-NN vector search, BM25 keyword search, and client-side RRF fusion.
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "",
+        index_name: str = "",
+        region: str = "",
+    ):
+        self.endpoint = endpoint or config.OPENSEARCH_ENDPOINT
+        self.index_name = index_name or config.OPENSEARCH_INDEX_NAME
+        self.region = region or config.AWS_REGION
+        self.vector_field = config.OPENSEARCH_VECTOR_FIELD
+        self.dimensions = config.EMBED_DIMENSIONS
+
+        if not self.endpoint:
+            raise ValueError(
+                "OpenSearch endpoint is required. Set OPENSEARCH_ENDPOINT env var."
+            )
+
+        self.client = self._create_client()
+
+    def _create_client(self) -> OpenSearch:
+        """Create authenticated OpenSearch client for Serverless (aoss)."""
+        credentials = boto3.Session().get_credentials()
+        awsauth = AWS4Auth(
+            credentials.access_key,
+            credentials.secret_key,
+            self.region,
+            "aoss",
+            session_token=credentials.token,
+        )
+
+        host = self.endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+
+        client = OpenSearch(
+            hosts=[{"host": host, "port": 443}],
+            http_auth=awsauth,
+            use_ssl=True,
+            verify_certs=True,
+            connection_class=RequestsHttpConnection,
+            timeout=30,
+        )
+        logger.info(f"Connected to OpenSearch Serverless: {host}")
+        return client
+
+    # ------------------------------------------------------------------
+    # Index management
+    # ------------------------------------------------------------------
+
+    def create_index(self, delete_existing: bool = False) -> bool:
+        """
+        Create the OpenSearch index with k-NN vector mapping.
+
+        Args:
+            delete_existing: If True, delete index before creating.
+
+        Returns:
+            True if successful.
+        """
+        if delete_existing and self.client.indices.exists(index=self.index_name):
+            self.client.indices.delete(index=self.index_name)
+            logger.info(f"Deleted existing index: {self.index_name}")
+
+        if self.client.indices.exists(index=self.index_name):
+            logger.info(f"Index {self.index_name} already exists.")
+            return True
+
+        mapping = {
+            "settings": {
+                "index.knn": True,
+                "index.knn.algo_param.ef_search": 100,
+            },
+            "mappings": {
+                "properties": {
+                    "chunk_id": {"type": "keyword"},
+                    "text": {"type": "text", "analyzer": "standard"},
+                    "embedding": {
+                        "type": "knn_vector",
+                        "dimension": self.dimensions,
+                        "method": {
+                            "name": "hnsw",
+                            "space_type": "cosinesimil",
+                            "engine": "faiss",
+                            "parameters": {"ef_construction": 128, "m": 16},
+                        },
+                    },
+                    "document_id": {"type": "keyword"},
+                    "page_number": {"type": "integer"},
+                    "section": {"type": "keyword"},
+                    "section_level": {"type": "integer"},
+                    "element_type": {"type": "keyword"},
+                    "parent_id": {"type": "keyword"},
+                    "prev_chunk_id": {"type": "keyword"},
+                    "next_chunk_id": {"type": "keyword"},
+                    "contains_table": {"type": "boolean"},
+                    "table_headers": {"type": "keyword"},
+                    "char_count": {"type": "integer"},
+                    "token_estimate": {"type": "integer"},
+                    "metadata": {"type": "object", "enabled": False},
+                }
+            },
+        }
+
+        try:
+            self.client.indices.create(index=self.index_name, body=mapping)
+            logger.info(f"Created index: {self.index_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to create index: {e}")
+            raise
+
+    def delete_index(self) -> bool:
+        """Delete the index. Use with caution."""
+        if self.client.indices.exists(index=self.index_name):
+            self.client.indices.delete(index=self.index_name)
+            logger.info(f"Deleted index: {self.index_name}")
+        return True
+
+    def index_exists(self) -> bool:
+        return self.client.indices.exists(index=self.index_name)
+
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
+    def bulk_ingest(self, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Bulk ingest chunks into OpenSearch.
+
+        Args:
+            chunks: List of chunk dicts with "embedding" and "text" fields.
+
+        Returns:
+            OpenSearch bulk response summary.
+        """
+        if not chunks:
+            logger.warning("No chunks to ingest.")
+            return {"ingested": 0}
+
+        actions = []
+        for chunk in chunks:
+            doc = {
+                "chunk_id": chunk.get("chunk_id", ""),
+                "text": chunk.get("text", ""),
+                "embedding": chunk.get("embedding", []),
+                "document_id": chunk["metadata"].get("document_id", ""),
+                "page_number": chunk["metadata"].get("page_number", 0),
+                "section": chunk["metadata"].get("section", ""),
+                "section_level": chunk["metadata"].get("section_level", 0),
+                "element_type": chunk["metadata"].get("element_type", ""),
+                "parent_id": chunk["metadata"].get("parent_id", ""),
+                "prev_chunk_id": chunk["metadata"].get("prev_chunk_id", ""),
+                "next_chunk_id": chunk["metadata"].get("next_chunk_id", ""),
+                "contains_table": chunk["metadata"].get("contains_table", False),
+                "table_headers": chunk["metadata"].get("table_headers") or [],
+                "char_count": chunk["metadata"].get("char_count", 0),
+                "token_estimate": chunk["metadata"].get("token_estimate", 0),
+                "metadata": chunk.get("metadata", {}),
+            }
+            actions.append({"index": {"_index": self.index_name, "_id": doc["chunk_id"]}})
+            actions.append(doc)
+
+        try:
+            response = self.client.bulk(body=actions, refresh=True)
+            errors = response.get("errors", False)
+            ingested = len(chunks)
+            if errors:
+                failed = sum(1 for item in response["items"] if "error" in item.get("index", {}))
+                logger.warning(f"Bulk ingest completed with {failed} failures out of {ingested}")
+            else:
+                logger.info(f"Bulk ingested {ingested} chunks into {self.index_name}")
+            return {"ingested": ingested, "errors": errors, "response": response}
+        except Exception as e:
+            logger.error(f"Bulk ingest failed: {e}")
+            raise
+
+    # ------------------------------------------------------------------
+    # Search methods
+    # ------------------------------------------------------------------
+
+    def search_vector(
+        self,
+        query_embedding: List[float],
+        k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Pure k-NN vector search.
+
+        Args:
+            query_embedding: Dense vector from embedding model.
+            k: Number of results. Defaults to config.RETRIEVAL_TOP_K.
+            filters: Optional metadata filters.
+
+        Returns:
+            List of hit dicts with "_score", "_source", "_id".
+        """
+        k = k or config.RETRIEVAL_TOP_K
+
+        knn_query = {
+            "size": k,
+            "query": {
+                "knn": {
+                    self.vector_field: {
+                        "vector": query_embedding,
+                        "k": k,
+                    }
+                }
+            },
+        }
+
+        if filters:
+            knn_query["query"]["knn"][self.vector_field]["filter"] = {
+                "bool": {"must": [{"term": {f: v}} for f, v in filters.items()]}
+            }
+
+        response = self.client.search(index=self.index_name, body=knn_query)
+        return response.get("hits", {}).get("hits", [])
+
+    def search_bm25(
+        self,
+        query_text: str,
+        k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Pure BM25 keyword search on the "text" field.
+
+        Args:
+            query_text: Raw user query.
+            k: Number of results. Defaults to config.RETRIEVAL_TOP_K.
+            filters: Optional metadata filters.
+
+        Returns:
+            List of hit dicts.
+        """
+        k = k or config.RETRIEVAL_TOP_K
+
+        must_clauses = [{"match": {"text": query_text}}]
+        if filters:
+            for field, value in filters.items():
+                must_clauses.append({"term": {field: value}})
+
+        query = {
+            "size": k,
+            "query": {"bool": {"must": must_clauses}},
+        }
+
+        response = self.client.search(index=self.index_name, body=query)
+        return response.get("hits", {}).get("hits", [])
+
+    def search_hybrid(
+        self,
+        query_text: str,
+        query_embedding: List[float],
+        k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Hybrid search: client-side RRF fusion of vector + BM25 results.
+
+        Args:
+            query_text: Raw user query (for BM25).
+            query_embedding: Dense vector (for k-NN).
+            k: Final number of results after fusion.
+            filters: Optional metadata filters applied to both searches.
+
+        Returns:
+            Merged and re-ranked list of hit dicts.
+        """
+        if not config.ENABLE_HYBRID_SEARCH:
+            logger.info("Hybrid search disabled; falling back to vector search.")
+            return self.search_vector(query_embedding, k, filters)
+
+        k = k or config.RETRIEVAL_TOP_K
+        rrf_k = config.RETRIEVAL_RRF_K
+        fetch_k = k * 2
+
+        vector_hits = self.search_vector(query_embedding, fetch_k, filters)
+        bm25_hits = self.search_bm25(query_text, fetch_k, filters)
+
+        scores: Dict[str, float] = {}
+        docs: Dict[str, Dict[str, Any]] = {}
+
+        for rank, hit in enumerate(vector_hits):
+            doc_id = hit["_id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+            docs[doc_id] = hit
+
+        for rank, hit in enumerate(bm25_hits):
+            doc_id = hit["_id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+            docs[doc_id] = hit
+
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        final_results = []
+        for doc_id, rrf_score in ranked[:k]:
+            hit = docs[doc_id]
+            hit["_rrf_score"] = rrf_score
+            final_results.append(hit)
+
+        logger.info(
+            f"Hybrid search: vector={len(vector_hits)}, bm25={len(bm25_hits)}, "
+            f"fusion={len(final_results)}"
+        )
+        return final_results
+
+    def get_chunk_by_id(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single chunk by its chunk_id."""
+        try:
+            response = self.client.get(index=self.index_name, id=chunk_id)
+            return response.get("_source")
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # S3 backup
+    # ------------------------------------------------------------------
+
+    def save_index_metadata_to_s3(self, extra: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Save index mapping, settings, and stats to S3 vectorstore/ folder.
+
+        Returns:
+            S3 key of the saved metadata file.
+        """
+        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=self.region)
+
+        try:
+            mapping = self.client.indices.get_mapping(index=self.index_name)
+            settings = self.client.indices.get_settings(index=self.index_name)
+            stats = self.client.indices.stats(index=self.index_name)
+        except Exception as e:
+            logger.error(f"Failed to fetch index metadata: {e}")
+            mapping = settings = stats = {}
+
+        payload = {
+            "index_name": self.index_name,
+            "endpoint": self.endpoint,
+            "mapping": mapping,
+            "settings": settings,
+            "stats": stats,
+            "extra": extra or {},
+        }
+
+        key = f"{config.S3_VECTORSTORE_PREFIX}index_metadata_{self.index_name}_{int(time.time())}.json"
+        s3.put_string(
+            key,
+            json.dumps(payload, indent=2, default=str),
+            content_type="application/json",
+        )
+        logger.info(f"Saved index metadata to s3://{config.S3_BUCKET_NAME}/{key}")
+        return key
+
+##########
 """
 Retrieval engine for RAG pipeline.
 Orchestrates query embedding, hybrid search, and context expansion
@@ -216,2383 +1015,25 @@ class RetrievalEngine:
         """
         result = self.retrieve(query, top_k=top_k)
         return result["context_text"]
-############################
-#vector_store.py
-"""
-OpenSearch Serverless vector store manager.
-Handles index creation, bulk ingestion, and hybrid search (vector + BM25).
-Uses AWS Signature V4 auth for IAM-based access to OpenSearch Serverless.
-"""
 
-import json
-import logging
-from typing import Any, Dict, List, Optional
-
-import boto3
-from opensearchpy import OpenSearch, RequestsHttpConnection
-from requests_aws4auth import AWS4Auth
-
+#########
 from config import config
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+# Verify all paths
+print(config.get_all_s3_paths())
+# {
+#   "source": "ecmc_org/RAG/Source_data/",
+#   "textract_output": "ecmc_org/RAG/textract-output/",
+#   "chunking": "ecmc_org/RAG/chunking/",
+#   "embeddings": "ecmc_org/RAG/embeddings/",
+#   "vectorstore": "ecmc_org/RAG/vectorstore/",
+#   "logs": "ecmc_org/RAG/logs/"
+# }
+
+# Run full pipeline
+from embedding_engine import run_embedding_pipeline
+results = run_embedding_pipeline(
+    jsonl_s3_prefix="ecmc_org/RAG/chunking/",
+    ingest_to_opensearch=True,
 )
-logger = logging.getLogger(__name__)
-
-
-class OpenSearchVectorStore:
-    """
-    Manages OpenSearch Serverless index for RAG chunks.
-    Supports k-NN vector search, BM25 keyword search, and client-side RRF fusion.
-    """
-
-    def __init__(
-        self,
-        endpoint: str = "",
-        index_name: str = "",
-        region: str = "",
-    ):
-        self.endpoint = endpoint or config.OPENSEARCH_ENDPOINT
-        self.index_name = index_name or config.OPENSEARCH_INDEX_NAME
-        self.region = region or config.AWS_REGION
-        self.vector_field = config.OPENSEARCH_VECTOR_FIELD
-        self.dimensions = config.EMBED_DIMENSIONS
-
-        if not self.endpoint:
-            raise ValueError(
-                "OpenSearch endpoint is required. Set OPENSEARCH_ENDPOINT env var."
-            )
-
-        self.client = self._create_client()
-
-    def _create_client(self) -> OpenSearch:
-        """Create authenticated OpenSearch client for Serverless (aoss)."""
-        credentials = boto3.Session().get_credentials()
-        awsauth = AWS4Auth(
-            credentials.access_key,
-            credentials.secret_key,
-            self.region,
-            "aoss",  # OpenSearch Serverless service name
-            session_token=credentials.token,
-        )
-
-        # Strip protocol from endpoint if present
-        host = self.endpoint.replace("https://", "").replace("http://", "").rstrip("/")
-
-        client = OpenSearch(
-            hosts=[{"host": host, "port": 443}],
-            http_auth=awsauth,
-            use_ssl=True,
-            verify_certs=True,
-            connection_class=RequestsHttpConnection,
-            timeout=30,
-        )
-        logger.info(f"Connected to OpenSearch Serverless: {host}")
-        return client
-
-    # ------------------------------------------------------------------
-    # Index management
-    # ------------------------------------------------------------------
-
-    def create_index(self, delete_existing: bool = False) -> bool:
-        """
-        Create the OpenSearch index with k-NN vector mapping.
-
-        Args:
-            delete_existing: If True, delete index before creating.
-
-        Returns:
-            True if successful.
-        """
-        if delete_existing and self.client.indices.exists(index=self.index_name):
-            self.client.indices.delete(index=self.index_name)
-            logger.info(f"Deleted existing index: {self.index_name}")
-
-        if self.client.indices.exists(index=self.index_name):
-            logger.info(f"Index {self.index_name} already exists.")
-            return True
-
-        mapping = {
-            "settings": {
-                "index.knn": True,
-                "index.knn.algo_param.ef_search": 100,
-            },
-            "mappings": {
-                "properties": {
-                    "chunk_id": {"type": "keyword"},
-                    "text": {"type": "text", "analyzer": "standard"},
-                    "embedding": {
-                        "type": "knn_vector",
-                        "dimension": self.dimensions,
-                        "method": {
-                            "name": "hnsw",
-                            "space_type": "cosinesimil",
-                            "engine": "faiss",
-                            "parameters": {"ef_construction": 128, "m": 16},
-                        },
-                    },
-                    "document_id": {"type": "keyword"},
-                    "page_number": {"type": "integer"},
-                    "section": {"type": "keyword"},
-                    "section_level": {"type": "integer"},
-                    "element_type": {"type": "keyword"},
-                    "parent_id": {"type": "keyword"},
-                    "prev_chunk_id": {"type": "keyword"},
-                    "next_chunk_id": {"type": "keyword"},
-                    "contains_table": {"type": "boolean"},
-                    "table_headers": {"type": "keyword"},
-                    "char_count": {"type": "integer"},
-                    "token_estimate": {"type": "integer"},
-                    "metadata": {"type": "object", "enabled": False},
-                }
-            },
-        }
-
-        try:
-            self.client.indices.create(index=self.index_name, body=mapping)
-            logger.info(f"Created index: {self.index_name}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to create index: {e}")
-            raise
-
-    def delete_index(self) -> bool:
-        """Delete the index. Use with caution."""
-        if self.client.indices.exists(index=self.index_name):
-            self.client.indices.delete(index=self.index_name)
-            logger.info(f"Deleted index: {self.index_name}")
-        return True
-
-    def index_exists(self) -> bool:
-        return self.client.indices.exists(index=self.index_name)
-
-    # ------------------------------------------------------------------
-    # Ingestion
-    # ------------------------------------------------------------------
-
-    def bulk_ingest(self, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Bulk ingest chunks into OpenSearch.
-
-        Args:
-            chunks: List of chunk dicts with "embedding" and "text" fields.
-
-        Returns:
-            OpenSearch bulk response summary.
-        """
-        if not chunks:
-            logger.warning("No chunks to ingest.")
-            return {"ingested": 0}
-
-        actions = []
-        for chunk in chunks:
-            doc = {
-                "chunk_id": chunk.get("chunk_id", ""),
-                "text": chunk.get("text", ""),
-                "embedding": chunk.get("embedding", []),
-                "document_id": chunk["metadata"].get("document_id", ""),
-                "page_number": chunk["metadata"].get("page_number", 0),
-                "section": chunk["metadata"].get("section", ""),
-                "section_level": chunk["metadata"].get("section_level", 0),
-                "element_type": chunk["metadata"].get("element_type", ""),
-                "parent_id": chunk["metadata"].get("parent_id", ""),
-                "prev_chunk_id": chunk["metadata"].get("prev_chunk_id", ""),
-                "next_chunk_id": chunk["metadata"].get("next_chunk_id", ""),
-                "contains_table": chunk["metadata"].get("contains_table", False),
-                "table_headers": chunk["metadata"].get("table_headers") or [],
-                "char_count": chunk["metadata"].get("char_count", 0),
-                "token_estimate": chunk["metadata"].get("token_estimate", 0),
-                "metadata": chunk.get("metadata", {}),
-            }
-            actions.append({"index": {"_index": self.index_name, "_id": doc["chunk_id"]}})
-            actions.append(doc)
-
-        try:
-            response = self.client.bulk(body=actions, refresh=True)
-            errors = response.get("errors", False)
-            ingested = len(chunks)
-            if errors:
-                failed = sum(1 for item in response["items"] if "error" in item.get("index", {}))
-                logger.warning(f"Bulk ingest completed with {failed} failures out of {ingested}")
-            else:
-                logger.info(f"Bulk ingested {ingested} chunks into {self.index_name}")
-            return {"ingested": ingested, "errors": errors, "response": response}
-        except Exception as e:
-            logger.error(f"Bulk ingest failed: {e}")
-            raise
-
-    # ------------------------------------------------------------------
-    # Search methods
-    # ------------------------------------------------------------------
-
-    def search_vector(
-        self,
-        query_embedding: List[float],
-        k: int = 0,
-        filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Pure k-NN vector search.
-
-        Args:
-            query_embedding: Dense vector from embedding model.
-            k: Number of results. Defaults to RETRIEVAL_TOP_K.
-            filters: Optional metadata filters (e.g., {"document_id": "loan-guide"}).
-
-        Returns:
-            List of hit dicts with "_score", "_source", "_id".
-        """
-        k = k or config.RETRIEVAL_TOP_K
-
-        knn_query = {
-            "size": k,
-            "query": {
-                "knn": {
-                    self.vector_field: {
-                        "vector": query_embedding,
-                        "k": k,
-                    }
-                }
-            },
-        }
-
-        if filters:
-            knn_query["query"]["knn"][self.vector_field]["filter"] = {
-                "bool": {"must": [{"term": {f: v}} for f, v in filters.items()]}
-            }
-
-        response = self.client.search(index=self.index_name, body=knn_query)
-        return response.get("hits", {}).get("hits", [])
-
-    def search_bm25(
-        self,
-        query_text: str,
-        k: int = 0,
-        filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Pure BM25 keyword search on the "text" field.
-
-        Args:
-            query_text: Raw user query.
-            k: Number of results. Defaults to RETRIEVAL_TOP_K.
-            filters: Optional metadata filters.
-
-        Returns:
-            List of hit dicts.
-        """
-        k = k or config.RETRIEVAL_TOP_K
-
-        must_clauses = [{"match": {"text": query_text}}]
-        if filters:
-            for field, value in filters.items():
-                must_clauses.append({"term": {field: value}})
-
-        query = {
-            "size": k,
-            "query": {"bool": {"must": must_clauses}},
-        }
-
-        response = self.client.search(index=self.index_name, body=query)
-        return response.get("hits", {}).get("hits", [])
-
-    def search_hybrid(
-        self,
-        query_text: str,
-        query_embedding: List[float],
-        k: int = 0,
-        filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Hybrid search: client-side RRF fusion of vector + BM25 results.
-
-        Args:
-            query_text: Raw user query (for BM25).
-            query_embedding: Dense vector (for k-NN).
-            k: Final number of results after fusion.
-            filters: Optional metadata filters applied to both searches.
-
-        Returns:
-            Merged and re-ranked list of hit dicts.
-        """
-        if not config.ENABLE_HYBRID_SEARCH:
-            logger.info("Hybrid search disabled; falling back to vector search.")
-            return self.search_vector(query_embedding, k, filters)
-
-        k = k or config.RETRIEVAL_TOP_K
-        rrf_k = config.RETRIEVAL_RRF_K
-
-        # Fetch 2x results from each search for better fusion coverage
-        fetch_k = k * 2
-
-        vector_hits = self.search_vector(query_embedding, fetch_k, filters)
-        bm25_hits = self.search_bm25(query_text, fetch_k, filters)
-
-        # RRF scoring
-        scores: Dict[str, float] = {}
-        docs: Dict[str, Dict[str, Any]] = {}
-
-        for rank, hit in enumerate(vector_hits):
-            doc_id = hit["_id"]
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
-            docs[doc_id] = hit
-
-        for rank, hit in enumerate(bm25_hits):
-            doc_id = hit["_id"]
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
-            docs[doc_id] = hit
-
-        # Sort by RRF score descending
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        final_results = []
-        for doc_id, rrf_score in ranked[:k]:
-            hit = docs[doc_id]
-            hit["_rrf_score"] = rrf_score
-            final_results.append(hit)
-
-        logger.info(
-            f"Hybrid search: vector={len(vector_hits)}, bm25={len(bm25_hits)}, "
-            f"fusion={len(final_results)}"
-        )
-        return final_results
-
-    def get_chunk_by_id(self, chunk_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch a single chunk by its chunk_id."""
-        try:
-            response = self.client.get(index=self.index_name, id=chunk_id)
-            return response.get("_source")
-        except Exception:
-            return None
-#######################
-#embedding_engine.py
-"""
-Embedding engine for RAG pipeline.
-Generates dense vector embeddings using Amazon Bedrock Titan Embed v2.0.
-Supports single-text, batch, and S3 JSONL chunk processing.
-"""
-
-import json
-import logging
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
-
-import boto3
-from botocore.exceptions import ClientError
-
-from config import config
-from utility import S3Manager
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
-class EmbeddingEngine:
-    """Generates embeddings via Amazon Bedrock Titan Embed Text v2."""
-
-    def __init__(self, region: str = ""):
-        self.region = region or config.AWS_REGION
-        self.bedrock_runtime = boto3.client(
-            "bedrock-runtime", region_name=self.region
-        )
-        self.model_id = config.BEDROCK_EMBED_MODEL_ID
-        self.dimensions = config.EMBED_DIMENSIONS
-        self.normalize = config.EMBED_NORMALIZE
-        self.max_retries = config.EMBED_MAX_RETRIES
-        self.max_workers = config.EMBED_MAX_WORKERS
-
-    # ------------------------------------------------------------------
-    # Core embedding methods
-    # ------------------------------------------------------------------
-
-    def embed_text(self, text: str) -> List[float]:
-        """
-        Embed a single text string.
-
-        Args:
-            text: Raw text to embed (max 8K tokens for Titan v2).
-
-        Returns:
-            List of float values (length = EMBED_DIMENSIONS).
-        """
-        if not text or not text.strip():
-            logger.warning("Empty text passed to embed_text; returning zero vector.")
-            return [0.0] * self.dimensions
-
-        body = json.dumps({
-            "inputText": text.strip(),
-            "dimensions": self.dimensions,
-            "normalize": self.normalize,
-        })
-
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                response = self.bedrock_runtime.invoke_model(
-                    body=body,
-                    modelId=self.model_id,
-                    accept="application/json",
-                    contentType="application/json",
-                )
-                result = json.loads(response["body"].read())
-                embedding = result.get("embedding", [])
-                if not embedding:
-                    raise ValueError("Empty embedding returned by Bedrock.")
-                return embedding
-
-            except ClientError as e:
-                error_code = e.response["Error"]["Code"]
-                if error_code in ("ThrottlingException", "ServiceUnavailable"):
-                    wait = 2 ** attempt
-                    logger.warning(
-                        f"Bedrock throttled (attempt {attempt}/{self.max_retries}). "
-                        f"Retrying in {wait}s..."
-                    )
-                    time.sleep(wait)
-                else:
-                    logger.error(f"Bedrock ClientError: {e}")
-                    raise
-            except Exception as e:
-                logger.error(f"Unexpected error during embedding: {e}")
-                raise
-
-        raise RuntimeError(f"Failed to embed text after {self.max_retries} retries.")
-
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """
-        Embed a batch of texts in parallel using ThreadPoolExecutor.
-
-        Args:
-            texts: List of text strings.
-
-        Returns:
-            List of embeddings (same order as input texts).
-        """
-        if not texts:
-            return []
-
-        results = [None] * len(texts)
-        logger.info(f"Embedding batch of {len(texts)} texts with {self.max_workers} workers")
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_idx = {
-                executor.submit(self.embed_text, txt): idx
-                for idx, txt in enumerate(texts)
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    logger.error(f"Failed to embed text at index {idx}: {e}")
-                    results[idx] = [0.0] * self.dimensions
-
-        return results
-
-    # ------------------------------------------------------------------
-    # Chunk-oriented helpers
-    # ------------------------------------------------------------------
-
-    def embed_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Attach embeddings to a list of chunk dicts in-place.
-
-        Args:
-            chunks: List of chunk dicts (must have "text" key).
-
-        Returns:
-            Same list with "embedding" field added to each chunk.
-        """
-        texts = [c.get("text", "") for c in chunks]
-        embeddings = self.embed_batch(texts)
-
-        for chunk, emb in zip(chunks, embeddings):
-            chunk["embedding"] = emb
-
-        logger.info(f"Embedded {len(chunks)} chunks")
-        return chunks
-
-    def embed_chunks_from_s3(self, jsonl_s3_key: str) -> List[Dict[str, Any]]:
-        """
-        Read a .jsonl file from S3, embed all chunks, and return enriched list.
-
-        Args:
-            jsonl_s3_key: S3 key of the .jsonl chunk file.
-
-        Returns:
-            List of chunk dicts with "embedding" field.
-        """
-        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=self.region)
-        raw = s3.get_string(jsonl_s3_key)
-        if raw is None:
-            raise ValueError(f"Could not read {jsonl_s3_key} from S3")
-
-        chunks = []
-        for line in raw.strip().split("\n"):
-            line = line.strip()
-            if line:
-                chunks.append(json.loads(line))
-
-        logger.info(f"Loaded {len(chunks)} chunks from {jsonl_s3_key}")
-        return self.embed_chunks(chunks)
-
-    def save_embedded_chunks(
-        self,
-        chunks: List[Dict[str, Any]],
-        document_id: str,
-    ) -> str:
-        """
-        Save embedded chunks as .jsonl to S3 (separate from raw chunks).
-
-        Returns:
-            S3 key of the saved embedded .jsonl file.
-        """
-        s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=self.region)
-        key = f"{config.S3_CHUNKING_OUTPUT_PREFIX}{document_id}_embedded.jsonl"
-        body = "\n".join(json.dumps(c, ensure_ascii=False) for c in chunks)
-        s3.put_string(key, body, content_type="application/jsonlines")
-        logger.info(f"Saved embedded chunks → s3://{config.S3_BUCKET_NAME}/{key}")
-        return key
-
-
-# ------------------------------------------------------------------
-# Standalone batch helper
-# ------------------------------------------------------------------
-
-def run_embedding_pipeline(jsonl_s3_prefix: Optional[str] = None):
-    """
-    Discover all .jsonl files under the chunking prefix, embed each,
-    and save _embedded.jsonl back to S3.
-    """
-    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
-    engine = EmbeddingEngine()
-
-    prefix = jsonl_s3_prefix or config.S3_CHUNKING_OUTPUT_PREFIX
-    keys = [k for k in s3.list_objects(prefix=prefix) if k.endswith(".jsonl") and not k.endswith("_embedded.jsonl")]
-
-    logger.info(f"Found {len(keys)} chunk files to embed under {prefix}")
-    results = []
-
-    for key in keys:
-        try:
-            doc_name = key.split("/")[-1].replace(".jsonl", "")
-            chunks = engine.embed_chunks_from_s3(key)
-            embedded_key = engine.save_embedded_chunks(chunks, doc_name)
-            results.append((key, True, embedded_key, len(chunks)))
-        except Exception as e:
-            logger.error(f"Embedding failed for {key}: {e}")
-            results.append((key, False, str(e), 0))
-
-    # Save batch report
-    report_lines = ["EMBEDDING BATCH REPORT", "=" * 70]
-    for k, ok, msg, count in results:
-        status = "PASS" if ok else "FAIL"
-        report_lines.append(f"[{status}] {k} → {msg} ({count} chunks)")
-    report = "\n".join(report_lines)
-
-    report_key = f"{config.S3_LOGS_PREFIX}embedding_batch_report_{int(time.time())}.txt"
-    s3.put_string(report_key, report)
-    logger.info(f"Batch report saved to {report_key}")
-    return results
-#####################
-#config.py
-"""
-Centralized configuration for the Textract RAG pipeline.
-Loads environment variables and defines S3 paths, chunking, embedding,
-vector store, retrieval, and Lambda settings.
-"""
-
-import os
-from typing import List
-
-
-class Config:
-    """Centralized configuration for the Textract RAG pipeline."""
-
-    # ── AWS ──────────────────────────────────────────────────────
-    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
-
-    # ── S3 Paths ─────────────────────────────────────────────────
-    S3_SOURCE_PREFIX: str = os.getenv(
-        "S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"
-    )
-    S3_TEXTRACT_OUTPUT_PREFIX: str = os.getenv(
-        "S3_TEXTRACT_OUTPUT_PREFIX", "ecmc_org/RAG/textract-output/"
-    )
-    S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
-        "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
-    )
-    S3_LOGS_PREFIX: str = os.getenv(
-        "S3_LOGS_PREFIX", "ecmc_org/RAG/logs/"
-    )
-
-    # ── Textract ─────────────────────────────────────────────────
-    TEXTRACT_FEATURES: List[str] = ["TABLES", "FORMS", "LAYOUT"]
-    SUPPORTED_EXTENSIONS: tuple = (".pdf", ".png", ".jpg", ".jpeg", ".tiff")
-    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "60"))
-    POLL_INTERVAL_SEC: int = int(os.getenv("POLL_INTERVAL_SEC", "5"))
-
-    # ── Output from Textract ─────────────────────────────────────
-    OUTPUT_FORMATS: List[str] = ["md", "txt"]
-
-    # ── Chunking ─────────────────────────────────────────────────
-    CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
-    CHUNK_SIZE_TOKENS: int = int(os.getenv("CHUNK_SIZE_TOKENS", "512"))
-    CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "128"))
-    CHUNK_SIZE_CHARS: int = CHUNK_SIZE_TOKENS * 4
-    CHUNK_OVERLAP_CHARS: int = CHUNK_OVERLAP_TOKENS * 4
-    MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
-
-    CHUNK_METADATA_FIELDS: List[str] = [
-        "chunk_id", "document_id", "source_s3_key", "page_number",
-        "section", "section_level", "element_type", "parent_id",
-        "prev_chunk_id", "next_chunk_id", "contains_table",
-        "table_headers", "char_count", "token_estimate",
-    ]
-
-    # ── Embedding (Bedrock Titan) ────────────────────────────────
-    BEDROCK_EMBED_MODEL_ID: str = os.getenv(
-        "BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0"
-    )
-    EMBED_DIMENSIONS: int = int(os.getenv("EMBED_DIMENSIONS", "1024"))
-    EMBED_BATCH_SIZE: int = int(os.getenv("EMBED_BATCH_SIZE", "24"))
-    EMBED_MAX_RETRIES: int = int(os.getenv("EMBED_MAX_RETRIES", "5"))
-    EMBED_MAX_WORKERS: int = int(os.getenv("EMBED_MAX_WORKERS", "10"))
-    EMBED_NORMALIZE: bool = os.getenv("EMBED_NORMALIZE", "true").lower() == "true"
-
-    # ── Vector Store (OpenSearch Serverless) ─────────────────────
-    OPENSEARCH_ENDPOINT: str = os.getenv("OPENSEARCH_ENDPOINT", "")
-    OPENSEARCH_INDEX_NAME: str = os.getenv(
-        "OPENSEARCH_INDEX_NAME", "ecmc-rag-chunks"
-    )
-    OPENSEARCH_VECTOR_FIELD: str = os.getenv(
-        "OPENSEARCH_VECTOR_FIELD", "embedding"
-    )
-
-    # ── Retrieval ────────────────────────────────────────────────
-    RETRIEVAL_TOP_K: int = int(os.getenv("RETRIEVAL_TOP_K", "5"))
-    RETRIEVAL_RRF_K: int = int(os.getenv("RETRIEVAL_RRF_K", "60"))
-    ENABLE_HYBRID_SEARCH: bool = os.getenv(
-        "ENABLE_HYBRID_SEARCH", "true"
-    ).lower() == "true"
-    ENABLE_CONTEXT_EXPANSION: bool = os.getenv(
-        "ENABLE_CONTEXT_EXPANSION", "true"
-    ).lower() == "true"
-
-    # ── Lambda / Deployment ──────────────────────────────────────
-    LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
-    LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
-
-
-# Singleton instance
-config = Config()
-#####################
-from config import config
-print(type(config.CHUNK_SIZE_CHARS))   # Should print: <class 'int'>
-print(config.CHUNK_SIZE_CHARS)         # Should print: 2048
-
-from chunking_engine import ChunkingEngine
-engine = ChunkingEngine()
-print(type(engine.recursive_splitter._chunk_size))  # Should print: <class 'int'>
-#####
-"""
-Centralized configuration for the Textract RAG pipeline.
-Loads environment variables and defines S3 paths, chunking, and Lambda settings.
-"""
-
-import os
-from typing import List
-
-
-class Config:
-    """Centralized configuration for the Textract RAG pipeline."""
-
-    # ── AWS ──────────────────────────────────────────────────────
-    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
-
-    # ── S3 Paths ─────────────────────────────────────────────────
-    S3_SOURCE_PREFIX: str = os.getenv(
-        "S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"
-    )
-    S3_TEXTRACT_OUTPUT_PREFIX: str = os.getenv(
-        "S3_TEXTRACT_OUTPUT_PREFIX", "ecmc_org/RAG/textract-output/"
-    )
-    S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
-        "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
-    )
-    S3_LOGS_PREFIX: str = os.getenv(
-        "S3_LOGS_PREFIX", "ecmc_org/RAG/logs/"
-    )
-
-    # ── Textract ─────────────────────────────────────────────────
-    TEXTRACT_FEATURES: List[str] = ["TABLES", "FORMS", "LAYOUT"]
-    SUPPORTED_EXTENSIONS: tuple = (".pdf", ".png", ".jpg", ".jpeg", ".tiff")
-    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "60"))
-    POLL_INTERVAL_SEC: int = int(os.getenv("POLL_INTERVAL_SEC", "5"))
-
-    # ── Output from Textract (both saved; chunking picks one) ────
-    OUTPUT_FORMATS: List[str] = ["md", "txt"]
-
-    # ── Chunking ─────────────────────────────────────────────────
-    # Input format for the chunking engine (always use md for structure-aware)
-    CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
-
-    # Token-based sizing (industry standard for embedding models)
-    CHUNK_SIZE_TOKENS: int = int(os.getenv("CHUNK_SIZE_TOKENS", "512"))
-    CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "128"))
-
-    # Table chunking
-    MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
-
-    # Character equivalents (1 token ≈ 4 chars for English)
-    # NOTE: Must be plain ints, NOT @property, so LangChain splitters accept them
-    CHUNK_SIZE_CHARS: int = CHUNK_SIZE_TOKENS * 4
-    CHUNK_OVERLAP_CHARS: int = CHUNK_OVERLAP_TOKENS * 4
-
-    # ── Metadata fields preserved per chunk ──────────────────────
-    CHUNK_METADATA_FIELDS: List[str] = [
-        "chunk_id",
-        "document_id",
-        "source_s3_key",
-        "page_number",
-        "section",
-        "section_level",
-        "element_type",
-        "parent_id",
-        "prev_chunk_id",
-        "next_chunk_id",
-        "contains_table",
-        "table_headers",
-        "char_count",
-        "token_estimate",
-    ]
-
-    # ── Lambda / Deployment ──────────────────────────────────────
-    LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
-    LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
-
-
-# Singleton instance
-config = Config()
-####################
-from textract_processor import TextractPipeline
-from chunking_engine import run_chunking_pipeline
-
-# ── Step 1: Run Textract on all source PDFs ──
-pipeline = TextractPipeline()
-results = pipeline.run_sequential()   # or run_parallel(max_workers=3)
-pipeline.generate_report(results)
-
-# ── Step 2: Chunk all generated .md files ──
-print("\n" + "="*50)
-print("Starting chunking phase...")
-chunk_results = run_chunking_pipeline()
-
-print(f"\nChunking complete. Processed {len(chunk_results)} documents.")
-#######################
-"""
-Structure-aware chunking engine for RAG pipelines.
-
-Pipeline:
-  1. Read Markdown from S3 (with YAML frontmatter + HTML page markers)
-  2. Split by Markdown headers (#, ##, ###)
-  3. Detect tables → keep atomic or split by rows with header injection
-  4. Fallback to RecursiveCharacterTextSplitter for oversized text sections
-  5. Enrich metadata (page, section, parent_id, prev/next links)
-  6. Save as JSON Lines (.jsonl) to S3
-
-Dependencies:
-  pip install langchain-text-splitters
-"""
-
-import json
-import logging
-import re
-import time
-from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple
-
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-
-from config import config
-from utility import S3Manager
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-# Regex for HTML page markers injected by Textract post-processor
-PAGE_MARKER_RE = re.compile(r"<!--\s*page:\s*(\d+)\s*-->")
-
-# Regex for YAML frontmatter
-FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
-
-
-class ChunkingEngine:
-    """Structure-aware chunking with table preservation and metadata enrichment."""
-
-    def __init__(self):
-        self.md_splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=[
-                ("#", "Header_1"),
-                ("##", "Header_2"),
-                ("###", "Header_3"),
-            ],
-            strip_headers=False,  # Keep headers in chunk text for context
-        )
-        self.recursive_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=config.CHUNK_SIZE_CHARS,
-            chunk_overlap=config.CHUNK_OVERLAP_CHARS,
-            separators=["\n\n", "\n", ". ", " "],
-            length_function=len,
-        )
-        self.s3 = S3Manager(
-            bucket_name=config.S3_BUCKET_NAME,
-            region=config.AWS_REGION,
-        )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def chunk_document_from_s3(self, md_s3_key: str) -> Tuple[List[Dict[str, Any]], str]:
-        """
-        Read a Markdown file from S3, chunk it, and return chunks + log.
-
-        Args:
-            md_s3_key: S3 key of the .md file (e.g., ecmc_org/RAG/textract-output/doc1.md)
-
-        Returns:
-            Tuple of (chunks list, log string).
-        """
-        logger.info(f"Chunking document from S3: {md_s3_key}")
-
-        md_text = self.s3.get_string(md_s3_key)
-        if md_text is None:
-            raise ValueError(f"Could not read {md_s3_key} from S3")
-
-        document_id = self._extract_document_id(md_s3_key, md_text)
-        chunks = self.chunk_markdown(md_text, document_id, source_s3_key=md_s3_key)
-
-        log = self._generate_chunking_log(document_id, md_s3_key, chunks)
-        return chunks, log
-
-    def chunk_markdown(
-        self,
-        md_text: str,
-        document_id: str,
-        source_s3_key: str = "",
-    ) -> List[Dict[str, Any]]:
-        """
-        Core chunking logic. Operates on Markdown string in memory.
-
-        Args:
-            md_text: Full Markdown content (with frontmatter + page markers).
-            document_id: Unique document identifier.
-            source_s3_key: Original S3 key for provenance.
-
-        Returns:
-            List of chunk dicts ready for .jsonl serialization.
-        """
-        # 1. Strip frontmatter before header splitting
-        body_text = self._strip_frontmatter(md_text)
-
-        # 2. Build page-marker map: position in text → page number
-        page_markers = self._build_page_marker_map(body_text)
-
-        # 3. Split by Markdown headers
-        sections = self.md_splitter.split_text(body_text)
-        logger.info(f"Document '{document_id}' split into {len(sections)} header sections")
-
-        all_chunks: List[Dict[str, Any]] = []
-        section_idx = 0
-
-        for section in sections:
-            section_idx += 1
-            content = section.page_content
-            meta = section.metadata  # e.g., {"Header_1": "Title", "Header_2": "Sub"}
-
-            # Build human-readable section path
-            section_path = " > ".join(
-                v for k, v in sorted(meta.items()) if v
-            )
-            section_level = len(meta)
-            parent_id = f"{document_id}_sec_{section_idx:03d}"
-
-            # Determine page number from first page marker in this section
-            page_number = self._resolve_page_number(content, page_markers, body_text)
-
-            # 4. Detect and handle tables
-            table_chunks = self._extract_and_chunk_tables(
-                content,
-                section_path=section_path,
-                section_level=section_level,
-                page_number=page_number,
-                parent_id=parent_id,
-                document_id=document_id,
-                source_s3_key=source_s3_key,
-            )
-
-            if table_chunks:
-                all_chunks.extend(table_chunks)
-                continue
-
-            # 5. No table → standard text chunking with recursive fallback
-            text_chunks = self._chunk_text_section(
-                content,
-                section_path=section_path,
-                section_level=section_level,
-                page_number=page_number,
-                parent_id=parent_id,
-                document_id=document_id,
-                source_s3_key=source_s3_key,
-            )
-            all_chunks.extend(text_chunks)
-
-        # 6. Link prev/next chunk IDs globally
-        all_chunks = self._link_neighbors(all_chunks)
-
-        logger.info(
-            f"Document '{document_id}' → {len(all_chunks)} final chunks "
-            f"(tables: {sum(1 for c in all_chunks if c['metadata']['contains_table'])})"
-        )
-        return all_chunks
-
-    def save_chunks_to_s3(
-        self,
-        chunks: List[Dict[str, Any]],
-        document_id: str,
-        log: str = "",
-    ) -> str:
-        """
-        Save chunks as .jsonl to S3 and optionally save the log.
-
-        Returns:
-            S3 key of the saved .jsonl file.
-        """
-        jsonl_key = f"{config.S3_CHUNKING_OUTPUT_PREFIX}{document_id}.jsonl"
-        jsonl_body = "\n".join(
-            json.dumps(chunk, ensure_ascii=False) for chunk in chunks
-        )
-        self.s3.put_string(
-            jsonl_key,
-            jsonl_body,
-            content_type="application/jsonlines",
-        )
-
-        if log:
-            log_key = f"{config.S3_LOGS_PREFIX}chunking_{document_id}_{int(time.time())}.txt"
-            self.s3.put_string(log_key, log)
-
-        return jsonl_key
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_document_id(md_s3_key: str, md_text: str) -> str:
-        """Extract document_id from YAML frontmatter or S3 key stem."""
-        match = FRONTMATTER_RE.search(md_text)
-        if match:
-            fm = match.group(1)
-            for line in fm.split("\n"):
-                if line.strip().startswith("document_id:"):
-                    return line.split(":", 1)[1].strip().strip('"').strip("'")
-        return Path(md_s3_key).stem
-
-    @staticmethod
-    def _strip_frontmatter(md_text: str) -> str:
-        """Remove YAML frontmatter so MarkdownHeaderTextSplitter works cleanly."""
-        match = FRONTMATTER_RE.search(md_text)
-        if match:
-            return md_text[match.end():]
-        return md_text
-
-    @staticmethod
-    def _build_page_marker_map(text: str) -> List[Tuple[int, int]]:
-        """
-        Build a list of (char_position, page_number) from HTML comments.
-        Sorted by position.
-        """
-        markers = []
-        for match in PAGE_MARKER_RE.finditer(text):
-            pos = match.start()
-            page = int(match.group(1))
-            markers.append((pos, page))
-        markers.sort()
-        return markers
-
-    @staticmethod
-    def _resolve_page_number(
-        section_text: str, page_markers: List[Tuple[int, int]], full_body: str
-    ) -> int:
-        """
-        Find the page number for a section by looking at the first page marker
-        that appears before or within the section text.
-        """
-        # Find where this section starts in the full body
-        idx = full_body.find(section_text)
-        if idx == -1:
-            return 1
-
-        # Walk backwards through markers to find the nearest preceding one
-        best_page = 1
-        for pos, page in page_markers:
-            if pos <= idx:
-                best_page = page
-            else:
-                break
-        return best_page
-
-    def _extract_and_chunk_tables(
-        self,
-        text: str,
-        section_path: str,
-        section_level: int,
-        page_number: int,
-        parent_id: str,
-        document_id: str,
-        source_s3_key: str,
-    ) -> Optional[List[Dict[str, Any]]]:
-        """
-        If the text contains one or more Markdown tables, extract and chunk them.
-        Returns None if no tables found (caller falls back to text chunking).
-        """
-        tables = self._find_markdown_tables(text)
-        if not tables:
-            return None
-
-        chunks = []
-        for table_idx, table_md in enumerate(tables, 1):
-            header_row, separator, data_rows, table_headers = self._parse_table_rows(table_md)
-
-            if not header_row or not separator:
-                # Malformed table → treat as plain text
-                continue
-
-            # Section context to inject above every table chunk
-            context_prefix = f"# {section_path}\n\n" if section_path else ""
-
-            if len(data_rows) <= config.MAX_TABLE_CHUNK_ROWS:
-                # Atomic table chunk
-                chunk_text = context_prefix + "\n".join([header_row, separator] + data_rows)
-                chunks.append(self._build_chunk(
-                    text=chunk_text,
-                    document_id=document_id,
-                    source_s3_key=source_s3_key,
-                    page_number=page_number,
-                    section=section_path,
-                    section_level=section_level,
-                    element_type="table",
-                    parent_id=parent_id,
-                    contains_table=True,
-                    table_headers=table_headers,
-                ))
-            else:
-                # Split table by row groups
-                for i in range(0, len(data_rows), config.MAX_TABLE_CHUNK_ROWS):
-                    group = data_rows[i : i + config.MAX_TABLE_CHUNK_ROWS]
-                    chunk_text = context_prefix + "\n".join([header_row, separator] + group)
-                    chunks.append(self._build_chunk(
-                        text=chunk_text,
-                        document_id=document_id,
-                        source_s3_key=source_s3_key,
-                        page_number=page_number,
-                        section=section_path,
-                        section_level=section_level,
-                        element_type="table",
-                        parent_id=parent_id,
-                        contains_table=True,
-                        table_headers=table_headers,
-                    ))
-
-        # If there is non-table text mixed in, we should also chunk that.
-        # For simplicity in v1, we return only table chunks when tables are detected.
-        # TODO: interleave non-table text chunks between table chunks.
-        return chunks if chunks else None
-
-    @staticmethod
-    def _find_markdown_tables(text: str) -> List[str]:
-        """
-        Find all Markdown pipe tables in the text.
-        A table = consecutive lines starting with '|', with at least 2 rows
-        (header + separator).
-        """
-        lines = text.split("\n")
-        tables = []
-        current = []
-        in_table = False
-
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("|"):
-                current.append(line)
-                in_table = True
-            else:
-                if in_table and len(current) >= 2:
-                    tables.append("\n".join(current))
-                current = []
-                in_table = False
-
-        if in_table and len(current) >= 2:
-            tables.append("\n".join(current))
-
-        return tables
-
-    @staticmethod
-    def _parse_table_rows(table_md: str) -> Tuple[str, str, List[str], List[str]]:
-        """
-        Parse a Markdown table into (header_row, separator, data_rows, headers_list).
-        """
-        lines = [l.strip() for l in table_md.strip().split("\n") if l.strip()]
-        if len(lines) < 2:
-            return "", "", [], []
-
-        header_row = lines[0]
-        separator = lines[1]
-        data_rows = lines[2:]
-
-        # Extract header names
-        headers = [c.strip() for c in header_row.strip("|").split("|")]
-        return header_row, separator, data_rows, headers
-
-    def _chunk_text_section(
-        self,
-        text: str,
-        section_path: str,
-        section_level: int,
-        page_number: int,
-        parent_id: str,
-        document_id: str,
-        source_s3_key: str,
-    ) -> List[Dict[str, Any]]:
-        """Chunk a text section using RecursiveCharacterTextSplitter if needed."""
-        if len(text) <= config.CHUNK_SIZE_CHARS:
-            return [self._build_chunk(
-                text=text,
-                document_id=document_id,
-                source_s3_key=source_s3_key,
-                page_number=page_number,
-                section=section_path,
-                section_level=section_level,
-                element_type="paragraph",
-                parent_id=parent_id,
-                contains_table=False,
-                table_headers=None,
-            )]
-
-        sub_chunks = self.recursive_splitter.split_text(text)
-        return [
-            self._build_chunk(
-                text=sc,
-                document_id=document_id,
-                source_s3_key=source_s3_key,
-                page_number=page_number,
-                section=section_path,
-                section_level=section_level,
-                element_type="paragraph",
-                parent_id=parent_id,
-                contains_table=False,
-                table_headers=None,
-            )
-            for sc in sub_chunks
-        ]
-
-    def _build_chunk(
-        self,
-        text: str,
-        document_id: str,
-        source_s3_key: str,
-        page_number: int,
-        section: str,
-        section_level: int,
-        element_type: str,
-        parent_id: str,
-        contains_table: bool,
-        table_headers: Optional[List[str]],
-    ) -> Dict[str, Any]:
-        """Assemble a single chunk dict with metadata."""
-        return {
-            "chunk_id": "",  # filled later by _link_neighbors
-            "text": text.strip(),
-            "metadata": {
-                "document_id": document_id,
-                "source_s3_key": source_s3_key,
-                "page_number": page_number,
-                "section": section,
-                "section_level": section_level,
-                "element_type": element_type,
-                "parent_id": parent_id,
-                "prev_chunk_id": None,
-                "next_chunk_id": None,
-                "contains_table": contains_table,
-                "table_headers": table_headers,
-                "char_count": len(text),
-                "token_estimate": len(text) // 4,
-            },
-        }
-
-    @staticmethod
-    def _link_neighbors(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Assign chunk_ids and link prev/next references."""
-        document_id = chunks[0]["metadata"]["document_id"] if chunks else "doc"
-        for i, chunk in enumerate(chunks):
-            chunk["chunk_id"] = f"{document_id}_{i:04d}"
-            if i > 0:
-                chunk["metadata"]["prev_chunk_id"] = chunks[i - 1]["chunk_id"]
-            if i < len(chunks) - 1:
-                chunk["metadata"]["next_chunk_id"] = chunks[i + 1]["chunk_id"]
-        return chunks
-
-    @staticmethod
-    def _generate_chunking_log(
-        document_id: str, source_key: str, chunks: List[Dict[str, Any]]
-    ) -> str:
-        """Generate a human-readable log of the chunking operation."""
-        total = len(chunks)
-        tables = sum(1 for c in chunks if c["metadata"]["contains_table"])
-        avg_len = sum(c["metadata"]["char_count"] for c in chunks) // total if total else 0
-
-        lines = [
-            "=" * 70,
-            f"CHUNKING LOG: {document_id}",
-            "=" * 70,
-            f"Source         : {source_key}",
-            f"Total chunks   : {total}",
-            f"Table chunks   : {tables}",
-            f"Text chunks    : {total - tables}",
-            f"Avg chars/chunk: {avg_len}",
-            f"Target size    : {config.CHUNK_SIZE_TOKENS} tokens (~{config.CHUNK_SIZE_CHARS} chars)",
-            "-" * 70,
-        ]
-        for c in chunks:
-            m = c["metadata"]
-            t = "[TBL]" if m["contains_table"] else "[TXT]"
-            lines.append(
-                f"{c['chunk_id']} {t} page={m['page_number']} "
-                f"chars={m['char_count']} section="{m['section']}""
-            )
-        lines.append("=" * 70)
-        return "\n".join(lines)
-
-
-# ------------------------------------------------------------------
-# Standalone helper for batch chunking
-# ------------------------------------------------------------------
-
-def run_chunking_pipeline(md_s3_prefix: Optional[str] = None):
-    """
-    Discover all .md files under the Textract output prefix, chunk each,
-    and save .jsonl + logs to S3.
-    """
-    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
-    engine = ChunkingEngine()
-
-    prefix = md_s3_prefix or config.S3_TEXTRACT_OUTPUT_PREFIX
-    md_keys = [
-        k for k in s3.list_objects(prefix=prefix)
-        if k.endswith(".md")
-    ]
-
-    logger.info(f"Found {len(md_keys)} Markdown files to chunk under {prefix}")
-    results = []
-
-    for md_key in md_keys:
-        try:
-            chunks, log = engine.chunk_document_from_s3(md_key)
-            doc_name = Path(md_key).stem
-            jsonl_key = engine.save_chunks_to_s3(chunks, doc_name, log=log)
-            results.append((md_key, True, jsonl_key))
-        except Exception as e:
-            logger.error(f"Chunking failed for {md_key}: {e}")
-            results.append((md_key, False, str(e)))
-
-    # Save batch report
-    report_lines = ["CHUNKING BATCH REPORT", "=" * 70]
-    for mk, ok, msg in results:
-        status = "PASS" if ok else "FAIL"
-        report_lines.append(f"[{status}] {Path(mk).name} → {msg}")
-    report = "\n".join(report_lines)
-
-    report_key = f"{config.S3_LOGS_PREFIX}chunking_batch_report_{int(time.time())}.txt"
-    s3.put_string(report_key, report)
-    logger.info(f"Batch report saved to {report_key}")
-    return results
-######################
-"""
-Centralized configuration for the Textract RAG pipeline.
-Loads environment variables and defines S3 paths, chunking, and Lambda settings.
-"""
-
-import os
-from typing import List
-
-
-class Config:
-    """Centralized configuration for the Textract RAG pipeline."""
-
-    # ── AWS ──────────────────────────────────────────────────────
-    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "bankrupcy-data-bkt")
-
-    # ── S3 Paths ─────────────────────────────────────────────────
-    S3_SOURCE_PREFIX: str = os.getenv(
-        "S3_SOURCE_PREFIX", "ecmc_org/RAG/Source_data/"
-    )
-    S3_TEXTRACT_OUTPUT_PREFIX: str = os.getenv(
-        "S3_TEXTRACT_OUTPUT_PREFIX", "ecmc_org/RAG/textract-output/"
-    )
-    S3_CHUNKING_OUTPUT_PREFIX: str = os.getenv(
-        "S3_CHUNKING_OUTPUT_PREFIX", "ecmc_org/RAG/chunking/"
-    )
-    S3_LOGS_PREFIX: str = os.getenv(
-        "S3_LOGS_PREFIX", "ecmc_org/RAG/logs/"
-    )
-
-    # ── Textract ─────────────────────────────────────────────────
-    TEXTRACT_FEATURES: List[str] = ["TABLES", "FORMS", "LAYOUT"]
-    SUPPORTED_EXTENSIONS: tuple = (".pdf", ".png", ".jpg", ".jpeg", ".tiff")
-    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "60"))
-    POLL_INTERVAL_SEC: int = int(os.getenv("POLL_INTERVAL_SEC", "5"))
-
-    # ── Output from Textract (both saved; chunking picks one) ────
-    OUTPUT_FORMATS: List[str] = ["md", "txt"]
-
-    # ── Chunking ─────────────────────────────────────────────────
-    # Input format for the chunking engine (always use md for structure-aware)
-    CHUNKING_INPUT_FORMAT: str = os.getenv("CHUNKING_INPUT_FORMAT", "md")
-
-    # Token-based sizing (industry standard for embedding models)
-    CHUNK_SIZE_TOKENS: int = int(os.getenv("CHUNK_SIZE_TOKENS", "512"))
-    CHUNK_OVERLAP_TOKENS: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "128"))
-
-    # Table chunking
-    MAX_TABLE_CHUNK_ROWS: int = int(os.getenv("MAX_TABLE_CHUNK_ROWS", "20"))
-
-    # Rough character estimates (1 token ≈ 4 chars for English)
-    @property
-    def CHUNK_SIZE_CHARS(self) -> int:
-        return self.CHUNK_SIZE_TOKENS * 4
-
-    @property
-    def CHUNK_OVERLAP_CHARS(self) -> int:
-        return self.CHUNK_OVERLAP_TOKENS * 4
-
-    # ── Metadata fields preserved per chunk ──────────────────────
-    CHUNK_METADATA_FIELDS: List[str] = [
-        "chunk_id",
-        "document_id",
-        "source_s3_key",
-        "page_number",
-        "section",
-        "section_level",
-        "element_type",
-        "parent_id",
-        "prev_chunk_id",
-        "next_chunk_id",
-        "contains_table",
-        "table_headers",
-        "char_count",
-        "token_estimate",
-    ]
-
-    # ── Lambda / Deployment ──────────────────────────────────────
-    LAMBDA_TIMEOUT_SEC: int = int(os.getenv("LAMBDA_TIMEOUT_SEC", "900"))
-    LAMBDA_MEMORY_MB: int = int(os.getenv("LAMBDA_MEMORY_MB", "3008"))
-
-################
-
-"""
-Reusable utilities for S3, Textract, logging, and document processing.
-Production-grade with proper reading order, paragraph grouping,
-heading detection, robust table parsing, and Markdown page markers.
-"""
-
-import logging
-from typing import Dict, List, Optional, Any, Tuple, Set
-from dataclasses import dataclass, field, asdict
-from collections import defaultdict
-
-import boto3
-from botocore.exceptions import ClientError, BotoCoreError
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Dataclasses for structured output
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TextElement:
-    """Represents a single text element with metadata."""
-    text: str
-    block_type: str
-    page: int
-    confidence: float
-    bbox: Dict[str, float]
-    block_id: str
-    is_heading: bool = False
-    heading_level: int = 0
-
-
-@dataclass
-class TableCell:
-    """Represents a table cell."""
-    text: str
-    row_index: int
-    column_index: int
-    row_span: int = 1
-    column_span: int = 1
-    is_header: bool = False
-    confidence: float = 0.0
-
-
-@dataclass
-class TableElement:
-    """Represents a parsed table."""
-    cells: List[TableCell] = field(default_factory=list)
-    page: int = 1
-    bbox: Dict[str, float] = field(default_factory=dict)
-    block_id: str = ""
-    column_count: int = 0
-
-
-@dataclass
-class ParsedDocument:
-    """Structured document output."""
-    elements: List[Any] = field(default_factory=list)
-    plain_text: str = ""
-    markdown_text: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize to a plain dict (JSON-friendly)."""
-        return {
-            "metadata": self.metadata,
-            "plain_text": self.plain_text,
-            "markdown_text": self.markdown_text,
-            "elements": [
-                {
-                    "type": type(e).__name__,
-                    **asdict(e),
-                }
-                for e in self.elements
-            ],
-        }
-
-
-# ---------------------------------------------------------------------------
-# S3 Manager
-# ---------------------------------------------------------------------------
-
-class S3Manager:
-    """Handles all S3 operations (upload, download, list, validate, put_string)."""
-
-    def __init__(self, bucket_name: str, region: str = "us-east-1"):
-        self.bucket_name = bucket_name
-        self.s3_client = boto3.client("s3", region_name=region)
-
-    def upload_file(
-        self,
-        local_file_path: str,
-        s3_key: str,
-        extra_args: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        try:
-            self.s3_client.upload_file(
-                local_file_path,
-                self.bucket_name,
-                s3_key,
-                ExtraArgs=extra_args or {},
-            )
-            logger.info(f"Uploaded {local_file_path} → s3://{self.bucket_name}/{s3_key}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to upload {local_file_path}: {e}")
-            return False
-
-    def download_file(self, s3_key: str, local_file_path: str) -> bool:
-        try:
-            self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
-            logger.info(f"Downloaded s3://{self.bucket_name}/{s3_key} → {local_file_path}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to download {s3_key}: {e}")
-            return False
-
-    def put_string(self, s3_key: str, content: str, content_type: str = "text/plain; charset=utf-8") -> bool:
-        """Save a string directly to S3."""
-        try:
-            self.s3_client.put_object(
-                Bucket=self.bucket_name,
-                Key=s3_key,
-                Body=content.encode("utf-8"),
-                ContentType=content_type,
-            )
-            logger.info(f"Saved string → s3://{self.bucket_name}/{s3_key}")
-            return True
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to save string to {s3_key}: {e}")
-            return False
-
-    def get_string(self, s3_key: str) -> Optional[str]:
-        """Read a string directly from S3."""
-        try:
-            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
-            return response["Body"].read().decode("utf-8")
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to read string from {s3_key}: {e}")
-            return None
-
-    def list_objects(self, prefix: str = "") -> List[str]:
-        try:
-            paginator = self.s3_client.get_paginator("list_objects_v2")
-            objects = []
-            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
-                objects.extend([obj["Key"] for obj in page.get("Contents", [])])
-            return objects
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to list objects: {e}")
-            return []
-
-    def validate_path(self, s3_key: str) -> bool:
-        try:
-            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
-            return True
-        except (ClientError, BotoCoreError):
-            return False
-
-
-# ---------------------------------------------------------------------------
-# Textract Manager
-# ---------------------------------------------------------------------------
-
-class TextractManager:
-    """Handles Amazon Textract operations with enhanced post-processing."""
-
-    def __init__(self, region: str = "us-east-1"):
-        self.textract_client = boto3.client("textract", region_name=region)
-
-    def start_document_analysis(
-        self,
-        s3_bucket: str,
-        s3_key: str,
-        features: Optional[List[str]] = None,
-        notification_channel: Optional[Dict[str, str]] = None,
-    ) -> str:
-        """
-        Start a Textract document analysis job.
-
-        Args:
-            s3_bucket: S3 bucket name containing the document.
-            s3_key: S3 key of the document to analyze.
-            features: List of Textract features (FORMS, TABLES, LAYOUT).
-            notification_channel: Optional SNS topic ARN for job completion.
-                Example: {"SNSTopicArn": "arn:aws:sns:...", "RoleArn": "arn:aws:iam::..."}
-
-        Returns:
-            str: Job ID for tracking.
-        """
-        features = features or ["TABLES", "FORMS", "LAYOUT"]
-        try:
-            kwargs = {
-                "DocumentLocation": {
-                    "S3Object": {"Bucket": s3_bucket, "Name": s3_key}
-                },
-                "FeatureTypes": features,
-            }
-            if notification_channel:
-                kwargs["NotificationChannel"] = notification_channel
-
-            response = self.textract_client.start_document_analysis(**kwargs)
-            job_id = response["JobId"]
-            logger.info(f"Started Textract job {job_id} for s3://{s3_bucket}/{s3_key}")
-            return job_id
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to start Textract job for {s3_key}: {e}")
-            raise
-
-    def get_job_status(self, job_id: str) -> str:
-        try:
-            response = self.textract_client.get_document_analysis(JobId=job_id)
-            return response["JobStatus"]
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to get job status for {job_id}: {e}")
-            raise
-
-    def wait_for_job_completion(
-        self, job_id: str, max_retries: int = 60, sleep_sec: int = 5
-    ) -> bool:
-        import time
-        for attempt in range(max_retries):
-            status = self.get_job_status(job_id)
-            if status == "SUCCEEDED":
-                logger.info(f"Textract job {job_id} succeeded.")
-                return True
-            elif status == "FAILED":
-                logger.error(f"Textract job {job_id} failed.")
-                return False
-            logger.info(f"Job {job_id} status: {status}. Retry {attempt + 1}/{max_retries}...")
-            time.sleep(sleep_sec)
-        logger.error(f"Textract job {job_id} timed out after {max_retries} retries.")
-        return False
-
-    def get_job_results(self, job_id: str) -> List[Dict[str, Any]]:
-        """Retrieve ALL results from a completed Textract job with pagination."""
-        blocks = []
-        next_token = None
-        try:
-            while True:
-                kwargs = {"JobId": job_id}
-                if next_token:
-                    kwargs["NextToken"] = next_token
-                response = self.textract_client.get_document_analysis(**kwargs)
-                blocks.extend(response.get("Blocks", []))
-                next_token = response.get("NextToken")
-                if not next_token:
-                    break
-            logger.info(f"Retrieved {len(blocks)} blocks for job {job_id}")
-            return blocks
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"Failed to get results for job {job_id}: {e}")
-            raise
-
-    # -----------------------------------------------------------------------
-    # Enhanced Post-Processing
-    # -----------------------------------------------------------------------
-
-    def parse_document(self, blocks: List[Dict[str, Any]], document_id: str = "") -> ParsedDocument:
-        """
-        Parse Textract blocks into a structured document with proper reading order,
-        paragraph grouping, heading detection, and table reconstruction.
-        """
-        block_map = {b["Id"]: b for b in blocks}
-        blocks_by_page = defaultdict(list)
-        for block in blocks:
-            page = block.get("Page", 1)
-            blocks_by_page[page].append(block)
-
-        elements = []
-        for page_num in sorted(blocks_by_page.keys()):
-            page_blocks_list = blocks_by_page[page_num]
-            lines = [b for b in page_blocks_list if b["BlockType"] == "LINE"]
-            tables = [b for b in page_blocks_list if b["BlockType"] == "TABLE"]
-
-            ordered_lines = self._reconstruct_reading_order(lines)
-            heading_ids = self._detect_headings(ordered_lines)
-            paragraphs = self._group_paragraphs(ordered_lines, heading_ids)
-
-            table_elements = []
-            for table_block in tables:
-                table_elem = self._parse_table_enhanced(table_block, block_map)
-                table_elem.page = page_num
-                table_elements.append(table_elem)
-
-            page_elements = self._merge_elements(paragraphs, table_elements, page_num)
-            elements.extend(page_elements)
-
-        plain_text = self._generate_plain_text(elements)
-        markdown_text = self._generate_markdown(elements, document_id=document_id)
-
-        metadata = {
-            "document_id": document_id,
-            "total_pages": max(blocks_by_page.keys()) if blocks_by_page else 0,
-            "total_blocks": len(blocks),
-            "total_lines": len([b for b in blocks if b["BlockType"] == "LINE"]),
-            "total_tables": len([b for b in blocks if b["BlockType"] == "TABLE"]),
-        }
-
-        return ParsedDocument(
-            elements=elements,
-            plain_text=plain_text,
-            markdown_text=markdown_text,
-            metadata=metadata,
-        )
-
-    def _reconstruct_reading_order(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not lines:
-            return []
-        lines_sorted = sorted(
-            lines,
-            key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0),
-        )
-        bands = []
-        current_band = [lines_sorted[0]]
-        band_threshold = 0.02
-
-        for line in lines_sorted[1:]:
-            prev_top = current_band[-1].get("Geometry", {}).get("BoundingBox", {}).get("Top", 0)
-            curr_top = line.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0)
-            if abs(curr_top - prev_top) <= band_threshold:
-                current_band.append(line)
-            else:
-                bands.append(
-                    sorted(current_band, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0))
-                )
-                current_band = [line]
-        if current_band:
-            bands.append(
-                sorted(current_band, key=lambda x: x.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0))
-            )
-
-        ordered = []
-        for band in bands:
-            ordered.extend(band)
-        return ordered
-
-    def _detect_headings(self, lines: List[Dict[str, Any]]) -> Set[str]:
-        heading_ids = set()
-        if not lines:
-            return heading_ids
-
-        heights = []
-        for line in lines:
-            bbox = line.get("Geometry", {}).get("BoundingBox", {})
-            heights.append(bbox.get("Height", 0))
-        avg_height = sum(heights) / len(heights) if heights else 0.01
-
-        for i, line in enumerate(lines):
-            text = line.get("Text", "").strip()
-            if not text:
-                continue
-            bbox = line.get("Geometry", {}).get("BoundingBox", {})
-            height = bbox.get("Height", 0)
-
-            is_short = len(text) < 100
-            is_tall = height > avg_height * 1.3
-            is_all_caps = text.isupper() and len(text) > 3
-            is_title_case = text.istitle() and len(text.split()) <= 10
-
-            is_prominent = False
-            if i == 0:
-                is_prominent = True
-            elif i > 0:
-                prev_bbox = lines[i - 1].get("Geometry", {}).get("BoundingBox", {})
-                curr_top = bbox.get("Top", 0)
-                prev_bottom = prev_bbox.get("Top", 0) + prev_bbox.get("Height", 0)
-                if curr_top - prev_bottom > avg_height * 2:
-                    is_prominent = True
-
-            score = sum([is_short, is_tall, is_all_caps, is_title_case, is_prominent])
-            if score >= 3 or (is_all_caps and is_short) or (is_tall and is_prominent):
-                heading_ids.add(line["Id"])
-        return heading_ids
-
-    def _group_paragraphs(
-        self, lines: List[Dict[str, Any]], heading_ids: Set[str]
-    ) -> List[TextElement]:
-        if not lines:
-            return []
-
-        paragraphs = []
-        current_para_lines = [lines[0]]
-
-        for i in range(1, len(lines)):
-            prev_line = lines[i - 1]
-            curr_line = lines[i]
-
-            prev_bbox = prev_line.get("Geometry", {}).get("BoundingBox", {})
-            curr_bbox = curr_line.get("Geometry", {}).get("BoundingBox", {})
-
-            prev_bottom = prev_bbox.get("Top", 0) + prev_bbox.get("Height", 0)
-            curr_top = curr_bbox.get("Top", 0)
-            vertical_gap = curr_top - prev_bottom
-
-            prev_left = prev_bbox.get("Left", 0)
-            curr_left = curr_bbox.get("Left", 0)
-            horizontal_diff = abs(curr_left - prev_left)
-
-            line_height = prev_bbox.get("Height", 0.01)
-            para_gap_threshold = line_height * 1.8
-
-            is_new_para = (
-                vertical_gap > para_gap_threshold or horizontal_diff > 0.05
-            )
-
-            # Also break if current line is a heading
-            if curr_line["Id"] in heading_ids:
-                is_new_para = True
-
-            if is_new_para:
-                para_text = " ".join(l.get("Text", "") for l in current_para_lines)
-                first_line = current_para_lines[0]
-                bbox = first_line.get("Geometry", {}).get("BoundingBox", {})
-                is_heading = first_line["Id"] in heading_ids
-
-                paragraphs.append(TextElement(
-                    text=para_text,
-                    block_type="HEADING" if is_heading else "PARAGRAPH",
-                    page=first_line.get("Page", 1),
-                    confidence=min(l.get("Confidence", 99) for l in current_para_lines),
-                    bbox=bbox,
-                    block_id=first_line["Id"],
-                    is_heading=is_heading,
-                    heading_level=1 if is_heading else 0,
-                ))
-                current_para_lines = [curr_line]
-            else:
-                current_para_lines.append(curr_line)
-
-        if current_para_lines:
-            para_text = " ".join(l.get("Text", "") for l in current_para_lines)
-            first_line = current_para_lines[0]
-            bbox = first_line.get("Geometry", {}).get("BoundingBox", {})
-            is_heading = first_line["Id"] in heading_ids
-            paragraphs.append(TextElement(
-                text=para_text,
-                block_type="HEADING" if is_heading else "PARAGRAPH",
-                page=first_line.get("Page", 1),
-                confidence=min(l.get("Confidence", 99) for l in current_para_lines),
-                bbox=bbox,
-                block_id=first_line["Id"],
-                is_heading=is_heading,
-                heading_level=1 if is_heading else 0,
-            ))
-
-        return paragraphs
-
-    def _parse_table_enhanced(
-        self, table_block: Dict[str, Any], block_map: Dict[str, Dict[str, Any]]
-    ) -> TableElement:
-        cells = []
-        cell_blocks = []
-        for rel in table_block.get("Relationships", []):
-            if rel["Type"] == "CHILD":
-                for cell_id in rel["Ids"]:
-                    cell = block_map.get(cell_id)
-                    if cell and cell["BlockType"] == "CELL":
-                        cell_blocks.append(cell)
-
-        max_col = 0
-        for cell in cell_blocks:
-            row_idx = cell.get("RowIndex", 0)
-            col_idx = cell.get("ColumnIndex", 0)
-            row_span = cell.get("RowSpan", 1)
-            col_span = cell.get("ColumnSpan", 1)
-
-            cell_texts = []
-            for rel in cell.get("Relationships", []):
-                if rel["Type"] == "CHILD":
-                    for child_id in rel["Ids"]:
-                        child = block_map.get(child_id)
-                        if child and child["BlockType"] in ("WORD", "LINE", "SELECTION_ELEMENT"):
-                            if child["BlockType"] == "SELECTION_ELEMENT":
-                                status = "[x]" if child.get("SelectionStatus") == "SELECTED" else "[ ]"
-                                cell_texts.append(status)
-                            else:
-                                cell_texts.append(child.get("Text", ""))
-
-            text = " ".join(cell_texts).strip()
-            max_col = max(max_col, col_idx + col_span - 1)
-            is_header = row_idx == 1
-
-            cells.append(TableCell(
-                text=text,
-                row_index=row_idx,
-                column_index=col_idx,
-                row_span=row_span,
-                column_span=col_span,
-                is_header=is_header,
-                confidence=cell.get("Confidence", 0),
-            ))
-
-        return TableElement(
-            cells=cells,
-            page=table_block.get("Page", 1),
-            bbox=table_block.get("Geometry", {}).get("BoundingBox", {}),
-            block_id=table_block["Id"],
-            column_count=max_col,
-        )
-
-    def _merge_elements(
-        self, paragraphs: List[TextElement], tables: List[TableElement], page_num: int
-    ) -> List[Any]:
-        all_elements = []
-        for para in paragraphs:
-            all_elements.append(("paragraph", para.bbox.get("Top", 0), para))
-        for table in tables:
-            all_elements.append(("table", table.bbox.get("Top", 0), table))
-        all_elements.sort(key=lambda x: x[1])
-        return [elem for _, _, elem in all_elements]
-
-    def _generate_plain_text(self, elements: List[Any]) -> str:
-        parts = []
-        for elem in elements:
-            if isinstance(elem, TextElement):
-                parts.append(elem.text)
-            elif isinstance(elem, TableElement):
-                parts.append("[TABLE]")
-        return "\n\n".join(parts)
-
-    def _generate_markdown(self, elements: List[Any], document_id: str = "") -> str:
-        """Generate Markdown with YAML frontmatter and HTML page markers."""
-        lines = []
-        # YAML frontmatter
-        lines.append("---")
-        lines.append(f'document_id: "{document_id}"')
-        lines.append(f"total_pages: {max((e.page for e in elements if hasattr(e, 'page')), default=0)}")
-        lines.append("---")
-        lines.append("")
-
-        current_page = 0
-        for elem in elements:
-            page = getattr(elem, "page", 1)
-            if page != current_page:
-                lines.append(f"<!-- page: {page} -->")
-                current_page = page
-
-            if isinstance(elem, TextElement):
-                if elem.is_heading:
-                    level = min(elem.heading_level + 1, 6)  # # or ##
-                    lines.append(f"{'#' * level} {elem.text}")
-                else:
-                    lines.append(elem.text)
-            elif isinstance(elem, TableElement):
-                lines.append(self._table_to_markdown(elem))
-            lines.append("")
-
-        return "\n".join(lines)
-
-    def _table_to_markdown(self, table: TableElement) -> str:
-        if not table.cells:
-            return ""
-        rows = defaultdict(list)
-        for cell in table.cells:
-            rows[cell.row_index].append(cell)
-
-        md_lines = []
-        for row_idx in sorted(rows.keys()):
-            row_cells = sorted(rows[row_idx], key=lambda c: c.column_index)
-            cell_texts = [c.text.replace("|", "\|").replace("\n", " ") for c in row_cells]
-            md_lines.append("| " + " | ".join(cell_texts) + " |")
-            if row_idx == 1:
-                md_lines.append("|" + "|".join([" --- "] * len(row_cells)) + "|")
-        return "\n".join(md_lines)
-
-    @staticmethod
-    def parse_blocks(blocks: List[Dict[str, Any]]) -> Tuple[str, str]:
-        manager = TextractManager()
-        doc = manager.parse_document(blocks)
-        return doc.plain_text, doc.markdown_text
-
-#####################################
-"""
-Main pipeline: Discover all documents in S3, run Textract analysis,
-post-process with enhanced parsing, and save structured outputs back to S3.
-Supports both sequential and parallel execution.
-"""
-
-import json
-import logging
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import List, Optional, Tuple
-
-from botocore.exceptions import ClientError, BotoCoreError
-
-from config import config
-from utility import S3Manager, TextractManager, ParsedDocument
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
-class TextractPipeline:
-    """End-to-end pipeline for batch Textract processing."""
-
-    def __init__(self):
-        self.s3 = S3Manager(
-            bucket_name=config.S3_BUCKET_NAME,
-            region=config.AWS_REGION,
-        )
-        self.textract = TextractManager(region=config.AWS_REGION)
-
-    def discover_documents(self, prefix: Optional[str] = None) -> List[str]:
-        """List all supported documents under the source S3 prefix."""
-        prefix = prefix or config.S3_SOURCE_PREFIX
-        all_keys = self.s3.list_objects(prefix=prefix)
-        docs = [
-            key for key in all_keys
-            if key.lower().endswith(config.SUPPORTED_EXTENSIONS)
-        ]
-        logger.info(f"Discovered {len(docs)} documents under {prefix}")
-        return docs
-
-    def process_single_document(self, s3_key: str) -> Tuple[str, bool, str]:
-        """
-        Process one document: Textract → parse → save .md, .txt, .json outputs.
-
-        Returns:
-            Tuple of (s3_key, success: bool, message: str).
-        """
-        doc_name = Path(s3_key).stem
-        logger.info(f"Processing: {s3_key}")
-
-        try:
-            # 1. Start Textract job
-            job_id = self.textract.start_document_analysis(
-                s3_bucket=config.S3_BUCKET_NAME,
-                s3_key=s3_key,
-                features=config.TEXTRACT_FEATURES,
-            )
-
-            # 2. Wait for completion
-            success = self.textract.wait_for_job_completion(
-                job_id=job_id,
-                max_retries=config.MAX_RETRIES,
-                sleep_sec=config.POLL_INTERVAL_SEC,
-            )
-            if not success:
-                return s3_key, False, f"Textract job {job_id} failed or timed out"
-
-            # 3. Retrieve and parse blocks
-            blocks = self.textract.get_job_results(job_id=job_id)
-            parsed: ParsedDocument = self.textract.parse_document(
-                blocks, document_id=doc_name
-            )
-
-            # 4. Save outputs to S3
-            base_output_key = f"{config.S3_TEXTRACT_OUTPUT_PREFIX}{doc_name}"
-            saved = []
-
-            # 4a. Structured JSON (full document with elements + metadata)
-            json_key = f"{base_output_key}.json"
-            self.s3.put_string(
-                json_key,
-                json.dumps(parsed.to_dict(), indent=2, ensure_ascii=False),
-                content_type="application/json",
-            )
-            saved.append(json_key)
-
-            # 4b. Markdown (with YAML frontmatter + page markers)
-            if "md" in config.OUTPUT_FORMATS:
-                md_key = f"{base_output_key}.md"
-                self.s3.put_string(
-                    md_key,
-                    parsed.markdown_text,
-                    content_type="text/markdown; charset=utf-8",
-                )
-                saved.append(md_key)
-
-            # 4c. Plain text
-            if "txt" in config.OUTPUT_FORMATS:
-                txt_key = f"{base_output_key}.txt"
-                self.s3.put_string(
-                    txt_key,
-                    parsed.plain_text,
-                    content_type="text/plain; charset=utf-8",
-                )
-                saved.append(txt_key)
-
-            logger.info(f"Saved {len(saved)} outputs for {doc_name}")
-            return s3_key, True, f"OK → {saved}"
-
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"AWS error processing {s3_key}: {e}")
-            return s3_key, False, str(e)
-        except Exception as e:
-            logger.error(f"Unexpected error processing {s3_key}: {e}")
-            return s3_key, False, str(e)
-
-    def run_sequential(self, prefix: Optional[str] = None) -> List[Tuple[str, bool, str]]:
-        """Process all documents one by one."""
-        docs = self.discover_documents(prefix)
-        results = []
-        for doc in docs:
-            result = self.process_single_document(doc)
-            results.append(result)
-        return results
-
-    def run_parallel(
-        self, prefix: Optional[str] = None, max_workers: Optional[int] = None
-    ) -> List[Tuple[str, bool, str]]:
-        """Process documents in parallel using ThreadPoolExecutor."""
-        docs = self.discover_documents(prefix)
-        max_workers = max_workers or 3  # Conservative for Textract quotas
-        results = []
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_doc = {
-                executor.submit(self.process_single_document, doc): doc
-                for doc in docs
-            }
-            for future in as_completed(future_to_doc):
-                doc = future_to_doc[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    logger.error(f"Exception for {doc}: {e}")
-                    result = (doc, False, str(e))
-                results.append(result)
-
-        return results
-
-    def generate_report(self, results: List[Tuple[str, bool, str]]) -> str:
-        """Generate a simple processing report and save to S3."""
-        total = len(results)
-        success = sum(1 for _, ok, _ in results if ok)
-        failed = total - success
-
-        lines = [
-            "=" * 70,
-            "TEXTRACT BATCH PROCESSING REPORT",
-            "=" * 70,
-            f"Total documents : {total}",
-            f"Successful      : {success}",
-            f"Failed          : {failed}",
-            f"Success rate    : {success / total * 100:.1f}%" if total else "N/A",
-            "-" * 70,
-        ]
-
-        for s3_key, ok, msg in results:
-            status = "PASS" if ok else "FAIL"
-            lines.append(f"[{status}] {Path(s3_key).name:<45} {msg}")
-
-        lines.append("=" * 70)
-        report = "\n".join(lines)
-        logger.info("\n" + report)
-
-        report_key = f"{config.S3_LOGS_PREFIX}textract_report_{int(time.time())}.txt"
-        self.s3.put_string(report_key, report)
-        return report
-
-
-def main():
-    """CLI / Notebook entry point."""
-    pipeline = TextractPipeline()
-    results = pipeline.run_sequential()
-    pipeline.generate_report(results)
-
-
-if __name__ == "__main__":
-    main()
-
-###############################
-"""
-Main pipeline: Discover all documents in S3, run Textract analysis,
-post-process with enhanced parsing, and save structured outputs back to S3.
-Supports both sequential and parallel execution.
-"""
-
-import json
-import logging
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import List, Optional, Tuple
-
-from botocore.exceptions import ClientError, BotoCoreError
-
-from config import config
-from utility import S3Manager, TextractManager, ParsedDocument
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
-class TextractPipeline:
-    """End-to-end pipeline for batch Textract processing."""
-
-    def __init__(self):
-        self.s3 = S3Manager(
-            bucket_name=config.S3_BUCKET_NAME,
-            region=config.AWS_REGION,
-        )
-        self.textract = TextractManager(region=config.AWS_REGION)
-
-    def discover_documents(self, prefix: Optional[str] = None) -> List[str]:
-        """List all supported documents under the source S3 prefix."""
-        prefix = prefix or config.S3_SOURCE_PREFIX
-        all_keys = self.s3.list_objects(prefix=prefix)
-        docs = [
-            key for key in all_keys
-            if key.lower().endswith(config.SUPPORTED_EXTENSIONS)
-        ]
-        logger.info(f"Discovered {len(docs)} documents under {prefix}")
-        return docs
-
-    def process_single_document(self, s3_key: str) -> Tuple[str, bool, str]:
-        """
-        Process one document: Textract → parse → save .md, .txt, .json outputs.
-
-        Returns:
-            Tuple of (s3_key, success: bool, message: str).
-        """
-        doc_name = Path(s3_key).stem
-        logger.info(f"Processing: {s3_key}")
-
-        try:
-            # 1. Start Textract job
-            job_id = self.textract.start_document_analysis(
-                s3_bucket=config.S3_BUCKET_NAME,
-                s3_key=s3_key,
-                features=config.TEXTRACT_FEATURES,
-            )
-
-            # 2. Wait for completion
-            success = self.textract.wait_for_job_completion(
-                job_id=job_id,
-                max_retries=config.MAX_RETRIES,
-                sleep_sec=config.POLL_INTERVAL_SEC,
-            )
-            if not success:
-                return s3_key, False, f"Textract job {job_id} failed or timed out"
-
-            # 3. Retrieve and parse blocks
-            blocks = self.textract.get_job_results(job_id=job_id)
-            parsed: ParsedDocument = self.textract.parse_document(
-                blocks, document_id=doc_name
-            )
-
-            # 4. Save outputs to S3
-            base_output_key = f"{config.S3_TEXTRACT_OUTPUT_PREFIX}{doc_name}"
-            saved = []
-
-            # 4a. Structured JSON (full document with elements + metadata)
-            json_key = f"{base_output_key}.json"
-            self.s3.put_string(
-                json_key,
-                json.dumps(parsed.to_dict(), indent=2, ensure_ascii=False),
-                content_type="application/json",
-            )
-            saved.append(json_key)
-
-            # 4b. Markdown (with YAML frontmatter + page markers)
-            if "md" in config.OUTPUT_FORMATS:
-                md_key = f"{base_output_key}.md"
-                self.s3.put_string(
-                    md_key,
-                    parsed.markdown_text,
-                    content_type="text/markdown; charset=utf-8",
-                )
-                saved.append(md_key)
-
-            # 4c. Plain text
-            if "txt" in config.OUTPUT_FORMATS:
-                txt_key = f"{base_output_key}.txt"
-                self.s3.put_string(
-                    txt_key,
-                    parsed.plain_text,
-                    content_type="text/plain; charset=utf-8",
-                )
-                saved.append(txt_key)
-
-            logger.info(f"Saved {len(saved)} outputs for {doc_name}")
-            return s3_key, True, f"OK → {saved}"
-
-        except (ClientError, BotoCoreError) as e:
-            logger.error(f"AWS error processing {s3_key}: {e}")
-            return s3_key, False, str(e)
-        except Exception as e:
-            logger.error(f"Unexpected error processing {s3_key}: {e}")
-            return s3_key, False, str(e)
-
-    def run_sequential(self, prefix: Optional[str] = None) -> List[Tuple[str, bool, str]]:
-        """Process all documents one by one."""
-        docs = self.discover_documents(prefix)
-        results = []
-        for doc in docs:
-            result = self.process_single_document(doc)
-            results.append(result)
-        return results
-
-    def run_parallel(
-        self, prefix: Optional[str] = None, max_workers: Optional[int] = None
-    ) -> List[Tuple[str, bool, str]]:
-        """Process documents in parallel using ThreadPoolExecutor."""
-        docs = self.discover_documents(prefix)
-        max_workers = max_workers or 3  # Conservative for Textract quotas
-        results = []
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_doc = {
-                executor.submit(self.process_single_document, doc): doc
-                for doc in docs
-            }
-            for future in as_completed(future_to_doc):
-                doc = future_to_doc[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    logger.error(f"Exception for {doc}: {e}")
-                    result = (doc, False, str(e))
-                results.append(result)
-
-        return results
-
-    def generate_report(self, results: List[Tuple[str, bool, str]]) -> str:
-        """Generate a simple processing report and save to S3."""
-        total = len(results)
-        success = sum(1 for _, ok, _ in results if ok)
-        failed = total - success
-
-        lines = [
-            "=" * 70,
-            "TEXTRACT BATCH PROCESSING REPORT",
-            "=" * 70,
-            f"Total documents : {total}",
-            f"Successful      : {success}",
-            f"Failed          : {failed}",
-            f"Success rate    : {success / total * 100:.1f}%" if total else "N/A",
-            "-" * 70,
-        ]
-
-        for s3_key, ok, msg in results:
-            status = "PASS" if ok else "FAIL"
-            lines.append(f"[{status}] {Path(s3_key).name:<45} {msg}")
-
-        lines.append("=" * 70)
-        report = "\n".join(lines)
-        logger.info("\n" + report)
-
-        report_key = f"{config.S3_LOGS_PREFIX}textract_report_{int(time.time())}.txt"
-        self.s3.put_string(report_key, report)
-        return report
-
-
-def main():
-    """CLI / Notebook entry point."""
-    pipeline = TextractPipeline()
-    results = pipeline.run_sequential()
-    pipeline.generate_report(results)
-
-
-if __name__ == "__main__":
-    main()
-
-#########################
-# ── Core AWS SDK ──────────────────────────────────────────────
-boto3>=1.34.0
-botocore>=1.34.0
-
-# ── Text Splitting (chunking_engine.py) ───────────────────────
-langchain-text-splitters>=0.0.1
-
-# ── Environment variable loading (optional) ───────────────────
-python-dotenv>=1.0.0
-
-# ── Future / Optional ─────────────────────────────────────────
-# tiktoken>=0.6.0          # Exact OpenAI token counting (optional)
-# unstructured>=0.12.0     # Advanced PDF parsing (if needed later)
-# docling>=1.0.0           # Alternative to Textract (if needed later)
+# → Saves to embeddings/, vectorstore/, and logs/ automatically
