@@ -1,3 +1,18 @@
+from faiss_vector_store import FAISSVectorStore
+from retrieval_engine import RetrievalEngine
+
+store = FAISSVectorStore()
+store.load_from_s3("ecmc_index")
+retriever = RetrievalEngine(vector_store=store)
+
+for q in ["what is a t4 letter?", "i want to consolidate"]:
+    result = retriever.retrieve(q, top_k=5)
+    print(f"\n{'='*50}")
+    print(f"Query: {q}")
+    print(f"Chunks found: {result['total_chunks']}")
+    for c in result["chunks"]:
+        print(f"  → {c['chunk_id']} | score={c.get('score',0):.3f} | {c['text'][:80]}...")
+
 ## retrieval_engine.py
 """
 Retrieval engine for RAG pipeline.
