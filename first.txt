@@ -1,4 +1,603 @@
 """
+ECMC PDF Hierarchy Extraction — Page Number Resolution
+Changes:
+  1. Nova Lite now extracts printed page numbers from page images
+  2. If printed page number found -> use it; else -> fallback to sequential counter
+  3. Excel/Tree show resolved page numbers (document-accurate)
+"""
+
+import os
+import json
+import re
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime
+
+import boto3
+from botocore.exceptions import ClientError
+from pdf2image import convert_from_path
+import openpyxl
+from openpyxl.styles import Font, Alignment, PatternFill
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+POPPLER_PATH = Path(r"D:\Users\ntrinadh\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin")
+
+INPUT_DIR = Path(r"D:\Users\ntrinadh\OneDrive - ECMC group, Inc\Documents\Ecmc\all documents")
+OUTPUT_DIR = INPUT_DIR / "output"
+TEMP_IMAGE_DIR = OUTPUT_DIR / "temp_images"
+PASS1_DIR = OUTPUT_DIR / "pass1_metadata"
+FINAL_TREE_FILE = OUTPUT_DIR / "hierarchy_tree.txt"
+FINAL_EXCEL_FILE = OUTPUT_DIR / "section_inventory.xlsx"
+
+AWS_REGION = "us-east-1"
+MODEL_ID = "us.amazon.nova-2-lite-v1:0"
+
+DPI = 200
+MAX_PAGES_PER_BATCH = 2
+
+ROOT_WEBSITE = "Website"
+ROOT_ONENOTE = "OneNote"
+
+
+# =============================================================================
+# DATA SCHEMAS
+# =============================================================================
+
+@dataclass
+class PageMetadata:
+    page_number: int              # Sequential counter (1, 2, 3...)
+    printed_page_number: str      # What Nova reads from the image ("6", "Phone Guide Page 6", "")
+    generated_heading: str
+    subsection_title: str
+    section_summary: str
+    keywords: List[str]
+    keyphrases: List[str]
+    contains_table: bool
+    table_summary: str
+
+
+@dataclass
+class ConsolidatedSection:
+    title: str
+    summary: str
+    keywords: List[str]
+    keyphrases: List[str]
+    table_summary: str
+    start_page: int               # RESOLVED page number
+    end_page: int                 # RESOLVED page number
+
+
+@dataclass
+class DocumentResult:
+    root_node: str
+    file_name: str
+    file_path: Path
+    sections: List[ConsolidatedSection]
+
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+def classify_root_node(pdf_path: Path) -> str:
+    if "onenote" in str(pdf_path).lower():
+        return ROOT_ONENOTE
+    return ROOT_WEBSITE
+
+
+def clean_json_response(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    text = re.sub(r",\s*(\]|\})", r"\1", text)
+    return text
+
+
+def ensure_dirs():
+    for d in [OUTPUT_DIR, TEMP_IMAGE_DIR, PASS1_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# PHASE 1: PDF TO IMAGE CONVERSION
+# =============================================================================
+
+def convert_pdf_to_images(pdf_path: Path, dpi: int = 200) -> Tuple[Path, List[Path]]:
+    pdf_stem = pdf_path.stem
+    image_folder = TEMP_IMAGE_DIR / f"{pdf_stem}_images"
+    image_folder.mkdir(parents=True, exist_ok=True)
+
+    for old in image_folder.glob("*.png"):
+        old.unlink()
+
+    pages = convert_from_path(
+        str(pdf_path),
+        dpi=dpi,
+        fmt="png",
+        poppler_path=str(POPPLER_PATH),
+        thread_count=os.cpu_count()
+    )
+
+    image_paths: List[Path] = []
+    for page_num, page in enumerate(pages, start=1):
+        image_name = f"{pdf_stem}_page_{page_num:04d}.png"
+        image_path = image_folder / image_name
+        page.save(str(image_path), "PNG")
+        image_paths.append(image_path)
+
+    print(f"[Phase 1] {pdf_stem}: {len(image_paths)} pages -> {image_folder}")
+    return image_folder, image_paths
+
+
+# =============================================================================
+# PHASE 2: PASS 1 — LLM WITH PRINTED PAGE NUMBER EXTRACTION
+# =============================================================================
+
+def build_pass1_prompt(num_pages: int) -> str:
+    prompt = f"""Analyze these {num_pages} pages visually from an ECMC document.
+
+═══════════════════════════════════════════════════════════════
+TASK 1: EXTRACT PRINTED PAGE NUMBER
+═══════════════════════════════════════════════════════════════
+
+Look at the TOP or BOTTOM of each page for a printed page number.
+Examples of what to look for:
+  - "Phone Guide Page 6"
+  - "Page 6"
+  - "6"
+  - "6 of 12"
+
+Report ONLY the number or text you see. If no page number is visible, return an EMPTY STRING.
+
+═══════════════════════════════════════════════════════════════
+TASK 2: GENERATE HEADING
+═══════════════════════════════════════════════════════════════
+
+Generate a concise, descriptive heading (3-8 words) based on the page content.
+- Describe the TOPIC, not the format.
+- NEVER use a bare date as the heading.
+- If the page continues the same topic as the previous page, you may use the same heading.
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════
+
+Return a JSON ARRAY with exactly {num_pages} objects.
+
+Each object:
+{{
+  "page_number": integer,
+  "printed_page_number": "the text/number printed on the page, or empty string",
+  "generated_heading": "Your generated heading (3-8 words)",
+  "subsection_title": "Date line or sub-topic, or empty",
+  "section_summary": "Exactly one sentence",
+  "keywords": ["keyword1", "keyword2"],
+  "keyphrases": ["keyphrase1", "keyphrase2", "keyphrase3"],
+  "contains_table": false,
+  "table_summary": ""
+}}
+
+CRITICAL:
+- printed_page_number: extract ONLY what is printed on the page. Do NOT invent numbers.
+- Return ONLY the JSON array. No markdown fences.
+"""
+    return prompt
+
+
+def run_nova_pass1(image_paths: List[Path], pdf_name: str) -> List[PageMetadata]:
+    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+
+    content_blocks: List[Dict[str, Any]] = []
+
+    for img_path in image_paths:
+        with open(img_path, "rb") as f:
+            image_bytes = f.read()
+        content_blocks.append({
+            "image": {
+                "format": "png",
+                "source": {"bytes": image_bytes}
+            }
+        })
+
+    prompt_text = build_pass1_prompt(len(image_paths))
+    content_blocks.append({"text": prompt_text})
+
+    messages = [{"role": "user", "content": content_blocks}]
+
+    try:
+        response = bedrock.converse(
+            modelId=MODEL_ID,
+            messages=messages,
+            inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
+        )
+    except ClientError as e:
+        raise RuntimeError(f"Bedrock Converse failed for {pdf_name}: {e}") from e
+
+    output_message = response.get("output", {}).get("message", {})
+    output_text = ""
+    for block in output_message.get("content", []):
+        if "text" in block:
+            output_text += block["text"]
+
+    if not output_text:
+        raise ValueError(f"Empty response from Nova Lite for {pdf_name}")
+
+    cleaned = clean_json_response(output_text)
+    try:
+        raw_results = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        debug_path = PASS1_DIR / f"{pdf_name}_pass1_raw_error.txt"
+        debug_path.write_text(output_text, encoding="utf-8")
+        raise ValueError(f"JSON parse failed for {pdf_name}. Raw saved to {debug_path}. Error: {e}") from e
+
+    if not isinstance(raw_results, list):
+        raise ValueError(f"Expected JSON array from Nova, got {type(raw_results)} for {pdf_name}")
+
+    page_results: List[PageMetadata] = []
+    for idx, raw in enumerate(raw_results, start=1):
+        pm = PageMetadata(
+            page_number=raw.get("page_number", idx),
+            printed_page_number=str(raw.get("printed_page_number", "")).strip(),
+            generated_heading=raw.get("generated_heading", ""),
+            subsection_title=raw.get("subsection_title", ""),
+            section_summary=raw.get("section_summary", ""),
+            keywords=raw.get("keywords", []) or [],
+            keyphrases=raw.get("keyphrases", []) or [],
+            contains_table=raw.get("contains_table", False),
+            table_summary=raw.get("table_summary", ""),
+        )
+        page_results.append(pm)
+
+    return page_results
+
+
+def save_pass1_checkpoint(pdf_name: str, page_results: List[PageMetadata]):
+    checkpoint_path = PASS1_DIR / f"{pdf_name}_pass1.json"
+    data = [asdict(p) for p in page_results]
+    checkpoint_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[Phase 2] Checkpoint saved: {checkpoint_path}")
+
+
+# =============================================================================
+# PAGE NUMBER RESOLUTION
+# =============================================================================
+
+def resolve_page_numbers(page_results: List[PageMetadata]) -> List[PageMetadata]:
+    """
+    For each page:
+      - If printed_page_number is detected and looks valid -> keep it
+      - Else -> fallback to sequential counter (page_number)
+    
+    Also stores the resolved number back for downstream use.
+    """
+    resolved_results = []
+    
+    for page in page_results:
+        printed = page.printed_page_number
+        
+        # Try to extract a clean number from printed_page_number
+        resolved = page.page_number  # default fallback
+        
+        if printed:
+            # Look for digits in the printed text (e.g., "Phone Guide Page 6" -> 6)
+            digits = re.findall(r'\d+', printed)
+            if digits:
+                # Use the last group of digits (usually the actual page number)
+                try:
+                    resolved = int(digits[-1])
+                except ValueError:
+                    resolved = page.page_number
+        
+        # Store resolved page number in a new field by creating updated dataclass
+        # We'll attach it as an extra attribute for consolidation
+        page.resolved_page_number = resolved
+        resolved_results.append(page)
+    
+    return resolved_results
+
+
+# =============================================================================
+# POST-PROCESSING: SANITIZE HEADINGS
+# =============================================================================
+
+def is_date_only(text: str) -> bool:
+    if not text:
+        return False
+    text_lower = text.lower().strip()
+    date_patterns = [
+        r"^as of\s+\w+\s+\d{1,2},?\s+\d{4}",
+        r"^updated:?\s*\w+\s+\d{1,2},?\s+\d{4}",
+        r"^effective\s+\w+\s+\d{1,2},?\s+\d{4}",
+        r"^revised:?\s*\w+\s+\d{1,2},?\s+\d{4}",
+        r"^\w+\s+\d{1,2},?\s+\d{4}$",
+    ]
+    return any(re.search(p, text_lower) for p in date_patterns)
+
+
+def sanitize_page_results(page_results: List[PageMetadata]) -> List[PageMetadata]:
+    fixed = []
+    last_good_heading = ""
+
+    for page in page_results:
+        heading = page.generated_heading
+        sub = page.subsection_title
+
+        if is_date_only(heading):
+            if last_good_heading:
+                heading = last_good_heading
+            else:
+                heading = "General Content"
+            if not sub:
+                sub = page.generated_heading
+
+        if heading and not is_date_only(heading):
+            last_good_heading = heading
+
+        fixed.append(PageMetadata(
+            page_number=page.page_number,
+            printed_page_number=page.printed_page_number,
+            generated_heading=heading,
+            subsection_title=sub,
+            section_summary=page.section_summary,
+            keywords=page.keywords,
+            keyphrases=page.keyphrases,
+            contains_table=page.contains_table,
+            table_summary=page.table_summary,
+        ))
+
+    return fixed
+
+
+# =============================================================================
+# PHASE 3: DOCUMENT CONSOLIDATION (USES RESOLVED PAGE NUMBERS)
+# =============================================================================
+
+def consolidate_document(pdf_name: str, page_results: List[PageMetadata]) -> List[ConsolidatedSection]:
+    if not page_results:
+        return []
+
+    # Resolve page numbers first
+    page_results = resolve_page_numbers(page_results)
+    
+    sections: List[ConsolidatedSection] = []
+    
+    first_resolved = getattr(page_results[0], 'resolved_page_number', page_results[0].page_number)
+    
+    current = ConsolidatedSection(
+        title=page_results[0].generated_heading or "Untitled Section",
+        summary=page_results[0].section_summary,
+        keywords=list(page_results[0].keywords),
+        keyphrases=list(page_results[0].keyphrases),
+        table_summary=page_results[0].table_summary,
+        start_page=first_resolved,
+        end_page=first_resolved,
+    )
+
+    for page in page_results[1:]:
+        page_heading = page.generated_heading or ""
+        resolved = getattr(page, 'resolved_page_number', page.page_number)
+        
+        if page_heading and page_heading == current.title:
+            current.end_page = resolved
+            current.keywords = list(dict.fromkeys(current.keywords + page.keywords))[:3]
+            current.keyphrases = list(dict.fromkeys(current.keyphrases + page.keyphrases))[:5]
+            if page.table_summary:
+                current.table_summary = page.table_summary
+            if not current.summary and page.section_summary:
+                current.summary = page.section_summary
+        else:
+            sections.append(current)
+            current = ConsolidatedSection(
+                title=page_heading or current.title,
+                summary=page.section_summary,
+                keywords=list(page.keywords)[:3],
+                keyphrases=list(page.keyphrases)[:5],
+                table_summary=page.table_summary,
+                start_page=resolved,
+                end_page=resolved,
+            )
+
+    sections.append(current)
+    return sections
+
+
+# =============================================================================
+# PHASE 4: OUTPUT GENERATION
+# =============================================================================
+
+def write_excel(all_documents: List[DocumentResult], output_path: Path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Section Inventory"
+
+    headers = [
+        "Root Node", "File", "Generated Heading", "Section Summary",
+        "Keywords", "Keyphrases", "Table Summary",
+        "Start Page", "End Page", "Page Range", "Hierarchy Tree"
+    ]
+    ws.append(headers)
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for doc in all_documents:
+        for sec in doc.sections:
+            keywords_str = "; ".join(sec.keywords)
+            keyphrases_str = "; ".join(sec.keyphrases)
+            
+            if sec.start_page == sec.end_page:
+                page_range = f"p. {sec.start_page}"
+            else:
+                page_range = f"pp. {sec.start_page}-{sec.end_page}"
+                
+            hierarchy_str = f"{sec.title} ({page_range}) → {keywords_str}" if keywords_str else f"{sec.title} ({page_range})"
+
+            row = [
+                doc.root_node,
+                doc.file_name,
+                sec.title,
+                sec.summary,
+                keywords_str,
+                keyphrases_str,
+                sec.table_summary,
+                sec.start_page,
+                sec.end_page,
+                page_range,
+                hierarchy_str,
+            ]
+            ws.append(row)
+
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[column].width = min(max_length + 2, 80)
+
+    wb.save(str(output_path))
+    print(f"[Phase 4] Excel saved: {output_path}")
+
+
+def write_hierarchy_tree(all_documents: List[DocumentResult], output_path: Path):
+    lines: List[str] = []
+    lines.append("ROOT")
+    lines.append("")
+
+    website_docs = [d for d in all_documents if d.root_node == ROOT_WEBSITE]
+    onenote_docs = [d for d in all_documents if d.root_node == ROOT_ONENOTE]
+
+    def render_docs(docs: List[DocumentResult], indent: str = "├─ "):
+        for doc in docs:
+            lines.append(f"{indent}{doc.file_name}")
+            for sec in doc.sections:
+                keywords_str = ", ".join(sec.keywords) if sec.keywords else ""
+                if sec.start_page == sec.end_page:
+                    page_range = f"p.{sec.start_page}"
+                else:
+                    page_range = f"pp.{sec.start_page}-{sec.end_page}"
+                    
+                sec_line = f"{indent}    ├─ {sec.title} [{page_range}]"
+                if keywords_str:
+                    sec_line += f" → {keywords_str}"
+                lines.append(sec_line)
+            lines.append("")
+
+    if website_docs:
+        lines.append("├─ Website")
+        render_docs(website_docs, indent="│   ├─ ")
+
+    if onenote_docs:
+        lines.append("└─ OneNote")
+        render_docs(onenote_docs, indent="    ├─ ")
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[Phase 4] Tree saved: {output_path}")
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def main():
+    print("=" * 60)
+    print("ECMC PDF Hierarchy — Page Number Resolution")
+    print(f"Started: {datetime.now().isoformat()}")
+    print("=" * 60)
+
+    ensure_dirs()
+
+    pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
+    if not pdf_files:
+        print(f"No PDFs found in {INPUT_DIR}")
+        return
+
+    print(f"\nDiscovered {len(pdf_files)} PDF(s):")
+    for p in pdf_files:
+        print(f"  - {p.relative_to(INPUT_DIR)}")
+
+    all_results: List[DocumentResult] = []
+
+    for pdf_path in pdf_files:
+        pdf_name = pdf_path.stem
+        root_node = classify_root_node(pdf_path)
+
+        print(f"\n{'─' * 50}")
+        print(f"Processing: {pdf_name} | Root: {root_node}")
+        print(f"{'─' * 50}")
+
+        # Phase 1
+        _, image_paths = convert_pdf_to_images(pdf_path, dpi=DPI)
+
+        if not image_paths:
+            print(f"  WARNING: No images extracted. Skipping.")
+            continue
+
+        # Phase 2
+        page_results: List[PageMetadata] = []
+
+        for i in range(0, len(image_paths), MAX_PAGES_PER_BATCH):
+            chunk = image_paths[i:i + MAX_PAGES_PER_BATCH]
+            try:
+                chunk_results = run_nova_pass1(chunk, pdf_name)
+                page_results.extend(chunk_results)
+            except Exception as e:
+                print(f"  ERROR in Pass 1 chunk {i//MAX_PAGES_PER_BATCH + 1}: {e}")
+                continue
+
+        # Sanitize headings
+        page_results = sanitize_page_results(page_results)
+        save_pass1_checkpoint(pdf_name, page_results)
+
+        # Phase 3
+        if not page_results:
+            print(f"  WARNING: No page results. Skipping.")
+            continue
+
+        consolidated = consolidate_document(pdf_name, page_results)
+
+        doc_result = DocumentResult(
+            root_node=root_node,
+            file_name=pdf_path.name,
+            file_path=pdf_path,
+            sections=consolidated,
+        )
+        all_results.append(doc_result)
+
+    # Phase 4
+    print(f"\n{'=' * 60}")
+    print("Generating final outputs...")
+    print(f"{'=' * 60}")
+
+    write_excel(all_results, FINAL_EXCEL_FILE)
+    write_hierarchy_tree(all_results, FINAL_TREE_FILE)
+
+    print(f"\n{'=' * 60}")
+    print("Pipeline complete.")
+    print(f"Excel : {FINAL_EXCEL_FILE}")
+    print(f"Tree  : {FINAL_TREE_FILE}")
+    print(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    main()
+##############################
+"""
 ECMC PDF Hierarchy Extraction — LLM-Generated Headings + Poppler Path
 Changes:
   1. Headings are GENERATED by Nova Lite from content, not extracted visually
