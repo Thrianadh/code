@@ -1,3 +1,61 @@
+from pathlib import Path
+from pdf2image import convert_from_path
+import os
+
+
+# Windows Poppler bin folder
+POPPLER_PATH = r"C:\poppler\Library\bin"
+
+# Input PDF
+pdf_path = r"D:\Users\ntrinadh\OneDrive ECMC group, Inc\Documents\Ecms\all documents\sample.pdf"
+
+# Temporary image folder
+output_dir = Path("temp_images")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def pdf_to_images(pdf_file, output_folder, dpi=200):
+    """
+    Convert PDF pages into PNG images.
+
+    Returns:
+        List of generated image paths
+    """
+
+    generated_images = []
+
+    pages = convert_from_path(
+        pdf_file,
+        dpi=dpi,
+        fmt="png",
+        poppler_path=POPPLER_PATH,
+        thread_count=os.cpu_count()
+    )
+
+    pdf_name = Path(pdf_file).stem
+
+    for page_num, page in enumerate(pages, start=1):
+
+        image_name = f"{pdf_name}_page_{page_num:04d}.png"
+        image_path = output_folder / image_name
+
+        page.save(image_path, "PNG")
+
+        generated_images.append(str(image_path))
+
+    return generated_images
+
+
+if __name__ == "__main__":
+
+    images = pdf_to_images(
+        pdf_path,
+        output_dir,
+        dpi=200
+    )
+
+    print(f"Generated {len(images)} images")
+#################
 def save_to_s3(self, name="faiss_index"):
     if self.index is None:
         raise ValueError("Index is empty; nothing to save.")
