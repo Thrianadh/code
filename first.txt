@@ -1,3 +1,12 @@
+sec_line = f"{prefix}    {sec_branch}{sec.title} [{page_range}]"
+sec_line = f"{prefix}    {sec_branch}{sec.original_heading or sec.title} [{page_range}]"
+
+# In write_excel(), change:
+hierarchy_str = f"{sec.title} ({page_range}) → {keywords_str}"
+
+# To:
+hierarchy_str = f"{sec.original_heading or sec.title} ({page_range}) → {keywords_str}"
+###########
 # =============================================================================
 # FIX 1: CLASSIFICATION — Handle "One_note", "OneNote", "onenote", etc.
 # =============================================================================
