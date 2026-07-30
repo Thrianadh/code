@@ -1,3 +1,67 @@
+# =============================================================================
+# FIX 1: CLASSIFICATION — Handle "One_note", "OneNote", "onenote", etc.
+# =============================================================================
+
+def classify_root_node(pdf_path: Path) -> str:
+    """
+    Classify PDF as OneNote or Website based on path/file name.
+    Handles: onenote, one_note, one-note, OneNote, etc.
+    """
+    path_lower = str(pdf_path).lower()
+    # Check for any variant of "onenote" or "one_note"
+    if "onenote" in path_lower or "one_note" in path_lower or "one-note" in path_lower:
+        return ROOT_ONENOTE
+    return ROOT_WEBSITE
+
+
+# =============================================================================
+# FIX 2: TREE RENDERING — Cleaner separation of Website vs OneNote
+# =============================================================================
+
+def write_hierarchy_tree(all_documents: List[DocumentResult], output_path: Path):
+    lines: List[str] = []
+    lines.append("ROOT")
+    lines.append("")
+
+    website_docs = [d for d in all_documents if d.root_node == ROOT_WEBSITE]
+    onenote_docs = [d for d in all_documents if d.root_node == ROOT_ONENOTE]
+
+    def render_docs(docs: List[DocumentResult], prefix: str = "    "):
+        for idx, doc in enumerate(docs):
+            is_last_doc = (idx == len(docs) - 1)
+            doc_branch = "└─ " if is_last_doc else "├─ "
+            lines.append(f"{prefix}{doc_branch}{doc.file_name}")
+
+            for sec_idx, sec in enumerate(doc.sections):
+                is_last_sec = (sec_idx == len(doc.sections) - 1)
+                sec_branch = "└─ " if is_last_sec else "├─ "
+                
+                keywords_str = ", ".join(sec.keywords) if sec.keywords else ""
+                if sec.start_page == sec.end_page:
+                    page_range = f"p.{sec.start_page}"
+                else:
+                    page_range = f"pp.{sec.start_page}-{sec.end_page}"
+                    
+                sec_line = f"{prefix}    {sec_branch}{sec.title} [{page_range}]"
+                if keywords_str:
+                    sec_line += f" → {keywords_str}"
+                lines.append(sec_line)
+            
+            lines.append("")
+
+    # Website node
+    if website_docs:
+        lines.append("├─ Website")
+        render_docs(website_docs, prefix="│   ")
+
+    # OneNote node
+    if onenote_docs:
+        lines.append("└─ OneNote")
+        render_docs(onenote_docs, prefix="    ")
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[Phase 4] Tree saved: {output_path}")
+###############
 """
 ECMC PDF Hierarchy Extraction — Dual Heading + Inheritance Validation
 Changes:
