@@ -1,3 +1,516 @@
+
+"""
+ECMC PDF Hierarchy Extraction — Small File Pipeline
+Phases: 1-PDF2Image | 2-Pass1 Nova | 3-Pass2 Consolidation | 4-Outputs
+Optimized for 2-page PDFs (both pages batched into one Nova request).
+"""
+
+import os
+import json
+import re
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime
+
+import boto3
+from botocore.exceptions import ClientError
+from pdf2image import convert_from_path
+import openpyxl
+from openpyxl.styles import Font, Alignment, PatternFill
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# --- Paths ---
+INPUT_DIR = Path(r"D:\Users\ntrinadh\OneDrive ECMC group, Inc\Documents\Ecms\all documents")
+OUTPUT_DIR = INPUT_DIR / "output"
+TEMP_IMAGE_DIR = OUTPUT_DIR / "temp_images"          # xyz_image/ folders
+PASS1_DIR = OUTPUT_DIR / "pass1_metadata"              # checkpoint JSONs
+FINAL_TREE_FILE = OUTPUT_DIR / "hierarchy_tree.txt"
+FINAL_EXCEL_FILE = OUTPUT_DIR / "section_inventory.xlsx"
+
+# --- AWS / Model ---
+AWS_REGION = "us-east-1"
+MODEL_ID = "us.amazon.nova-2-lite-v1:0"                # verify in your Bedrock console
+
+# --- Processing ---
+DPI = 200
+MAX_PAGES_PER_BATCH = 2                                # set to 2 for small files; 1 or 5 for big files
+SUBSECTION_ENABLED = False                             # future flag from your design doc
+
+# --- Classification ---
+ROOT_WEBSITE = "Website"
+ROOT_ONENOTE = "OneNote"
+
+
+# =============================================================================
+# DATA SCHEMAS
+# =============================================================================
+
+@dataclass
+class PageMetadata:
+    """Pass 1 output schema per page."""
+    page_number: int
+    section_title: str
+    subsection_title: str
+    section_summary: str
+    keywords: List[str]
+    keyphrases: List[str]
+    contains_table: bool
+    table_summary: str
+
+
+@dataclass
+class ConsolidatedSection:
+    """Pass 2 output schema per section."""
+    title: str
+    summary: str
+    keywords: List[str]
+    keyphrases: List[str]
+    table_summary: str
+    start_page: int
+    end_page: int
+
+
+@dataclass
+class DocumentResult:
+    """Final per-document container."""
+    root_node: str
+    file_name: str
+    file_path: Path
+    sections: List[ConsolidatedSection]
+
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+def classify_root_node(pdf_path: Path) -> str:
+    """Rule: if 'onenote' in path -> OneNote, else Website."""
+    if "onenote" in str(pdf_path).lower():
+        return ROOT_ONENOTE
+    return ROOT_WEBSITE
+
+
+def clean_json_response(text: str) -> str:
+    """
+    Nova Lite sometimes wraps JSON in markdown fences or adds trailing commas.
+    Strip fences and sanitize before parsing.
+    """
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    # Remove trailing commas before ] or }
+    text = re.sub(r",\s*(\]|\})", r"\1", text)
+    return text
+
+
+def ensure_dirs():
+    """Create output directories if missing."""
+    for d in [OUTPUT_DIR, TEMP_IMAGE_DIR, PASS1_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# PHASE 1: PDF TO IMAGE CONVERSION
+# =============================================================================
+
+def convert_pdf_to_images(pdf_path: Path, dpi: int = 200) -> Tuple[Path, List[Path]]:
+    """
+    Convert PDF to images.
+    Returns: (image_folder_path, list_of_image_paths)
+    Naming: {pdf_stem}_images / page_{NNN}.png
+    """
+    pdf_stem = pdf_path.stem
+    image_folder = TEMP_IMAGE_DIR / f"{pdf_stem}_images"
+    image_folder.mkdir(parents=True, exist_ok=True)
+
+    # Clear old images in this folder to avoid stale data
+    for old in image_folder.glob("*.png"):
+        old.unlink()
+
+    images = convert_from_path(str(pdf_path), dpi=dpi)
+    image_paths: List[Path] = []
+
+    for i, img in enumerate(images, start=1):
+        img_path = image_folder / f"page_{i:03d}.png"
+        img.save(str(img_path), "PNG")
+        image_paths.append(img_path)
+
+    print(f"[Phase 1] {pdf_stem}: {len(image_paths)} pages -> {image_folder}")
+    return image_folder, image_paths
+
+
+# =============================================================================
+# PHASE 2: PASS 1 — NOVA LITE PAGE ANALYSIS (BATCHED)
+# =============================================================================
+
+def build_pass1_prompt(num_pages: int) -> str:
+    """
+    Build the prompt for N pages.
+    For small files, N=2 and both images are sent in one request.
+    """
+    prompt = f"""Analyze these {num_pages} pages visually from an ECMC document.
+
+For EACH page, provide the following in a JSON object:
+- page_number: integer (1-based, in the order images are provided)
+- section_title: primary section heading (or empty string if none)
+- subsection_title: subsection heading if present (or empty string)
+- section_summary: exactly one sentence summarizing the page content
+- keywords: array of 1-3 broad business topic keywords
+- keyphrases: array of 3-5 business concept keyphrases
+- contains_table: boolean (true if page contains a table)
+- table_summary: one sentence describing the table (empty if no table)
+
+CRITICAL RULES:
+1. Section summary must be exactly ONE sentence. No paragraphs, no bullets.
+2. Keywords are broad topics (e.g., "Bankruptcy", "Eligibility").
+3. Keyphrases are specific concepts (e.g., "Title IV Eligibility").
+4. If a page is PRIMARILY a table, generate table_summary and leave keywords/keyphrases EMPTY.
+5. Do NOT use table cell content for keyword extraction.
+6. Return a JSON ARRAY with exactly {num_pages} objects, in page order.
+7. Return ONLY the JSON array. No markdown fences, no explanations.
+
+Example output format:
+[
+  {{
+    "page_number": 1,
+    "section_title": "Chapter 13 Borrowers",
+    "subsection_title": "Repayment Requirements",
+    "section_summary": "Explains repayment requirements for borrowers in Chapter 13 bankruptcy.",
+    "keywords": ["Bankruptcy", "Eligibility"],
+    "keyphrases": ["Title IV Eligibility", "Satisfactory Repayment Arrangement"],
+    "contains_table": false,
+    "table_summary": ""
+  }}
+]
+"""
+    return prompt
+
+
+def run_nova_pass1(image_paths: List[Path], pdf_name: str) -> List[PageMetadata]:
+    """
+    Send all page images for one PDF to Nova Lite in a single Converse API call.
+    For small files (2 pages), this is one request per PDF.
+    """
+    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+
+    # Build content blocks: images first, then text prompt
+    content_blocks: List[Dict[str, Any]] = []
+
+    for img_path in image_paths:
+        with open(img_path, "rb") as f:
+            image_bytes = f.read()
+        content_blocks.append({
+            "image": {
+                "format": "png",
+                "source": {"bytes": image_bytes}
+            }
+        })
+
+    prompt_text = build_pass1_prompt(len(image_paths))
+    content_blocks.append({"text": prompt_text})
+
+    messages = [{"role": "user", "content": content_blocks}]
+
+    try:
+        response = bedrock.converse(
+            modelId=MODEL_ID,
+            messages=messages,
+            inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
+        )
+    except ClientError as e:
+        raise RuntimeError(f"Bedrock Converse failed for {pdf_name}: {e}") from e
+
+    # Extract text response
+    output_message = response.get("output", {}).get("message", {})
+    output_text = ""
+    for block in output_message.get("content", []):
+        if "text" in block:
+            output_text += block["text"]
+
+    if not output_text:
+        raise ValueError(f"Empty response from Nova Lite for {pdf_name}")
+
+    # Parse JSON
+    cleaned = clean_json_response(output_text)
+    try:
+        raw_results = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        # Save raw text for debugging
+        debug_path = PASS1_DIR / f"{pdf_name}_pass1_raw_error.txt"
+        debug_path.write_text(output_text, encoding="utf-8")
+        raise ValueError(f"JSON parse failed for {pdf_name}. Raw saved to {debug_path}. Error: {e}") from e
+
+    if not isinstance(raw_results, list):
+        raise ValueError(f"Expected JSON array from Nova, got {type(raw_results)} for {pdf_name}")
+
+    # Map to PageMetadata objects
+    page_results: List[PageMetadata] = []
+    for idx, raw in enumerate(raw_results, start=1):
+        pm = PageMetadata(
+            page_number=raw.get("page_number", idx),
+            section_title=raw.get("section_title", ""),
+            subsection_title=raw.get("subsection_title", ""),
+            section_summary=raw.get("section_summary", ""),
+            keywords=raw.get("keywords", []) or [],
+            keyphrases=raw.get("keyphrases", []) or [],
+            contains_table=raw.get("contains_table", False),
+            table_summary=raw.get("table_summary", ""),
+        )
+        page_results.append(pm)
+
+    return page_results
+
+
+def save_pass1_checkpoint(pdf_name: str, page_results: List[PageMetadata]):
+    """Append-only checkpoint: save Pass 1 results as JSON."""
+    checkpoint_path = PASS1_DIR / f"{pdf_name}_pass1.json"
+    data = [asdict(p) for p in page_results]
+    checkpoint_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[Phase 2] Checkpoint saved: {checkpoint_path}")
+
+
+# =============================================================================
+# PHASE 3: PASS 2 — DOCUMENT CONSOLIDATION
+# =============================================================================
+
+def consolidate_document(pdf_name: str, page_results: List[PageMetadata]) -> List[ConsolidatedSection]:
+    """
+    Merge consecutive pages with identical section titles.
+    For 2-page files, this usually produces 1 or 2 sections.
+    """
+    if not page_results:
+        return []
+
+    sections: List[ConsolidatedSection] = []
+    current = ConsolidatedSection(
+        title=page_results[0].section_title,
+        summary=page_results[0].section_summary,
+        keywords=list(page_results[0].keywords),
+        keyphrases=list(page_results[0].keyphrases),
+        table_summary=page_results[0].table_summary,
+        start_page=page_results[0].page_number,
+        end_page=page_results[0].page_number,
+    )
+
+    for page in page_results[1:]:
+        if page.section_title and page.section_title == current.title:
+            # Same section: merge
+            current.end_page = page.page_number
+            # Deduplicate and extend keywords/keyphrases
+            current.keywords = list(dict.fromkeys(current.keywords + page.keywords))
+            current.keyphrases = list(dict.fromkeys(current.keyphrases + page.keyphrases))
+            # If later page has table summary, prefer it (or append)
+            if page.table_summary:
+                current.table_summary = page.table_summary
+            # If summary is empty on current but present on page, use page's
+            if not current.summary and page.section_summary:
+                current.summary = page.section_summary
+        else:
+            # New section: flush current
+            sections.append(current)
+            current = ConsolidatedSection(
+                title=page.section_title,
+                summary=page.section_summary,
+                keywords=list(page.keywords),
+                keyphrases=list(page.keyphrases),
+                table_summary=page.table_summary,
+                start_page=page.page_number,
+                end_page=page.page_number,
+            )
+
+    sections.append(current)
+
+    # Enforce limits from design doc
+    for sec in sections:
+        sec.keywords = sec.keywords[:3]
+        sec.keyphrases = sec.keyphrases[:5]
+
+    print(f"[Phase 3] {pdf_name}: {len(sections)} consolidated section(s)")
+    return sections
+
+
+# =============================================================================
+# PHASE 4: OUTPUT GENERATION
+# =============================================================================
+
+def write_excel(all_documents: List[DocumentResult], output_path: Path):
+    """
+    Generate section_inventory.xlsx per design doc schema.
+    Columns: Root Node | File | Section | Section Summary | Keywords | Keyphrases | Table Summary | Hierarchy Tree
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Section Inventory"
+
+    headers = [
+        "Root Node", "File", "Section", "Section Summary",
+        "Keywords", "Keyphrases", "Table Summary", "Hierarchy Tree"
+    ]
+    ws.append(headers)
+
+    # Header styling
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for doc in all_documents:
+        for sec in doc.sections:
+            keywords_str = "; ".join(sec.keywords)
+            keyphrases_str = "; ".join(sec.keyphrases)
+            hierarchy_str = f"{sec.title} → {keywords_str}" if sec.keywords else sec.title
+
+            row = [
+                doc.root_node,
+                doc.file_name,
+                sec.title,
+                sec.summary,
+                keywords_str,
+                keyphrases_str,
+                sec.table_summary,
+                hierarchy_str,
+            ]
+            ws.append(row)
+
+    # Auto-adjust column widths
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except Exception:
+                pass
+        adjusted_width = min(max_length + 2, 80)
+        ws.column_dimensions[column].width = adjusted_width
+
+    wb.save(str(output_path))
+    print(f"[Phase 4] Excel saved: {output_path}")
+
+
+def write_hierarchy_tree(all_documents: List[DocumentResult], output_path: Path):
+    """
+    Generate hierarchy_tree.txt per design doc.
+    Only includes: Section + Keywords. No summaries, no table summaries, no keyphrases.
+    """
+    lines: List[str] = []
+    lines.append("ROOT")
+    lines.append("")
+
+    # Group by root node
+    website_docs = [d for d in all_documents if d.root_node == ROOT_WEBSITE]
+    onenote_docs = [d for d in all_documents if d.root_node == ROOT_ONENOTE]
+
+    def render_docs(docs: List[DocumentResult], indent: str = "├─ "):
+        for doc in docs:
+            doc_line = f"{indent}{doc.file_name}"
+            lines.append(doc_line)
+            for sec in doc.sections:
+                keywords_str = ", ".join(sec.keywords) if sec.keywords else ""
+                sec_line = f"{indent}    ├─ {sec.title}"
+                if keywords_str:
+                    sec_line += f" → {keywords_str}"
+                lines.append(sec_line)
+            lines.append("")
+
+    if website_docs:
+        lines.append("├─ Website")
+        render_docs(website_docs, indent="│   ├─ ")
+
+    if onenote_docs:
+        lines.append("└─ OneNote")
+        render_docs(onenote_docs, indent="    ├─ ")
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[Phase 4] Tree saved: {output_path}")
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def main():
+    print("=" * 60)
+    print("ECMC PDF Hierarchy Extraction — Small File Pipeline")
+    print(f"Started: {datetime.now().isoformat()}")
+    print("=" * 60)
+
+    ensure_dirs()
+
+    # Discover PDFs
+    pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
+    if not pdf_files:
+        print(f"No PDFs found in {INPUT_DIR}")
+        return
+
+    print(f"\nDiscovered {len(pdf_files)} PDF(s):")
+    for p in pdf_files:
+        print(f"  - {p.relative_to(INPUT_DIR)}")
+
+    all_results: List[DocumentResult] = []
+
+    for pdf_path in pdf_files:
+        pdf_name = pdf_path.stem
+        root_node = classify_root_node(pdf_path)
+
+        print(f"\n{'─' * 50}")
+        print(f"Processing: {pdf_name} | Root: {root_node}")
+        print(f"{'─' * 50}")
+
+        # --- Phase 1: PDF to Images ---
+        _, image_paths = convert_pdf_to_images(pdf_path, dpi=DPI)
+
+        # --- Phase 2: Pass 1 Nova Lite ---
+        # For small files, we send all pages in one batch (MAX_PAGES_PER_BATCH >= page count)
+        # If a file has more pages than MAX_PAGES_PER_BATCH, chunk it.
+        page_results: List[PageMetadata] = []
+        for i in range(0, len(image_paths), MAX_PAGES_PER_BATCH):
+            chunk = image_paths[i:i + MAX_PAGES_PER_BATCH]
+            chunk_results = run_nova_pass1(chunk, pdf_name)
+            page_results.extend(chunk_results)
+
+        save_pass1_checkpoint(pdf_name, page_results)
+
+        # --- Phase 3: Consolidation ---
+        consolidated = consolidate_document(pdf_name, page_results)
+
+        doc_result = DocumentResult(
+            root_node=root_node,
+            file_name=pdf_path.name,
+            file_path=pdf_path,
+            sections=consolidated,
+        )
+        all_results.append(doc_result)
+
+    # --- Phase 4: Generate Outputs ---
+    print(f"\n{'=' * 60}")
+    print("Generating final outputs...")
+    print(f"{'=' * 60}")
+
+    write_excel(all_results, FINAL_EXCEL_FILE)
+    write_hierarchy_tree(all_results, FINAL_TREE_FILE)
+
+    print(f"\n{'=' * 60}")
+    print("Pipeline complete.")
+    print(f"Excel : {FINAL_EXCEL_FILE}")
+    print(f"Tree  : {FINAL_TREE_FILE}")
+    print(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    main()
+####################
 from pathlib import Path
 from pdf2image import convert_from_path
 import os
