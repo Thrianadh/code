@@ -1,3 +1,367 @@
+"""
+Retrieval engine for RAG pipeline with OPTIONAL LLM generation.
+Orchestrates: query embedding -> vector search -> [LLM generation] -> answer.
+
+Two modes:
+  1. retrieve()          -> Returns chunks + context_text (no LLM)
+  2. retrieve_and_answer() -> Returns chunks + generated answer from Nova
+
+Optimized for Nova/Claude consumption with clean context formatting.
+"""
+
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+from config import config
+from embedding_engine import EmbeddingEngine
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class RetrievalEngine:
+    """
+    End-to-end retrieval: embed query -> search -> [expand context] -> [generate answer].
+    Vector store is pluggable (OpenSearch, FAISS, or any custom store).
+    """
+
+    def __init__(
+        self,
+        vector_store: Optional[Any] = None,
+        embedding_engine: Optional[EmbeddingEngine] = None,
+        model_id: Optional[str] = None,
+    ):
+        self.embedder = embedding_engine or EmbeddingEngine()
+        self.store = vector_store
+        self.model_id = model_id or config.BEDROCK_CHAT_MODEL_ID
+        self.is_nova = "nova" in self.model_id.lower()
+        self.bedrock = boto3.client("bedrock-runtime", region_name=config.AWS_REGION)
+
+    # ------------------------------------------------------------------
+    # Mode 1: Pure retrieval (no LLM) — backward compatible
+    # ------------------------------------------------------------------
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        expand_context: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve relevant chunks for a user query. NO LLM generation.
+
+        Returns:
+            Dict with keys: query, chunks, context_text, total_chunks, expanded
+        """
+        if self.store is None:
+            raise ValueError("No vector store provided.")
+
+        top_k = top_k or config.RETRIEVAL_TOP_K
+        expand = expand_context if expand_context is not None else config.ENABLE_CONTEXT_EXPANSION
+
+        # 1. Embed query via Bedrock Titan
+        query_embedding = self.embedder.embed_text(query)
+
+        # 2. Search vector store
+        chunks = self.store.search(
+            query_embedding=query_embedding,
+            k=top_k,
+            filters=filters,
+        )
+
+        # 3. Context expansion
+        if expand and chunks:
+            chunks = self._expand_context(chunks)
+
+        # 4. Build context text
+        context_text = self._build_context_text(chunks, query)
+
+        result = {
+            "query": query,
+            "chunks": chunks,
+            "context_text": context_text,
+            "total_chunks": len(chunks),
+            "expanded": expand,
+        }
+
+        logger.info(
+            f"Retrieved {len(chunks)} chunks for query: '{query[:60]}...' "
+            f"(expanded={expand})"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Mode 2: Retrieval + LLM Generation (NEW)
+    # ------------------------------------------------------------------
+
+    def retrieve_and_answer(
+        self,
+        query: str,
+        top_k: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        expand_context: Optional[bool] = None,
+        system_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve chunks AND generate a clean answer via Bedrock Nova/Claude.
+
+        Args:
+            query: User question.
+            top_k: Number of chunks to retrieve.
+            filters: Metadata filters.
+            expand_context: Fetch prev/next neighbors.
+            system_prompt: Optional system prompt. Uses default if None.
+
+        Returns:
+            Dict with ALL retrieve() keys PLUS:
+                - "answer": Generated answer from LLM
+                - "model_id": Model used for generation
+                - "generation_success": True/False
+        """
+        # Step 1: Retrieve
+        retrieval = self.retrieve(
+            query=query,
+            top_k=top_k,
+            filters=filters,
+            expand_context=expand_context,
+        )
+
+        # Step 2: Build LLM prompt
+        prompt = self._build_llm_prompt(query, retrieval["context_text"])
+
+        # Step 3: Generate answer
+        answer, success = self._generate(
+            prompt=prompt,
+            system_prompt=system_prompt,
+        )
+
+        return {
+            **retrieval,  # All retrieve() keys
+            "answer": answer,
+            "model_id": self.model_id,
+            "generation_success": success,
+        }
+
+    # ------------------------------------------------------------------
+    # LLM Generation (Bedrock Nova/Claude)
+    # ------------------------------------------------------------------
+
+    def _generate(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+    ) -> tuple:
+        """
+        Call Bedrock Converse API for answer generation.
+        Returns: (answer_text, success_bool)
+        """
+        default_system = (
+            "You are a helpful assistant for ECMC student loan services. "
+            "Answer questions based ONLY on the provided context. "
+            "If the answer is not in the context, say "I don't have enough information." "
+            "Always cite the document name and page number when possible. "
+            "Be concise and direct."
+        )
+        system = system_prompt or default_system
+
+        try:
+            # Converse API (supports Nova + Claude)
+            kwargs = {
+                "modelId": self.model_id,
+                "messages": [
+                    {"role": "user", "content": [{"text": prompt}]}
+                ],
+                "inferenceConfig": {
+                    "maxTokens": config.CHAT_MAX_TOKENS,
+                    "temperature": config.CHAT_TEMPERATURE,
+                },
+            }
+
+            # Nova requires system as top-level param, not in messages
+            if self.is_nova:
+                kwargs["system"] = [{"text": system}]
+
+            response = self.bedrock.converse(**kwargs)
+            answer = response["output"]["message"]["content"][0]["text"]
+            return answer, True
+
+        except ClientError as e:
+            logger.error(f"Bedrock generation failed: {e}")
+            # Fallback: try without system prompt for older models
+            return self._generate_fallback(prompt, system)
+        except Exception as e:
+            logger.error(f"Unexpected generation error: {e}")
+            return "I apologize, but I'm unable to generate a response right now.", False
+
+    def _generate_fallback(self, prompt: str, system_prompt: str) -> tuple:
+        """Fallback using InvokeModel with native payload."""
+        try:
+            native_request = {
+                "messages": [
+                    {"role": "user", "content": [{"text": prompt}]}
+                ],
+                "inferenceConfig": {
+                    "max_new_tokens": config.CHAT_MAX_TOKENS,
+                    "temperature": config.CHAT_TEMPERATURE,
+                },
+            }
+
+            if self.is_nova:
+                native_request["system"] = [{"text": system_prompt}]
+
+            response = self.bedrock.invoke_model(
+                modelId=self.model_id,
+                body=json.dumps(native_request),
+            )
+            model_response = json.loads(response["body"].read())
+            answer = (
+                model_response.get("output", {})
+                .get("message", {})
+                .get("content", [{}])[0]
+                .get("text", "")
+            )
+            return answer, True
+        except Exception as e:
+            logger.error(f"Fallback generation failed: {e}")
+            return "I apologize, but I'm unable to generate a response right now.", False
+
+    # ------------------------------------------------------------------
+    # Prompt Builders
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_llm_prompt(question: str, context: str) -> str:
+        """Build a clean prompt for the LLM from retrieved context."""
+        return (
+            f"Based on the following documents, answer the question concisely. "
+            f"If the answer is not in the documents, say so.\n\n"
+            f"--- DOCUMENTS ---\n{context}\n"
+            f"--- END OF DOCUMENTS ---\n\n"
+            f"Question: {question}\n\n"
+            f"Answer:"
+        )
+
+    # ------------------------------------------------------------------
+    # Context Expansion (unchanged)
+    # ------------------------------------------------------------------
+
+    def _expand_context(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Fetch prev/next neighbors for each chunk."""
+        expanded = []
+        seen_ids = set()
+
+        for chunk in chunks:
+            prev_id = chunk.get("metadata", {}).get("prev_chunk_id") or chunk.get("prev_chunk_id")
+            if prev_id and prev_id not in seen_ids:
+                prev_doc = self.store.get_chunk_by_id(prev_id)
+                if prev_doc:
+                    prev_doc = dict(prev_doc)
+                    prev_doc["score"] = 0.0
+                    prev_doc["is_neighbor"] = True
+                    expanded.append(prev_doc)
+                    seen_ids.add(prev_id)
+
+            cid = chunk.get("chunk_id", "")
+            if cid not in seen_ids:
+                chunk = dict(chunk)
+                chunk["is_neighbor"] = False
+                expanded.append(chunk)
+                seen_ids.add(cid)
+
+            next_id = chunk.get("metadata", {}).get("next_chunk_id") or chunk.get("next_chunk_id")
+            if next_id and next_id not in seen_ids:
+                next_doc = self.store.get_chunk_by_id(next_id)
+                if next_doc:
+                    next_doc = dict(next_doc)
+                    next_doc["score"] = 0.0
+                    next_doc["is_neighbor"] = True
+                    expanded.append(next_doc)
+                    seen_ids.add(next_id)
+
+        return expanded
+
+    @staticmethod
+    def _build_context_text(chunks: List[Dict[str, Any]], query: str = "") -> str:
+        """Build context text from chunks for LLM consumption."""
+        if not chunks:
+            return (
+                "[NO RELEVANT DOCUMENTS FOUND]\n\n"
+                "No matching documents were found in the knowledge base for this query."
+            )
+
+        parts = [f"The following documents were retrieved for the query: "{query}"\n"]
+
+        for i, chunk in enumerate(chunks, 1):
+            tag = "[NEIGHBOR]" if chunk.get("is_neighbor") else f"[DOCUMENT {i}]"
+            meta = chunk.get("metadata", chunk)
+            doc_id = meta.get("document_id", "unknown")
+            page = meta.get("page_number", 0)
+            section = meta.get("section", "")
+            score = chunk.get("score", 0)
+
+            header = f"{tag} Source: {doc_id} | Page: {page} | Section: {section}"
+            if not chunk.get("is_neighbor"):
+                header += f" | Relevance: {score:.3f}"
+
+            parts.append(header)
+            parts.append(chunk.get("text", "").strip())
+            parts.append("")
+
+        parts.append("--- END OF DOCUMENTS ---")
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Convenience methods
+    # ------------------------------------------------------------------
+
+    def retrieve_simple(self, query: str, top_k: int = 0) -> str:
+        """Simplest API: query -> context text string."""
+        result = self.retrieve(query, top_k=top_k)
+        return result["context_text"]
+
+    def answer_simple(self, query: str, top_k: int = 0) -> str:
+        """One-liner: query -> clean answer from Nova."""
+        result = self.retrieve_and_answer(query, top_k=top_k)
+        return result["answer"]
+####### Clean Answer (Recommended)
+
+from faiss_vector_store import FAISSVectorStore
+from retrieval_engine import RetrievalEngine
+
+# 1. Build index
+store = FAISSVectorStore()
+store.build_from_s3()
+
+# 2. Initialize retrieval engine (auto-loads Nova model from config)
+retriever = RetrievalEngine(vector_store=store)
+
+# 3. Get CLEAN answer from Nova
+result = retriever.retrieve_and_answer("what is a t4 letter?", top_k=5)
+print(result["answer"])
+# → "A T4 letter is a notification from your loan servicer about..."
+
+# 4. Also see which chunks were used
+for c in result["chunks"]:
+    if not c.get("is_neighbor"):
+        print(f"  • {c['chunk_id']} | Page {c['metadata'].get('page_number',0)}")
+#####One-Liner Answer
+
+# Just the answer string, nothing else
+answer = retriever.answer_simple("i want to consolidate", top_k=5)
+print(answer)
+##########Raw Chunks Only (Debugging)
+# Same as before — no LLM, just chunks
+result = retriever.retrieve("what is a t4 letter?", top_k=5)
+print(result["context_text"])  # Messy raw chunks
+#######################
 sec_line = f"{prefix}    {sec_branch}{sec.title} [{page_range}]"
 sec_line = f"{prefix}    {sec_branch}{sec.original_heading or sec.title} [{page_range}]"
 
