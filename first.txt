@@ -1,3 +1,59 @@
+def filename_to_doc_id(s3_key: str, max_len: int = 80) -> str:
+    filename = os.path.basename(s3_key)
+    name = os.path.splitext(filename)[0]
+    clean = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+    clean = re.sub(r'_+', '_', clean).strip('_')
+    
+    # Truncate if too long
+    if len(clean) > max_len:
+        clean = clean[:max_len]
+    
+    return clean
+#######
+# OLD (sequential):
+# doc_id = generate_doc_id(filename, existing_ids)
+# existing_ids.add(doc_id)
+
+# NEW (filename-based):
+doc_id = filename_to_doc_id(source_key)
+
+logger.info(
+    f"Processing [{i+1}/{len(pdf_keys)}]",
+    extra={"doc_id": doc_id, "source_key": source_key},
+)
+############
+doc_id = generate_doc_id(filename, existing_ids)
+
+doc_id = filename_to_doc_id(source_key)
+
+#######
+import re
+import os
+
+def filename_to_doc_id(s3_key: str) -> str:
+    """Convert S3 filename to clean doc_id for folder naming.
+    
+    Example:
+        'ecmc_org/ECMC_RAG/source_files/One_note_ECMC Phone Numbers.pdf'
+        → 'One_note_ECMC_Phone_Numbers'
+    """
+    # Extract just the filename from the S3 key
+    filename = os.path.basename(s3_key)  # 'One_note_ECMC Phone Numbers.pdf'
+    
+    # Remove extension
+    name = os.path.splitext(filename)[0]  # 'One_note_ECMC Phone Numbers'
+    
+    # Replace spaces and special chars with underscore
+    clean = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+    
+    # Collapse multiple underscores
+    clean = re.sub(r'_+', '_', clean)
+    
+    # Strip trailing underscore
+    clean = clean.strip('_')
+    
+    return clean
+################
 #textract_processor.py
 
 """Textract processor with PDF-to-image fallback for problematic documents.
