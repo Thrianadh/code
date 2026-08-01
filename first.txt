@@ -1,3 +1,1257 @@
+#image_extractor.py
+"""Extract figure images from documents and generate captions via Nova Lite multimodal.
+
+Pipeline:
+  1. Read Textract output to find LAYOUT_FIGURE blocks with geometry
+  2. Download original source file from S3
+  3. Crop image region using bounding box (PIL for images, optional for PDFs)
+  4. Send cropped image to Nova Lite (multimodal Converse API) for caption
+  5. Store:
+     - cropped images in S3: textract_output/{doc_id}/images/
+     - image_captions.json in 02_json/{doc_id}/
+
+Nova Lite prompt (from config.paths.PROMPTS.IMAGE_CAPTION):
+  "Describe this figure or chart and its key data points in 2-3 sentences."
+
+Note: For PDF source files, image cropping requires additional libraries
+(e.g., PyMuPDF). If unavailable, the extractor logs a warning and stores
+placeholder metadata for manual processing.
+"""
+
+import io
+import json
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+from botocore.exceptions import ClientError
+
+from config.settings import load_settings
+from utils.aws_clients import get_bedrock_runtime_client, get_s3_client
+from utils.s3_utils import download_json, upload_json, download_bytes
+from utils.logging_config import get_logger, log_operation
+from utils.decorators import retry, timing
+
+logger = get_logger("image_extractor")
+
+
+class ImageExtractor:
+    """Extract and caption figures detected by Textract LAYOUT analysis."""
+
+    def __init__(self):
+        self.settings = load_settings()
+        self.bucket = self.settings.S3_BUCKET
+        self.bedrock = get_bedrock_runtime_client()
+        self.s3 = get_s3_client()
+        self.chat_model = self.settings.BEDROCK_CHAT_MODEL_ID
+        self.prompt = self.settings.prompts.IMAGE_CAPTION
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    @timing()
+    def extract_and_caption(self, doc_id: str, source_s3_key: str) -> str:
+        """Extract all figures from a document and caption with Nova Lite.
+
+        Args:
+            doc_id: Document identifier.
+            source_s3_key: S3 key of the original source file (PDF or image).
+
+        Returns:
+            S3 key of image_captions.json.
+        """
+        # Read Textract output
+        textract_key = self.settings.s3_paths.textract_doc_path(doc_id) + "layout.json"
+        textract_data = download_json(self.bucket, textract_key)
+
+        if not textract_data or "Blocks" not in textract_data:
+            raise ValueError(f"Invalid Textract data for {doc_id}")
+
+        blocks = textract_data["Blocks"]
+
+        # Find LAYOUT_FIGURE blocks
+        figure_blocks = [
+            b for b in blocks
+            if b.get("BlockType") == "LAYOUT_FIGURE"
+        ]
+
+        if not figure_blocks:
+            logger.info("No figures found in document", extra={"doc_id": doc_id})
+            captions_output = {"doc_id": doc_id, "figures": []}
+            captions_key = (
+                self.settings.s3_paths.json_doc_path(doc_id) + "image_captions.json"
+            )
+            upload_json(self.bucket, captions_key, captions_output)
+            return captions_key
+
+        # Determine source file type
+        file_ext = os.path.splitext(source_s3_key)[1].lower()
+        is_pdf = file_ext == ".pdf"
+        is_image = file_ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff")
+
+        # Download source file to local temp
+        source_bytes = download_bytes(self.bucket, source_s3_key)
+
+        captions_output = {"doc_id": doc_id, "figures": []}
+
+        for i, figure_block in enumerate(figure_blocks, start=1):
+            figure_id = f"{doc_id}_figure_{i:03d}"
+            page = figure_block.get("Page", 1)
+            bbox = figure_block.get("Geometry", {}).get("BoundingBox", {})
+
+            figure_record = {
+                "figure_id": figure_id,
+                "textract_block_id": figure_block["Id"],
+                "page_number": page,
+                "bounding_box": bbox,
+                "confidence": figure_block.get("Confidence", 0.0),
+            }
+
+            # Attempt to crop and caption
+            cropped_bytes = None
+            if is_image:
+                cropped_bytes = self._crop_from_image(source_bytes, bbox)
+            elif is_pdf:
+                cropped_bytes = self._crop_from_pdf(source_bytes, page, bbox)
+            else:
+                logger.warning(
+                    "Unsupported source type for image cropping",
+                    extra={"doc_id": doc_id, "figure_id": figure_id, "ext": file_ext},
+                )
+
+            if cropped_bytes:
+                # Save cropped image to S3
+                image_key = (
+                    self.settings.s3_paths.textract_doc_path(doc_id)
+                    + f"images/{figure_id}.png"
+                )
+                self.s3.put_object(
+                    Bucket=self.bucket,
+                    Key=image_key,
+                    Body=cropped_bytes,
+                    ContentType="image/png",
+                )
+                figure_record["s3_image_key"] = image_key
+
+                # Caption with Nova Lite multimodal (with graceful fallback)
+                caption = self._caption_image_safe(cropped_bytes)
+                figure_record["caption"] = caption
+
+                logger.info(
+                    "Figure captioned",
+                    extra={
+                        "doc_id": doc_id,
+                        "figure_id": figure_id,
+                        "page": page,
+                        "image_key": image_key,
+                        "caption_length": len(caption),
+                    },
+                )
+            else:
+                figure_record["caption"] = (
+                    f"[Figure on page {page} — image extraction not available]"
+                )
+                figure_record["s3_image_key"] = None
+                logger.warning(
+                    "Could not extract figure image",
+                    extra={"doc_id": doc_id, "figure_id": figure_id, "page": page},
+                )
+
+            captions_output["figures"].append(figure_record)
+
+        # Upload captions
+        captions_key = (
+            self.settings.s3_paths.json_doc_path(doc_id) + "image_captions.json"
+        )
+        upload_json(self.bucket, captions_key, captions_output)
+
+        logger.info(
+            "Image extraction complete",
+            extra={
+                "doc_id": doc_id,
+                "figure_count": len(captions_output["figures"]),
+                "captioned": sum(
+                    1 for f in captions_output["figures"]
+                    if f.get("caption") and "not available" not in f["caption"]
+                ),
+            },
+        )
+
+        return captions_key
+
+    # ── Internal: Image Cropping ───────────────────────────────────────────
+
+    def _crop_from_image(self, image_bytes: bytes, bbox: Dict[str, float]) -> Optional[bytes]:
+        """Crop a region from an image using PIL.
+
+        Args:
+            image_bytes: Raw image bytes (PNG/JPG).
+            bbox: Textract BoundingBox dict with Top, Left, Width, Height (0-1 normalized).
+
+        Returns:
+            Cropped PNG bytes, or None if PIL unavailable or error.
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            logger.warning("PIL not available, skipping image crop")
+            return None
+
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            width, height = img.size
+
+            # Convert normalized bbox to pixel coordinates
+            left = int(bbox.get("Left", 0) * width)
+            top = int(bbox.get("Top", 0) * height)
+            right = int((bbox.get("Left", 0) + bbox.get("Width", 0)) * width)
+            bottom = int((bbox.get("Top", 0) + bbox.get("Height", 0)) * height)
+
+            # Ensure valid coordinates
+            left = max(0, left)
+            top = max(0, top)
+            right = min(width, right)
+            bottom = min(height, bottom)
+
+            if right <= left or bottom <= top:
+                logger.warning("Invalid crop coordinates", extra={"bbox": bbox})
+                return None
+
+            cropped = img.crop((left, top, right, bottom))
+
+            output = io.BytesIO()
+            cropped.save(output, format="PNG")
+            return output.getvalue()
+
+        except Exception as exc:
+            logger.warning("Image crop failed", extra={"error": str(exc)})
+            return None
+
+    def _crop_from_pdf(
+        self,
+        pdf_bytes: bytes,
+        page_number: int,
+        bbox: Dict[str, float],
+    ) -> Optional[bytes]:
+        """Crop a region from a PDF page.
+
+        Requires PyMuPDF (fitz). If unavailable, returns None.
+
+        Args:
+            pdf_bytes: Raw PDF bytes.
+            page_number: 1-based page number.
+            bbox: Textract BoundingBox dict (0-1 normalized).
+
+        Returns:
+            Cropped PNG bytes, or None if library unavailable.
+        """
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            logger.warning("PyMuPDF not available, skipping PDF image crop")
+            return None
+
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            if page_number < 1 or page_number > len(doc):
+                logger.warning(
+                    "Page number out of range",
+                    extra={"page": page_number, "total_pages": len(doc)},
+                )
+                return None
+
+            page = doc[page_number - 1]  # 0-based index
+            rect = page.rect
+
+            # Convert normalized bbox to page coordinates
+            x0 = bbox.get("Left", 0) * rect.width
+            y0 = bbox.get("Top", 0) * rect.height
+            x1 = (bbox.get("Left", 0) + bbox.get("Width", 0)) * rect.width
+            y1 = (bbox.get("Top", 0) + bbox.get("Height", 0)) * rect.height
+
+            clip_rect = fitz.Rect(x0, y0, x1, y1)
+            pix = page.get_pixmap(clip=clip_rect, dpi=150)
+
+            return pix.tobytes("png")
+
+        except Exception as exc:
+            logger.warning("PDF image crop failed", extra={"error": str(exc)})
+            return None
+
+    # ── Internal: Nova Lite Multimodal Caption (SAFE) ──────────────────────
+
+    def _caption_image_safe(self, image_bytes: bytes) -> str:
+        """Send image to Nova Lite multimodal API for caption with validation.
+
+        Args:
+            image_bytes: PNG image bytes.
+
+        Returns:
+            Generated caption string, or placeholder if API fails.
+        """
+        # Validate image is not empty
+        if not image_bytes or len(image_bytes) < 100:
+            logger.warning("Image too small or empty, skipping caption")
+            return "[Image too small or empty — caption unavailable]"
+
+        try:
+            return self._caption_image(image_bytes)
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            error_msg = exc.response["Error"].get("Message", str(exc))
+            logger.warning(
+                "Image captioning failed via API",
+                extra={
+                    "error_code": error_code,
+                    "error_message": error_msg,
+                },
+            )
+            return f"[Image caption unavailable — {error_code}]"
+        except Exception as exc:
+            logger.warning(
+                "Image captioning failed unexpectedly",
+                extra={"error": str(exc)},
+            )
+            return "[Image caption unavailable — unexpected error]"
+
+    @retry(max_attempts=2, backoff_seconds=2, exceptions=(ClientError,))
+    def _caption_image(self, image_bytes: bytes) -> str:
+        """Send image to Nova Lite multimodal API for caption.
+
+        IMPORTANT: Pass raw bytes directly. Boto3 handles base64 encoding internally.
+        Do NOT base64-encode the image yourself.
+
+        Args:
+            image_bytes: PNG image bytes (raw, NOT base64).
+
+        Returns:
+            Generated caption string.
+        """
+        response = self.bedrock.converse(
+            modelId=self.chat_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "image": {
+                                "format": "png",
+                                "source": {"bytes": image_bytes},  # RAW BYTES
+                            }
+                        },
+                        {"text": self.prompt},
+                    ],
+                }
+            ],
+            inferenceConfig={
+                "maxTokens": 300,
+                "temperature": 0.3,
+            },
+        )
+
+        return response["output"]["message"]["content"][0]["text"].strip()
+
+
+# ── Convenience Function ───────────────────────────────────────────────────
+
+def extract_and_caption_images(doc_id: str, source_s3_key: str) -> str:
+    """One-shot function to extract and caption images for a document.
+
+    Args:
+        doc_id: Document identifier.
+        source_s3_key: S3 key of the original source file.
+
+    Returns:
+        S3 key of image_captions.json.
+    """
+    extractor = ImageExtractor()
+    return extractor.extract_and_caption(doc_id, source_s3_key)
+################
+#table_extractor.py
+"""Extract tables from Textract output, convert to markdown, and enrich with Nova Lite.
+
+Pipeline:
+  1. Read raw Textract JSON + reading_order.json
+  2. Extract TABLE blocks with cell geometry
+  3. Convert each table to pipe-delimited markdown
+  4. Extract surrounding text context (before/after blocks)
+  5. Send table + context to Nova Lite for semantic caption
+  6. Store:
+     - tables.json: Markdown representations + metadata
+     - table_enrichments.json: Nova-generated captions
+
+Handles fallback output from detect_document_text (no TABLE blocks) by
+writing empty table files without crashing.
+
+Nova Lite prompt (from config.paths.PROMPTS.TABLE_ENRICHMENT):
+  "Describe what this table represents, its column meanings, and key values."
+"""
+
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
+from config.settings import load_settings
+from utils.aws_clients import get_bedrock_runtime_client
+from utils.s3_utils import download_json, upload_json
+from utils.text_utils import (
+    textract_table_to_markdown,
+    extract_context_around_table,
+    estimate_token_count,
+)
+from utils.logging_config import get_logger, log_operation
+from utils.decorators import retry, timing
+
+logger = get_logger("table_extractor")
+
+
+class TableExtractor:
+    """Extract and enrich tables from Textract output."""
+
+    def __init__(self):
+        self.settings = load_settings()
+        self.bucket = self.settings.S3_BUCKET
+        self.bedrock = get_bedrock_runtime_client()
+        self.chat_model = self.settings.BEDROCK_CHAT_MODEL_ID
+        self.prompt = self.settings.prompts.TABLE_ENRICHMENT
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    @timing()
+    def extract_and_enrich(self, doc_id: str) -> Tuple[str, str]:
+        """Extract all tables from a document and enrich with Nova Lite captions.
+
+        Args:
+            doc_id: Document identifier.
+
+        Returns:
+            Tuple of (tables_s3_key, enrichments_s3_key).
+        """
+        # Read inputs
+        textract_key = self.settings.s3_paths.textract_doc_path(doc_id) + "layout.json"
+        reading_key = self.settings.s3_paths.json_doc_path(doc_id) + "reading_order.json"
+
+        textract_data = download_json(self.bucket, textract_key)
+        reading_data = download_json(self.bucket, reading_key)
+
+        if not textract_data or "Blocks" not in textract_data:
+            raise ValueError(f"Invalid Textract data for {doc_id}")
+
+        blocks = textract_data["Blocks"]
+        blocks_by_id = {b["Id"]: b for b in blocks}
+        reading_blocks = reading_data.get("blocks", [])
+
+        # Check if fallback was used (detect_document_text has no TABLE blocks)
+        fallback_used = reading_data.get("fallback_used", False)
+
+        # Find all TABLE blocks
+        table_blocks = [b for b in blocks if b.get("BlockType") == "TABLE"]
+
+        if not table_blocks:
+            logger.info(
+                "No tables found in document",
+                extra={"doc_id": doc_id, "fallback_used": fallback_used},
+            )
+            # Write empty files for consistency (downstream expects these keys)
+            tables_output = {"doc_id": doc_id, "tables": [], "fallback_used": fallback_used}
+            enrichments_output = {"doc_id": doc_id, "enrichments": [], "fallback_used": fallback_used}
+
+            tables_key = self.settings.s3_paths.json_doc_path(doc_id) + "tables.json"
+            enrichments_key = (
+                self.settings.s3_paths.json_doc_path(doc_id) + "table_enrichments.json"
+            )
+            upload_json(self.bucket, tables_key, tables_output)
+            upload_json(self.bucket, enrichments_key, enrichments_output)
+            return tables_key, enrichments_key
+
+        tables_output = {"doc_id": doc_id, "tables": [], "fallback_used": fallback_used}
+        enrichments_output = {"doc_id": doc_id, "enrichments": [], "fallback_used": fallback_used}
+
+        for i, table_block in enumerate(table_blocks, start=1):
+            table_id = f"{doc_id}_table_{i:03d}"
+
+            # Convert to markdown
+            markdown = textract_table_to_markdown(table_block, blocks_by_id)
+
+            # Extract context from reading order
+            context = self._extract_table_context(
+                table_block["Id"], reading_blocks, blocks_by_id
+            )
+
+            # Get page number from table block
+            page = table_block.get("Page", 1)
+
+            # Build table record
+            table_record = {
+                "table_id": table_id,
+                "textract_block_id": table_block["Id"],
+                "page_number": page,
+                "markdown": markdown,
+                "row_count": self._count_rows(table_block),
+                "column_count": self._count_columns(table_block),
+                "context": context,
+            }
+            tables_output["tables"].append(table_record)
+
+            # Enrich with Nova Lite (with graceful fallback)
+            caption = self._enrich_table_safe(table_record)
+
+            enrichment_record = {
+                "table_id": table_id,
+                "caption": caption,
+                "page_number": page,
+            }
+            enrichments_output["enrichments"].append(enrichment_record)
+
+            logger.info(
+                "Table enriched",
+                extra={
+                    "doc_id": doc_id,
+                    "table_id": table_id,
+                    "page": page,
+                    "rows": table_record["row_count"],
+                    "cols": table_record["column_count"],
+                },
+            )
+
+        # Upload outputs
+        tables_key = self.settings.s3_paths.json_doc_path(doc_id) + "tables.json"
+        enrichments_key = (
+            self.settings.s3_paths.json_doc_path(doc_id) + "table_enrichments.json"
+        )
+
+        upload_json(self.bucket, tables_key, tables_output)
+        upload_json(self.bucket, enrichments_key, enrichments_output)
+
+        logger.info(
+            "Table extraction complete",
+            extra={
+                "doc_id": doc_id,
+                "table_count": len(tables_output["tables"]),
+            },
+        )
+
+        return tables_key, enrichments_key
+
+    # ── Internal: Context Extraction ───────────────────────────────────────
+
+    def _extract_table_context(
+        self,
+        table_block_id: str,
+        reading_blocks: List[Dict[str, Any]],
+        blocks_by_id: Dict[str, Dict[str, Any]],
+    ) -> str:
+        """Extract text blocks immediately before and after a table.
+
+        Uses reading_order blocks to find position, then collects
+        LAYOUT_TEXT and LAYOUT_SECTION_HEADER blocks up to token limit.
+        """
+        # Find table position in reading order
+        table_idx = -1
+        for i, block in enumerate(reading_blocks):
+            if block.get("block_id") == table_block_id:
+                table_idx = i
+                break
+
+        if table_idx == -1:
+            return ""
+
+        max_tokens = self.settings.chunking.TABLE_CONTEXT_TOKENS
+        half_tokens = max_tokens // 2
+
+        before_parts = []
+        after_parts = []
+        before_tokens = 0
+        after_tokens = 0
+
+        # Collect before table
+        for i in range(table_idx - 1, -1, -1):
+            block = reading_blocks[i]
+            if block["block_type"] in ("LAYOUT_TEXT", "LAYOUT_SECTION_HEADER"):
+                text = block.get("text", "")
+                tokens = estimate_token_count(text)
+                if before_tokens + tokens > half_tokens:
+                    break
+                before_parts.insert(0, text)
+                before_tokens += tokens
+
+        # Collect after table
+        for i in range(table_idx + 1, len(reading_blocks)):
+            block = reading_blocks[i]
+            if block["block_type"] in ("LAYOUT_TEXT", "LAYOUT_SECTION_HEADER"):
+                text = block.get("text", "")
+                tokens = estimate_token_count(text)
+                if after_tokens + tokens > half_tokens:
+                    break
+                after_parts.append(text)
+                after_tokens += tokens
+
+        return " ".join(before_parts + after_parts)
+
+    # ── Internal: Nova Lite Enrichment (SAFE) ────────────────────────────
+
+    def _enrich_table_safe(self, table_record: Dict[str, Any]) -> str:
+        """Send table to Nova Lite with validation and fallback."""
+        markdown = table_record.get("markdown", "")
+        if not markdown or len(markdown) < 10:
+            return "[Table too small or empty — enrichment unavailable]"
+
+        try:
+            return self._enrich_table(table_record)
+        except Exception as exc:
+            logger.warning(
+                "Table enrichment failed, using placeholder",
+                extra={"error": str(exc)},
+            )
+            return "[Table enrichment unavailable — could not process]"
+
+    @retry(max_attempts=2, backoff_seconds=2, exceptions=(Exception,))
+    def _enrich_table(self, table_record: Dict[str, Any]) -> str:
+        """Send table markdown + context to Nova Lite for semantic caption.
+
+        Args:
+            table_record: Dict with 'markdown', 'context', 'table_id'.
+
+        Returns:
+            Nova Lite generated caption string.
+        """
+        prompt = self._build_enrichment_prompt(table_record)
+
+        response = self.bedrock.converse(
+            modelId=self.chat_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": prompt}],
+                }
+            ],
+            inferenceConfig={
+                "maxTokens": 500,
+                "temperature": 0.3,
+            },
+        )
+
+        output = response["output"]["message"]["content"][0]["text"]
+        return output.strip()
+
+    def _build_enrichment_prompt(self, table_record: Dict[str, Any]) -> str:
+        """Build the prompt for table enrichment."""
+        markdown = table_record.get("markdown", "")
+        context = table_record.get("context", "")
+
+        prompt_parts = [self.settings.prompts.TABLE_ENRICHMENT]
+
+        if context:
+            prompt_parts.append(f"\n\nContext from the document:\n{context}")
+
+        prompt_parts.append(f"\n\nTable (in markdown format):\n\n{markdown}")
+
+        return "\n".join(prompt_parts)
+
+    # ── Internal: Table Geometry Helpers ───────────────────────────────────
+
+    def _count_rows(self, table_block: Dict[str, Any]) -> int:
+        """Count unique row indices in table cells."""
+        max_row = 0
+        for rel in table_block.get("Relationships", []):
+            if rel.get("Type") == "CHILD":
+                for cell_id in rel.get("Ids", []):
+                    pass  # Would need blocks_by_id lookup
+        return 0  # Placeholder
+
+    def _count_columns(self, table_block: Dict[str, Any]) -> int:
+        """Count unique column indices in table cells."""
+        return 0  # Placeholder
+
+
+# ── Convenience Function ───────────────────────────────────────────────────
+
+def extract_and_enrich_tables(doc_id: str) -> Tuple[str, str]:
+    """One-shot function to extract and enrich tables for a document.
+
+    Args:
+        doc_id: Document identifier.
+
+    Returns:
+        Tuple of (tables_s3_key, enrichments_s3_key).
+    """
+    extractor = TableExtractor()
+    return extractor.extract_and_enrich(doc_id)
+#####################
+#layout_parser.py
+"""Parse Textract raw JSON into structured reading order and document metadata.
+
+Enforces sequential document flow:
+  1. Group blocks by page number
+  2. Sort by vertical position (top-to-bottom)
+  3. Within same Y-position, sort by horizontal (left-to-right)
+  4. Assign reading_order integers
+  5. Identify section boundaries at LAYOUT_TITLE / LAYOUT_SECTION_HEADER
+
+Handles fallback output from detect_document_text (which produces LINE blocks
+instead of LAYOUT blocks) by creating synthetic layout blocks.
+
+Outputs:
+  - reading_order.json: Ordered blocks with geometry, page, sequence
+  - document_metadata.json: Doc-level info (title, pages, source)
+"""
+
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
+from config.settings import load_settings
+from utils.s3_utils import download_json, upload_json
+from utils.logging_config import get_logger, log_operation
+from utils.decorators import timing
+
+logger = get_logger("layout_parser")
+
+
+class LayoutParser:
+    """Parse Textract layout into sequential reading order."""
+
+    def __init__(self):
+        self.settings = load_settings()
+        self.bucket = self.settings.S3_BUCKET
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    @timing()
+    def parse_document(self, doc_id: str) -> Tuple[str, str]:
+        """Parse Textract output into reading_order.json and document_metadata.json.
+
+        Args:
+            doc_id: Document identifier (e.g., 'doc_001').
+
+        Returns:
+            Tuple of (reading_order_s3_key, metadata_s3_key).
+        """
+        # Read raw Textract JSON from S3
+        textract_key = self.settings.s3_paths.textract_doc_path(doc_id) + "layout.json"
+        raw_data = download_json(self.bucket, textract_key)
+
+        if not raw_data or "Blocks" not in raw_data:
+            raise ValueError(f"Invalid Textract data for {doc_id}: missing 'Blocks'")
+
+        blocks = raw_data["Blocks"]
+        doc_meta = raw_data.get("DocumentMetadata", {})
+        fallback_used = raw_data.get("_fallback_used", False)
+
+        if fallback_used:
+            logger.warning(
+                "Fallback output detected (detect_document_text), "
+                "using LINE blocks for reading order",
+                extra={"doc_id": doc_id},
+            )
+
+        # Build block lookup for relationship resolution
+        blocks_by_id = {b["Id"]: b for b in blocks}
+
+        # Extract layout blocks (text, headers, tables, figures)
+        layout_blocks = self._extract_layout_blocks(blocks, blocks_by_id, fallback_used)
+
+        # Sort by page → top → left
+        sorted_blocks = self._sort_by_reading_order(layout_blocks)
+
+        # Assign sequential reading_order integers
+        for i, block in enumerate(sorted_blocks, start=1):
+            block["reading_order"] = i
+
+        # Identify section boundaries
+        sections = self._identify_sections(sorted_blocks)
+
+        # Build outputs
+        reading_order = {
+            "doc_id": doc_id,
+            "total_pages": doc_meta.get("Pages", 0),
+            "total_blocks": len(sorted_blocks),
+            "fallback_used": fallback_used,
+            "blocks": sorted_blocks,
+            "sections": sections,
+        }
+
+        metadata = {
+            "doc_id": doc_id,
+            "total_pages": doc_meta.get("Pages", 0),
+            "total_blocks": len(blocks),
+            "layout_blocks": len(sorted_blocks),
+            "sections_count": len(sections),
+            "fallback_used": fallback_used,
+            "source_s3_key": textract_key,
+        }
+
+        # Upload to S3
+        reading_key = self.settings.s3_paths.json_doc_path(doc_id) + "reading_order.json"
+        metadata_key = self.settings.s3_paths.json_doc_path(doc_id) + "document_metadata.json"
+
+        upload_json(self.bucket, reading_key, reading_order)
+        upload_json(self.bucket, metadata_key, metadata)
+
+        logger.info(
+            "Layout parsed",
+            extra={
+                "doc_id": doc_id,
+                "blocks": len(sorted_blocks),
+                "sections": len(sections),
+                "pages": doc_meta.get("Pages", 0),
+                "fallback_used": fallback_used,
+            },
+        )
+
+        return reading_key, metadata_key
+
+    # ── Internal: Block Extraction ─────────────────────────────────────────
+
+    def _extract_layout_blocks(
+        self,
+        blocks: List[Dict[str, Any]],
+        blocks_by_id: Dict[str, Dict[str, Any]],
+        fallback_used: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Extract relevant layout blocks with resolved text and geometry.
+
+        For analyze_document output: uses LAYOUT_* block types.
+        For detect_document_text fallback: uses LINE blocks as synthetic layout.
+        """
+        layout_types = {
+            "LAYOUT_TEXT",
+            "LAYOUT_TITLE",
+            "LAYOUT_SECTION_HEADER",
+            "LAYOUT_TABLE",
+            "LAYOUT_FIGURE",
+            "LAYOUT_LIST",
+            "LAYOUT_PAGE_NUMBER",
+            "LAYOUT_FOOTER",
+            "LAYOUT_HEADER",
+        }
+
+        result = []
+        for block in blocks:
+            block_type = block.get("BlockType", "")
+
+            if block_type in layout_types:
+                # Standard analyze_document output
+                result.append(self._build_layout_record(block, blocks_by_id))
+            elif fallback_used and block_type == "LINE":
+                # Fallback: create synthetic layout block from LINE
+                result.append(self._build_synthetic_layout_record(block))
+
+        # If still no blocks (very rare), try WORD blocks
+        if not result and fallback_used:
+            logger.warning(
+                "No LINE blocks found, falling back to WORD blocks",
+                extra={"doc_id": "unknown"},
+            )
+            for block in blocks:
+                if block.get("BlockType") == "WORD":
+                    result.append(self._build_synthetic_layout_record(block))
+
+        return result
+
+    def _build_layout_record(
+        self,
+        block: Dict[str, Any],
+        blocks_by_id: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build a layout record from a standard Textract LAYOUT block."""
+        geometry = block.get("Geometry", {})
+        bbox = geometry.get("BoundingBox", {})
+        text = self._resolve_text(block, blocks_by_id)
+        page = block.get("Page", 1)
+
+        return {
+            "block_id": block["Id"],
+            "block_type": block["BlockType"],
+            "page_number": page,
+            "text": text,
+            "geometry": {
+                "top": bbox.get("Top", 0.0),
+                "left": bbox.get("Left", 0.0),
+                "width": bbox.get("Width", 0.0),
+                "height": bbox.get("Height", 0.0),
+            },
+            "confidence": block.get("Confidence", 0.0),
+        }
+
+    def _build_synthetic_layout_record(self, block: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a synthetic layout record from a LINE or WORD block.
+
+        Used when detect_document_text fallback is active (no LAYOUT blocks).
+        """
+        geometry = block.get("Geometry", {})
+        bbox = geometry.get("BoundingBox", {})
+        text = block.get("Text", "")
+        page = block.get("Page", 1)
+
+        # Heuristic: classify as title if short and all caps
+        block_type = "LAYOUT_TEXT"
+        if text and len(text) < 100 and text.isupper():
+            block_type = "LAYOUT_SECTION_HEADER"
+        elif text and len(text) < 50 and text.endswith(":"):
+            block_type = "LAYOUT_SECTION_HEADER"
+
+        return {
+            "block_id": block["Id"],
+            "block_type": block_type,
+            "page_number": page,
+            "text": text,
+            "geometry": {
+                "top": bbox.get("Top", 0.0),
+                "left": bbox.get("Left", 0.0),
+                "width": bbox.get("Width", 0.0),
+                "height": bbox.get("Height", 0.0),
+            },
+            "confidence": block.get("Confidence", 0.0),
+            "synthetic": True,
+        }
+
+    def _resolve_text(
+        self,
+        block: Dict[str, Any],
+        blocks_by_id: Dict[str, Dict[str, Any]],
+    ) -> str:
+        """Resolve full text from a block by concatenating child WORD blocks."""
+        text_parts = []
+        for rel in block.get("Relationships", []):
+            if rel.get("Type") == "CHILD":
+                for child_id in rel.get("Ids", []):
+                    child = blocks_by_id.get(child_id)
+                    if child and child.get("BlockType") == "WORD":
+                        text_parts.append(child.get("Text", ""))
+        return " ".join(text_parts).strip()
+
+    # ── Internal: Sorting ──────────────────────────────────────────────────
+
+    def _sort_by_reading_order(
+        self,
+        blocks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Sort blocks by page number, then vertical position, then horizontal."""
+        return sorted(
+            blocks,
+            key=lambda b: (
+                b["page_number"],
+                b["geometry"]["top"],
+                b["geometry"]["left"],
+            ),
+        )
+
+    # ── Internal: Section Identification ───────────────────────────────────
+
+    def _identify_sections(
+        self,
+        sorted_blocks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Identify document sections bounded by LAYOUT_TITLE or LAYOUT_SECTION_HEADER.
+
+        Returns list of sections with start_block_id, end_block_id, heading, page_range.
+        """
+        sections = []
+        current_section = None
+
+        for block in sorted_blocks:
+            block_type = block["block_type"]
+            block_id = block["block_id"]
+            page = block["page_number"]
+            text = block["text"]
+
+            # Start new section at title or section header
+            if block_type in ("LAYOUT_TITLE", "LAYOUT_SECTION_HEADER"):
+                # Close previous section
+                if current_section:
+                    current_section["end_block_id"] = sorted_blocks[
+                        sorted_blocks.index(block) - 1
+                    ]["block_id"]
+                    sections.append(current_section)
+
+                current_section = {
+                    "section_id": f"section_{len(sections) + 1:03d}",
+                    "heading": text,
+                    "heading_block_id": block_id,
+                    "start_block_id": block_id,
+                    "end_block_id": None,
+                    "page_start": page,
+                    "page_end": page,
+                }
+            elif current_section:
+                # Update page range
+                current_section["page_end"] = max(current_section["page_end"], page)
+
+        # Close final section
+        if current_section and sorted_blocks:
+            current_section["end_block_id"] = sorted_blocks[-1]["block_id"]
+            sections.append(current_section)
+
+        # If no sections found (fallback case), create one default section
+        if not sections and sorted_blocks:
+            sections.append({
+                "section_id": "section_001",
+                "heading": "Document Content",
+                "heading_block_id": sorted_blocks[0]["block_id"],
+                "start_block_id": sorted_blocks[0]["block_id"],
+                "end_block_id": sorted_blocks[-1]["block_id"],
+                "page_start": sorted_blocks[0]["page_number"],
+                "page_end": sorted_blocks[-1]["page_number"],
+            })
+
+        return sections
+
+
+# ── Convenience Function ───────────────────────────────────────────────────
+
+def parse_layout(doc_id: str) -> Tuple[str, str]:
+    """One-shot function to parse layout for a single document.
+
+    Args:
+        doc_id: Document identifier.
+
+    Returns:
+        Tuple of (reading_order_s3_key, metadata_s3_key).
+    """
+    parser = LayoutParser()
+    return parser.parse_document(doc_id)
+######################
+#textract_processor.py
+"""AWS Textract document analysis with polling and S3 persistence.
+
+Handles:
+  - analyze_document (synchronous, <10 pages) or start_document_analysis (async, >10 pages)
+  - Pagination of Textract block responses
+  - Polling with configurable interval and max attempts
+  - Raw JSON upload to S3 for downstream parsing
+  - Fallback to detect_document_text for unsupported PDF formats
+"""
+
+import json
+import time
+from typing import Any, Dict, List, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+from config.settings import load_settings
+from utils.aws_clients import get_textract_client, get_s3_client
+from utils.s3_utils import upload_json, check_exists
+from utils.logging_config import get_logger, log_operation
+from utils.decorators import retry, timing
+
+logger = get_logger("textract_processor")
+
+
+class TextractProcessor:
+    """Orchestrates Textract document analysis and S3 persistence."""
+
+    def __init__(self):
+        self.settings = load_settings()
+        self.textract = get_textract_client()
+        self.s3 = get_s3_client()
+        self.bucket = self.settings.S3_BUCKET
+        self.features = list(self.settings.textract.FEATURES)
+        self.poll_interval = self.settings.textract.POLLING_INTERVAL_SECONDS
+        self.max_polls = self.settings.textract.MAX_POLLING_ATTEMPTS
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    @timing()
+    def process_document(self, doc_id: str, s3_input_key: str) -> str:
+        """Analyze a document via Textract and store raw output in S3.
+
+        Args:
+            doc_id: Document identifier (e.g., 'doc_001').
+            s3_input_key: S3 key of the source file (e.g., 'ecmc_org/source_files/pdfs/doc_001.pdf').
+
+        Returns:
+            S3 key where raw Textract JSON was saved.
+
+        Raises:
+            RuntimeError: If Textract job fails or polling exceeds max attempts.
+            ClientError: On AWS API errors.
+        """
+        output_key = self.settings.s3_paths.textract_doc_path(doc_id) + "layout.json"
+
+        # Skip if already processed
+        if check_exists(self.bucket, output_key):
+            logger.info(
+                "Textract output already exists, skipping",
+                extra={"doc_id": doc_id, "s3_key": output_key},
+            )
+            return output_key
+
+        logger.info(
+            "Starting Textract analysis",
+            extra={"doc_id": doc_id, "s3_input_key": s3_input_key, "features": self.features},
+        )
+
+        # Determine sync vs async based on file size (heuristic: >10 pages or >5MB → async)
+        file_size = self._get_s3_file_size(s3_input_key)
+        if file_size and file_size > 5 * 1024 * 1024:
+            raw_response = self._analyze_async(s3_input_key)
+        else:
+            raw_response = self._analyze_sync(s3_input_key)
+
+        # Upload raw response to S3
+        upload_json(self.bucket, output_key, raw_response)
+
+        logger.info(
+            "Textract analysis complete",
+            extra={
+                "doc_id": doc_id,
+                "s3_output_key": output_key,
+                "block_count": len(raw_response.get("Blocks", [])),
+                "fallback_used": raw_response.get("_fallback_used", False),
+            },
+        )
+        return output_key
+
+    # ── Internal: Synchronous Analysis ───────────────────────────────────
+
+    @retry(max_attempts=3, backoff_seconds=2, exceptions=(ClientError,))
+    def _analyze_sync(self, s3_input_key: str) -> Dict[str, Any]:
+        """Call analyze_document (synchronous, best for <10 pages).
+
+        Falls back to detect_document_text if the document format is unsupported
+        (e.g., OneNote-exported PDFs, image-based PDFs without proper structure).
+        """
+        try:
+            response = self.textract.analyze_document(
+                Document={
+                    "S3Object": {"Bucket": self.bucket, "Name": s3_input_key}
+                },
+                FeatureTypes=self.features,
+            )
+            return self._flatten_response(response)
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code == "UnsupportedDocumentException":
+                logger.warning(
+                    "AnalyzeDocument unsupported format, falling back to DetectDocumentText",
+                    extra={"s3_key": s3_input_key, "error": str(exc)},
+                )
+                # Fallback: basic OCR without tables/layout/forms
+                response = self.textract.detect_document_text(
+                    Document={
+                        "S3Object": {"Bucket": self.bucket, "Name": s3_input_key}
+                    }
+                )
+                result = self._flatten_response(response)
+                result["_fallback_used"] = True
+                result["_fallback_type"] = "detect_document_text"
+                result["_original_error"] = str(exc)
+                return result
+            raise
+
+    # ── Internal: Asynchronous Analysis ────────────────────────────────────
+
+    @retry(max_attempts=3, backoff_seconds=2, exceptions=(ClientError,))
+    def _analyze_async(self, s3_input_key: str) -> Dict[str, Any]:
+        """Call start_document_analysis + poll (best for >10 pages)."""
+        start_resp = self.textract.start_document_analysis(
+            DocumentLocation={
+                "S3Object": {"Bucket": self.bucket, "Name": s3_input_key}
+            },
+            FeatureTypes=self.features,
+        )
+        job_id = start_resp["JobId"]
+        logger.info(
+            "Async Textract job started",
+            extra={"job_id": job_id, "s3_input_key": s3_input_key},
+        )
+
+        # Poll until complete
+        for attempt in range(1, self.max_polls + 1):
+            status_resp = self.textract.get_document_analysis(JobId=job_id)
+            status = status_resp["JobStatus"]
+
+            if status == "SUCCEEDED":
+                logger.info(
+                    "Async Textract job succeeded",
+                    extra={"job_id": job_id, "attempts": attempt},
+                )
+                return self._paginate_async_results(job_id)
+
+            if status == "FAILED":
+                error_msg = status_resp.get("StatusMessage", "Unknown error")
+                logger.error(
+                    "Async Textract job failed",
+                    extra={"job_id": job_id, "error": error_msg},
+                )
+                raise RuntimeError(f"Textract job {job_id} failed: {error_msg}")
+
+            logger.info(
+                "Textract job in progress, polling...",
+                extra={"job_id": job_id, "attempt": attempt, "status": status},
+            )
+            time.sleep(self.poll_interval)
+
+        raise RuntimeError(
+            f"Textract job {job_id} did not complete within "
+            f"{self.max_polls * self.poll_interval} seconds"
+        )
+
+    # ── Internal: Pagination ───────────────────────────────────────────────
+
+    def _paginate_async_results(self, job_id: str) -> Dict[str, Any]:
+        """Paginate through all blocks of an async Textract job."""
+        all_blocks: List[Dict[str, Any]] = []
+        next_token: Optional[str] = None
+        page_count = 0
+
+        while True:
+            kwargs = {"JobId": job_id}
+            if next_token:
+                kwargs["NextToken"] = next_token
+
+            page = self.textract.get_document_analysis(**kwargs)
+            page_count += 1
+            blocks = page.get("Blocks", [])
+            all_blocks.extend(blocks)
+
+            next_token = page.get("NextToken")
+            if not next_token:
+                break
+
+        logger.info(
+            "Paginated Textract results",
+            extra={"job_id": job_id, "pages": page_count, "total_blocks": len(all_blocks)},
+        )
+
+        # Return a structure compatible with analyze_document response
+        return {
+            "DocumentMetadata": page.get("DocumentMetadata", {}),
+            "Blocks": all_blocks,
+            "JobId": job_id,
+        }
+
+    # ── Internal: Helpers ──────────────────────────────────────────────────
+
+    def _get_s3_file_size(self, key: str) -> Optional[int]:
+        """Return S3 object size in bytes, or None if not found."""
+        try:
+            resp = self.s3.head_object(Bucket=self.bucket, Key=key)
+            return resp["ContentLength"]
+        except ClientError:
+            return None
+
+    def _flatten_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure consistent structure between sync and async responses."""
+        return {
+            "DocumentMetadata": response.get("DocumentMetadata", {}),
+            "Blocks": response.get("Blocks", []),
+        }
+
+
+# ── Convenience Function ───────────────────────────────────────────────────
+
+def process_document(doc_id: str, s3_input_key: str) -> str:
+    """One-shot function to process a single document.
+
+    Args:
+        doc_id: Document identifier.
+        s3_input_key: S3 key of source PDF/HTML.
+
+    Returns:
+        S3 key of stored Textract output.
+    """
+    processor = TextractProcessor()
+    return processor.process_document(doc_id, s3_input_key)
+###########################
 #!/usr/bin/env python3
 """CLI entry point: Ingest all PDFs from S3 source_files through Textract pipeline.
 
