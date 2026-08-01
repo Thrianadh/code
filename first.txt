@@ -1,3 +1,210 @@
+#textract_processor.py
+
+"""Textract processor with PDF-to-image fallback for problematic documents.
+
+Strategy:
+  1. Try analyze_document with S3Object (fast path for normal PDFs)
+  2. If that fails, try detect_document_text with S3Object
+  3. If THAT also fails, download PDF, render pages to PNG images using PyMuPDF,
+     and send each image to detect_document_text via Bytes (not S3Object)
+  4. Combine all page results into single output JSON
+
+This handles image-based PDFs, OneNote exports, scanned documents, etc.
+"""
+
+import io
+import json
+import time
+from typing import Any, Dict, List, Optional
+
+from botocore.exceptions import ClientError
+
+from config.settings import load_settings
+from utils.aws_clients import get_textract_client, get_s3_client
+from utils.s3_utils import upload_json, check_exists, download_bytes
+from utils.logging_config import get_logger
+from utils.decorators import timing
+
+logger = get_logger("textract_processor")
+
+
+class TextractProcessor:
+    def __init__(self):
+        self.settings = load_settings()
+        self.textract = get_textract_client()
+        self.s3 = get_s3_client()
+        self.bucket = self.settings.S3_BUCKET
+        self.features = list(self.settings.textract.FEATURES)
+        self.poll_interval = self.settings.textract.POLLING_INTERVAL_SECONDS
+        self.max_polls = self.settings.textract.MAX_POLLING_ATTEMPTS
+
+    @timing()
+    def process_document(self, doc_id: str, s3_input_key: str) -> str:
+        output_key = self.settings.s3_paths.textract_doc_path(doc_id) + "layout.json"
+
+        if check_exists(self.bucket, output_key):
+            logger.info("Textract output exists, skipping", extra={"doc_id": doc_id})
+            return output_key
+
+        logger.info(
+            "Starting Textract analysis",
+            extra={"doc_id": doc_id, "source_key": s3_input_key},
+        )
+
+        result = None
+        method_used = "analyze_document"
+
+        # --- Attempt 1: analyze_document with S3Object ---
+        try:
+            result = self._analyze_with_s3(s3_input_key)
+            logger.info("analyze_document succeeded", extra={"doc_id": doc_id})
+        except ClientError as exc:
+            err_code = exc.response["Error"]["Code"]
+            logger.warning(
+                "analyze_document failed",
+                extra={"doc_id": doc_id, "error": err_code},
+            )
+
+            # --- Attempt 2: detect_document_text with S3Object ---
+            try:
+                result = self._detect_with_s3(s3_input_key)
+                method_used = "detect_document_text_s3"
+                logger.info("detect_document_text (S3) succeeded", extra={"doc_id": doc_id})
+            except ClientError as exc2:
+                err_code2 = exc2.response["Error"]["Code"]
+                logger.warning(
+                    "detect_document_text (S3) also failed",
+                    extra={"doc_id": doc_id, "error": err_code2},
+                )
+
+                # --- Attempt 3: PDF → Images → detect_document_text with Bytes ---
+                logger.info(
+                    "Falling back to PDF-to-image rendering",
+                    extra={"doc_id": doc_id},
+                )
+                result = self._process_via_images(doc_id, s3_input_key)
+                method_used = "pdf_to_images"
+
+        if result is None:
+            raise RuntimeError(f"All Textract methods failed for {doc_id}")
+
+        result["_method_used"] = method_used
+        result["_doc_id"] = doc_id
+
+        upload_json(self.bucket, output_key, result)
+        logger.info(
+            "Textract complete",
+            extra={
+                "doc_id": doc_id,
+                "method": method_used,
+                "blocks": len(result.get("Blocks", [])),
+            },
+        )
+        return output_key
+
+    def _analyze_with_s3(self, s3_key: str) -> Dict[str, Any]:
+        """Standard analyze_document for well-formed PDFs."""
+        resp = self.textract.analyze_document(
+            Document={"S3Object": {"Bucket": self.bucket, "Name": s3_key}},
+            FeatureTypes=self.features,
+        )
+        return {"DocumentMetadata": resp.get("DocumentMetadata", {}), "Blocks": resp.get("Blocks", [])}
+
+    def _detect_with_s3(self, s3_key: str) -> Dict[str, Any]:
+        """Basic OCR for PDFs that don't support layout analysis."""
+        resp = self.textract.detect_document_text(
+            Document={"S3Object": {"Bucket": self.bucket, "Name": s3_key}}
+        )
+        return {"DocumentMetadata": resp.get("DocumentMetadata", {}), "Blocks": resp.get("Blocks", [])}
+
+    def _process_via_images(self, doc_id: str, s3_key: str) -> Dict[str, Any]:
+        """Download PDF, render each page to PNG, send each PNG to Textract via Bytes.
+
+        This is the nuclear option for PDFs that Textract can't parse directly.
+        Requires PyMuPDF (fitz) for PDF rendering.
+        """
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            raise RuntimeError(
+                "PyMuPDF (fitz) is required for image fallback but not installed. "
+                "Run: pip install pymupdf"
+            )
+
+        # Download PDF bytes from S3
+        pdf_bytes = download_bytes(self.bucket, s3_key)
+
+        # Open PDF and render pages
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+
+        logger.info(
+            "Rendering PDF to images",
+            extra={"doc_id": doc_id, "pages": total_pages},
+        )
+
+        all_blocks: List[Dict[str, Any]] = []
+        block_id_counter = 0
+
+        for page_idx in range(total_pages):
+            page_num = page_idx + 1
+            page = doc[page_idx]
+
+            # Render page to PNG at 200 DPI (good balance of quality vs size)
+            pix = page.get_pixmap(dpi=200)
+            img_bytes = pix.tobytes("png")
+
+            # Send image to Textract detect_document_text via Bytes
+            try:
+                resp = self.textract.detect_document_text(
+                    Document={"Bytes": img_bytes}
+                )
+                page_blocks = resp.get("Blocks", [])
+
+                # Remap block IDs to be unique across pages
+                # and inject page number into each block
+                for block in page_blocks:
+                    block_id_counter += 1
+                    block["Id"] = f"page_{page_num}_{block['Id']}"
+                    block["Page"] = page_num
+
+                    # Remap child relationships
+                    for rel in block.get("Relationships", []):
+                        rel["Ids"] = [
+                            f"page_{page_num}_{cid}" for cid in rel["Ids"]
+                        ]
+
+                    all_blocks.append(block)
+
+                logger.info(
+                    "Page processed via image",
+                    extra={"doc_id": doc_id, "page": page_num, "blocks": len(page_blocks)},
+                )
+
+            except ClientError as exc:
+                logger.error(
+                    "Page failed via image",
+                    extra={"doc_id": doc_id, "page": page_num, "error": str(exc)},
+                )
+                # Continue with remaining pages, don't fail entire document
+
+        doc.close()
+
+        if not all_blocks:
+            raise RuntimeError(f"All pages failed for {doc_id} via image fallback")
+
+        return {
+            "DocumentMetadata": {"Pages": total_pages},
+            "Blocks": all_blocks,
+            "_fallback_used": True,
+            "_fallback_type": "pdf_to_images",
+        }
+
+
+def process_document(doc_id: str, s3_input_key: str) -> str:
+    processor = TextractProcessor()
+    return processor.process_document(doc_id, s3_input_key)
+#############
 #image_extractor.py
 """Extract figure images from documents and generate captions via Nova Lite multimodal.
 
