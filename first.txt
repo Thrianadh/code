@@ -1,3 +1,98 @@
+#
+def _process_via_images(self, doc_id: str, s3_key: str) -> Dict[str, Any]:
+        """Download PDF, render each page to PNG, send each PNG to Textract via Bytes."""
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            raise RuntimeError("pip install pymupdf required for image fallback")
+
+        pdf_bytes = download_bytes(self.bucket, s3_key)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+
+        logger.info("Rendering PDF to images", extra={"doc_id": doc_id, "pages": total_pages})
+
+        all_blocks: List[Dict[str, Any]] = []
+
+        for page_idx in range(total_pages):
+            page_num = page_idx + 1
+            page = doc[page_idx]
+
+            # Render page to PNG at 150 DPI (reliable size for Textract)
+            pix = page.get_pixmap(dpi=150)
+            
+            # CRITICAL FIX: Use pix.save() to BytesIO instead of pix.tobytes()
+            # tobytes() can produce invalid PNG in some PyMuPDF versions
+            img_buffer = io.BytesIO()
+            pix.save(img_buffer, output="png")
+            img_bytes = img_buffer.getvalue()
+            pix.close()  # Free memory
+
+            # Validate image is not empty
+            if len(img_bytes) < 1000:
+                logger.warning(
+                    "Rendered image too small, skipping page",
+                    extra={"doc_id": doc_id, "page": page_num, "bytes": len(img_bytes)},
+                )
+                continue
+
+            # Send image to Textract detect_document_text via Bytes
+            try:
+                resp = self.textract.detect_document_text(
+                    Document={"Bytes": img_bytes}
+                )
+                page_blocks = resp.get("Blocks", [])
+
+                logger.info(
+                    "Textract image response",
+                    extra={
+                        "doc_id": doc_id,
+                        "page": page_num,
+                        "blocks_received": len(page_blocks),
+                    },
+                )
+
+                if not page_blocks:
+                    logger.warning(
+                        "Textract returned 0 blocks for page",
+                        extra={"doc_id": doc_id, "page": page_num},
+                    )
+                    continue
+
+                # Add page number to each block and collect
+                for block in page_blocks:
+                    block["Page"] = page_num
+                    all_blocks.append(block)
+
+            except ClientError as exc:
+                err_code = exc.response["Error"]["Code"]
+                err_msg = exc.response["Error"].get("Message", "")
+                logger.error(
+                    "Textract failed for page image",
+                    extra={
+                        "doc_id": doc_id,
+                        "page": page_num,
+                        "error_code": err_code,
+                        "error_msg": err_msg,
+                    },
+                )
+                continue
+
+        doc.close()
+
+        if not all_blocks:
+            raise RuntimeError(
+                f"All {total_pages} pages failed for {doc_id}. "
+                f"Textract could not extract text from rendered images."
+            )
+
+        return {
+            "DocumentMetadata": {"Pages": total_pages},
+            "Blocks": all_blocks,
+            "_fallback_used": True,
+            "_fallback_type": "pdf_to_images",
+        }
+######
 def filename_to_doc_id(s3_key: str, max_len: int = 80) -> str:
     filename = os.path.basename(s3_key)
     name = os.path.splitext(filename)[0]
