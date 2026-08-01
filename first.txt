@@ -1,4125 +1,1287 @@
-"""
-Retrieval engine for RAG pipeline with OPTIONAL LLM generation.
-Orchestrates: query embedding -> vector search -> [LLM generation] -> answer.
+#### __init__.py
+"""ECMC RAG Pipeline Configuration Module.
 
-Two modes:
-  1. retrieve()          -> Returns chunks + context_text (no LLM)
-  2. retrieve_and_answer() -> Returns chunks + generated answer from Nova
-
-Optimized for Nova/Claude consumption with clean context formatting.
+All S3 paths, chunking parameters, and prompt templates are centralized here.
+No YAML files — pure Python dataclasses for type safety and IDE autocomplete.
 """
 
-import json
-import logging
-from typing import Any, Dict, List, Optional
-
-import boto3
-from botocore.exceptions import ClientError
-
-from config import config
-from embedding_engine import EmbeddingEngine
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
-class RetrievalEngine:
-    """
-    End-to-end retrieval: embed query -> search -> [expand context] -> [generate answer].
-    Vector store is pluggable (OpenSearch, FAISS, or any custom store).
-    """
-
-    def __init__(
-        self,
-        vector_store: Optional[Any] = None,
-        embedding_engine: Optional[EmbeddingEngine] = None,
-        model_id: Optional[str] = None,
-    ):
-        self.embedder = embedding_engine or EmbeddingEngine()
-        self.store = vector_store
-        self.model_id = model_id or config.BEDROCK_CHAT_MODEL_ID
-        self.is_nova = "nova" in self.model_id.lower()
-        self.bedrock = boto3.client("bedrock-runtime", region_name=config.AWS_REGION)
-
-    # ------------------------------------------------------------------
-    # Mode 1: Pure retrieval (no LLM) — backward compatible
-    # ------------------------------------------------------------------
-
-    def retrieve(
-        self,
-        query: str,
-        top_k: int = 0,
-        filters: Optional[Dict[str, Any]] = None,
-        expand_context: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        """
-        Retrieve relevant chunks for a user query. NO LLM generation.
-
-        Returns:
-            Dict with keys: query, chunks, context_text, total_chunks, expanded
-        """
-        if self.store is None:
-            raise ValueError("No vector store provided.")
-
-        top_k = top_k or config.RETRIEVAL_TOP_K
-        expand = expand_context if expand_context is not None else config.ENABLE_CONTEXT_EXPANSION
-
-        # 1. Embed query via Bedrock Titan
-        query_embedding = self.embedder.embed_text(query)
-
-        # 2. Search vector store
-        chunks = self.store.search(
-            query_embedding=query_embedding,
-            k=top_k,
-            filters=filters,
-        )
-
-        # 3. Context expansion
-        if expand and chunks:
-            chunks = self._expand_context(chunks)
-
-        # 4. Build context text
-        context_text = self._build_context_text(chunks, query)
-
-        result = {
-            "query": query,
-            "chunks": chunks,
-            "context_text": context_text,
-            "total_chunks": len(chunks),
-            "expanded": expand,
-        }
-
-        logger.info(
-            f"Retrieved {len(chunks)} chunks for query: '{query[:60]}...' "
-            f"(expanded={expand})"
-        )
-        return result
-
-    # ------------------------------------------------------------------
-    # Mode 2: Retrieval + LLM Generation (NEW)
-    # ------------------------------------------------------------------
-
-    def retrieve_and_answer(
-        self,
-        query: str,
-        top_k: int = 0,
-        filters: Optional[Dict[str, Any]] = None,
-        expand_context: Optional[bool] = None,
-        system_prompt: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Retrieve chunks AND generate a clean answer via Bedrock Nova/Claude.
-
-        Args:
-            query: User question.
-            top_k: Number of chunks to retrieve.
-            filters: Metadata filters.
-            expand_context: Fetch prev/next neighbors.
-            system_prompt: Optional system prompt. Uses default if None.
-
-        Returns:
-            Dict with ALL retrieve() keys PLUS:
-                - "answer": Generated answer from LLM
-                - "model_id": Model used for generation
-                - "generation_success": True/False
-        """
-        # Step 1: Retrieve
-        retrieval = self.retrieve(
-            query=query,
-            top_k=top_k,
-            filters=filters,
-            expand_context=expand_context,
-        )
-
-        # Step 2: Build LLM prompt
-        prompt = self._build_llm_prompt(query, retrieval["context_text"])
-
-        # Step 3: Generate answer
-        answer, success = self._generate(
-            prompt=prompt,
-            system_prompt=system_prompt,
-        )
-
-        return {
-            **retrieval,  # All retrieve() keys
-            "answer": answer,
-            "model_id": self.model_id,
-            "generation_success": success,
-        }
-
-    # ------------------------------------------------------------------
-    # LLM Generation (Bedrock Nova/Claude)
-    # ------------------------------------------------------------------
-
-    def _generate(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-    ) -> tuple:
-        """
-        Call Bedrock Converse API for answer generation.
-        Returns: (answer_text, success_bool)
-        """
-        default_system = (
-            "You are a helpful assistant for ECMC student loan services. "
-            "Answer questions based ONLY on the provided context. "
-            "If the answer is not in the context, say "I don't have enough information." "
-            "Always cite the document name and page number when possible. "
-            "Be concise and direct."
-        )
-        system = system_prompt or default_system
-
-        try:
-            # Converse API (supports Nova + Claude)
-            kwargs = {
-                "modelId": self.model_id,
-                "messages": [
-                    {"role": "user", "content": [{"text": prompt}]}
-                ],
-                "inferenceConfig": {
-                    "maxTokens": config.CHAT_MAX_TOKENS,
-                    "temperature": config.CHAT_TEMPERATURE,
-                },
-            }
-
-            # Nova requires system as top-level param, not in messages
-            if self.is_nova:
-                kwargs["system"] = [{"text": system}]
-
-            response = self.bedrock.converse(**kwargs)
-            answer = response["output"]["message"]["content"][0]["text"]
-            return answer, True
-
-        except ClientError as e:
-            logger.error(f"Bedrock generation failed: {e}")
-            # Fallback: try without system prompt for older models
-            return self._generate_fallback(prompt, system)
-        except Exception as e:
-            logger.error(f"Unexpected generation error: {e}")
-            return "I apologize, but I'm unable to generate a response right now.", False
-
-    def _generate_fallback(self, prompt: str, system_prompt: str) -> tuple:
-        """Fallback using InvokeModel with native payload."""
-        try:
-            native_request = {
-                "messages": [
-                    {"role": "user", "content": [{"text": prompt}]}
-                ],
-                "inferenceConfig": {
-                    "max_new_tokens": config.CHAT_MAX_TOKENS,
-                    "temperature": config.CHAT_TEMPERATURE,
-                },
-            }
-
-            if self.is_nova:
-                native_request["system"] = [{"text": system_prompt}]
-
-            response = self.bedrock.invoke_model(
-                modelId=self.model_id,
-                body=json.dumps(native_request),
-            )
-            model_response = json.loads(response["body"].read())
-            answer = (
-                model_response.get("output", {})
-                .get("message", {})
-                .get("content", [{}])[0]
-                .get("text", "")
-            )
-            return answer, True
-        except Exception as e:
-            logger.error(f"Fallback generation failed: {e}")
-            return "I apologize, but I'm unable to generate a response right now.", False
-
-    # ------------------------------------------------------------------
-    # Prompt Builders
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_llm_prompt(question: str, context: str) -> str:
-        """Build a clean prompt for the LLM from retrieved context."""
-        return (
-            f"Based on the following documents, answer the question concisely. "
-            f"If the answer is not in the documents, say so.\n\n"
-            f"--- DOCUMENTS ---\n{context}\n"
-            f"--- END OF DOCUMENTS ---\n\n"
-            f"Question: {question}\n\n"
-            f"Answer:"
-        )
-
-    # ------------------------------------------------------------------
-    # Context Expansion (unchanged)
-    # ------------------------------------------------------------------
-
-    def _expand_context(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fetch prev/next neighbors for each chunk."""
-        expanded = []
-        seen_ids = set()
-
-        for chunk in chunks:
-            prev_id = chunk.get("metadata", {}).get("prev_chunk_id") or chunk.get("prev_chunk_id")
-            if prev_id and prev_id not in seen_ids:
-                prev_doc = self.store.get_chunk_by_id(prev_id)
-                if prev_doc:
-                    prev_doc = dict(prev_doc)
-                    prev_doc["score"] = 0.0
-                    prev_doc["is_neighbor"] = True
-                    expanded.append(prev_doc)
-                    seen_ids.add(prev_id)
-
-            cid = chunk.get("chunk_id", "")
-            if cid not in seen_ids:
-                chunk = dict(chunk)
-                chunk["is_neighbor"] = False
-                expanded.append(chunk)
-                seen_ids.add(cid)
-
-            next_id = chunk.get("metadata", {}).get("next_chunk_id") or chunk.get("next_chunk_id")
-            if next_id and next_id not in seen_ids:
-                next_doc = self.store.get_chunk_by_id(next_id)
-                if next_doc:
-                    next_doc = dict(next_doc)
-                    next_doc["score"] = 0.0
-                    next_doc["is_neighbor"] = True
-                    expanded.append(next_doc)
-                    seen_ids.add(next_id)
-
-        return expanded
-
-    @staticmethod
-    def _build_context_text(chunks: List[Dict[str, Any]], query: str = "") -> str:
-        """Build context text from chunks for LLM consumption."""
-        if not chunks:
-            return (
-                "[NO RELEVANT DOCUMENTS FOUND]\n\n"
-                "No matching documents were found in the knowledge base for this query."
-            )
-
-        parts = [f"The following documents were retrieved for the query: "{query}"\n"]
-
-        for i, chunk in enumerate(chunks, 1):
-            tag = "[NEIGHBOR]" if chunk.get("is_neighbor") else f"[DOCUMENT {i}]"
-            meta = chunk.get("metadata", chunk)
-            doc_id = meta.get("document_id", "unknown")
-            page = meta.get("page_number", 0)
-            section = meta.get("section", "")
-            score = chunk.get("score", 0)
-
-            header = f"{tag} Source: {doc_id} | Page: {page} | Section: {section}"
-            if not chunk.get("is_neighbor"):
-                header += f" | Relevance: {score:.3f}"
-
-            parts.append(header)
-            parts.append(chunk.get("text", "").strip())
-            parts.append("")
-
-        parts.append("--- END OF DOCUMENTS ---")
-        return "\n".join(parts)
-
-    # ------------------------------------------------------------------
-    # Convenience methods
-    # ------------------------------------------------------------------
-
-    def retrieve_simple(self, query: str, top_k: int = 0) -> str:
-        """Simplest API: query -> context text string."""
-        result = self.retrieve(query, top_k=top_k)
-        return result["context_text"]
-
-    def answer_simple(self, query: str, top_k: int = 0) -> str:
-        """One-liner: query -> clean answer from Nova."""
-        result = self.retrieve_and_answer(query, top_k=top_k)
-        return result["answer"]
-####### Clean Answer (Recommended)
-
-from faiss_vector_store import FAISSVectorStore
-from retrieval_engine import RetrievalEngine
-
-# 1. Build index
-store = FAISSVectorStore()
-store.build_from_s3()
-
-# 2. Initialize retrieval engine (auto-loads Nova model from config)
-retriever = RetrievalEngine(vector_store=store)
-
-# 3. Get CLEAN answer from Nova
-result = retriever.retrieve_and_answer("what is a t4 letter?", top_k=5)
-print(result["answer"])
-# → "A T4 letter is a notification from your loan servicer about..."
-
-# 4. Also see which chunks were used
-for c in result["chunks"]:
-    if not c.get("is_neighbor"):
-        print(f"  • {c['chunk_id']} | Page {c['metadata'].get('page_number',0)}")
-#####One-Liner Answer
-
-# Just the answer string, nothing else
-answer = retriever.answer_simple("i want to consolidate", top_k=5)
-print(answer)
-##########Raw Chunks Only (Debugging)
-# Same as before — no LLM, just chunks
-result = retriever.retrieve("what is a t4 letter?", top_k=5)
-print(result["context_text"])  # Messy raw chunks
-#######################
-sec_line = f"{prefix}    {sec_branch}{sec.title} [{page_range}]"
-sec_line = f"{prefix}    {sec_branch}{sec.original_heading or sec.title} [{page_range}]"
-
-# In write_excel(), change:
-hierarchy_str = f"{sec.title} ({page_range}) → {keywords_str}"
-
-# To:
-hierarchy_str = f"{sec.original_heading or sec.title} ({page_range}) → {keywords_str}"
-###########
-# =============================================================================
-# FIX 1: CLASSIFICATION — Handle "One_note", "OneNote", "onenote", etc.
-# =============================================================================
-
-def classify_root_node(pdf_path: Path) -> str:
-    """
-    Classify PDF as OneNote or Website based on path/file name.
-    Handles: onenote, one_note, one-note, OneNote, etc.
-    """
-    path_lower = str(pdf_path).lower()
-    # Check for any variant of "onenote" or "one_note"
-    if "onenote" in path_lower or "one_note" in path_lower or "one-note" in path_lower:
-        return ROOT_ONENOTE
-    return ROOT_WEBSITE
-
-
-# =============================================================================
-# FIX 2: TREE RENDERING — Cleaner separation of Website vs OneNote
-# =============================================================================
-
-def write_hierarchy_tree(all_documents: List[DocumentResult], output_path: Path):
-    lines: List[str] = []
-    lines.append("ROOT")
-    lines.append("")
-
-    website_docs = [d for d in all_documents if d.root_node == ROOT_WEBSITE]
-    onenote_docs = [d for d in all_documents if d.root_node == ROOT_ONENOTE]
-
-    def render_docs(docs: List[DocumentResult], prefix: str = "    "):
-        for idx, doc in enumerate(docs):
-            is_last_doc = (idx == len(docs) - 1)
-            doc_branch = "└─ " if is_last_doc else "├─ "
-            lines.append(f"{prefix}{doc_branch}{doc.file_name}")
-
-            for sec_idx, sec in enumerate(doc.sections):
-                is_last_sec = (sec_idx == len(doc.sections) - 1)
-                sec_branch = "└─ " if is_last_sec else "├─ "
-                
-                keywords_str = ", ".join(sec.keywords) if sec.keywords else ""
-                if sec.start_page == sec.end_page:
-                    page_range = f"p.{sec.start_page}"
-                else:
-                    page_range = f"pp.{sec.start_page}-{sec.end_page}"
-                    
-                sec_line = f"{prefix}    {sec_branch}{sec.title} [{page_range}]"
-                if keywords_str:
-                    sec_line += f" → {keywords_str}"
-                lines.append(sec_line)
-            
-            lines.append("")
-
-    # Website node
-    if website_docs:
-        lines.append("├─ Website")
-        render_docs(website_docs, prefix="│   ")
-
-    # OneNote node
-    if onenote_docs:
-        lines.append("└─ OneNote")
-        render_docs(onenote_docs, prefix="    ")
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[Phase 4] Tree saved: {output_path}")
-###############
-"""
-ECMC PDF Hierarchy Extraction — Dual Heading + Inheritance Validation
-Changes:
-  1. Two heading columns: Original Heading (extracted) + Generated Heading (LLM)
-  2. Nova reads full context and picks best heading when multiple exist
-  3. Validation before inheriting: keyword overlap + content similarity
-  4. Inherited headings marked with "(Inherited)" flag
-  5. Page number resolution from printed page numbers
-"""
-
-import os
-import json
-import re
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Set
-from dataclasses import dataclass, asdict, field
-from datetime import datetime
-
-import boto3
-from botocore.exceptions import ClientError
-from pdf2image import convert_from_path
-import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill
-
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-POPPLER_PATH = Path(r"D:\Users\ntrinadh\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin")
-
-INPUT_DIR = Path(r"D:\Users\ntrinadh\OneDrive - ECMC group, Inc\Documents\Ecmc\all documents")
-OUTPUT_DIR = INPUT_DIR / "output"
-TEMP_IMAGE_DIR = OUTPUT_DIR / "temp_images"
-PASS1_DIR = OUTPUT_DIR / "pass1_metadata"
-FINAL_TREE_FILE = OUTPUT_DIR / "hierarchy_tree.txt"
-FINAL_EXCEL_FILE = OUTPUT_DIR / "section_inventory.xlsx"
-
-AWS_REGION = "us-east-1"
-MODEL_ID = "us.amazon.nova-2-lite-v1:0"
-
-DPI = 200
-MAX_PAGES_PER_BATCH = 2
-
-# Validation threshold: minimum keyword overlap % to allow inheritance
-INHERITANCE_KEYWORD_OVERLAP_THRESHOLD = 0.30
-
-ROOT_WEBSITE = "Website"
-ROOT_ONENOTE = "OneNote"
-
-
-# =============================================================================
-# DATA SCHEMAS
-# =============================================================================
-
-@dataclass
-class PageMetadata:
-    page_number: int                    # Sequential counter (1, 2, 3...)
-    printed_page_number: str            # What Nova reads from image
-    original_heading: str             # Extracted from page (best heading)
-    generated_heading: str              # LLM-created descriptive heading
-    subsection_title: str
-    section_summary: str
-    keywords: List[str]
-    keyphrases: List[str]
-    contains_table: bool
-    table_summary: str
-    heading_source: str = "extracted"   # "extracted" | "inherited" | "llm_fallback"
-
-
-@dataclass
-class ConsolidatedSection:
-    title: str                          # Uses generated_heading
-    original_heading: str               # Uses original_heading for comparison
-    summary: str
-    keywords: List[str]
-    keyphrases: List[str]
-    table_summary: str
-    start_page: int
-    end_page: int
-
-
-@dataclass
-class DocumentResult:
-    root_node: str
-    file_name: str
-    file_path: Path
-    sections: List[ConsolidatedSection]
-
-
-# =============================================================================
-# UTILITIES
-# =============================================================================
-
-def classify_root_node(pdf_path: Path) -> str:
-    if "onenote" in str(pdf_path).lower():
-        return ROOT_ONENOTE
-    return ROOT_WEBSITE
-
-
-def clean_json_response(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-    text = re.sub(r",\s*(\]|\})", r"\1", text)
-    return text
-
-
-def ensure_dirs():
-    for d in [OUTPUT_DIR, TEMP_IMAGE_DIR, PASS1_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
-
-
-def keyword_overlap(current_keywords: List[str], previous_keywords: List[str]) -> float:
-    """Calculate Jaccard-like overlap between keyword sets."""
-    if not current_keywords or not previous_keywords:
-        return 0.0
-    current_set = set(k.lower() for k in current_keywords)
-    prev_set = set(k.lower() for k in previous_keywords)
-    intersection = current_set & prev_set
-    union = current_set | prev_set
-    return len(intersection) / len(union) if union else 0.0
-
-
-# =============================================================================
-# PHASE 1: PDF TO IMAGE CONVERSION
-# =============================================================================
-
-def convert_pdf_to_images(pdf_path: Path, dpi: int = 200) -> Tuple[Path, List[Path]]:
-    pdf_stem = pdf_path.stem
-    image_folder = TEMP_IMAGE_DIR / f"{pdf_stem}_images"
-    image_folder.mkdir(parents=True, exist_ok=True)
-
-    for old in image_folder.glob("*.png"):
-        old.unlink()
-
-    pages = convert_from_path(
-        str(pdf_path),
-        dpi=dpi,
-        fmt="png",
-        poppler_path=str(POPPLER_PATH),
-        thread_count=os.cpu_count()
-    )
-
-    image_paths: List[Path] = []
-    for page_num, page in enumerate(pages, start=1):
-        image_name = f"{pdf_stem}_page_{page_num:04d}.png"
-        image_path = image_folder / image_name
-        page.save(str(image_path), "PNG")
-        image_paths.append(image_path)
-
-    print(f"[Phase 1] {pdf_stem}: {len(image_paths)} pages -> {image_folder}")
-    return image_folder, image_paths
-
-
-# =============================================================================
-# PHASE 2: PASS 1 — DUAL HEADING EXTRACTION
-# =============================================================================
-
-def build_pass1_prompt(num_pages: int) -> str:
-    prompt = f"""Analyze these {num_pages} pages visually from an ECMC document.
-
-═══════════════════════════════════════════════════════════════
-TASK 1: EXTRACT PRINTED PAGE NUMBER
-═══════════════════════════════════════════════════════════════
-
-Look at the TOP or BOTTOM of each page for a printed page number.
-Examples: "Phone Guide Page 6", "Page 6", "6", "6 of 12"
-Return ONLY the number/text you see. Empty string if none visible.
-
-═══════════════════════════════════════════════════════════════
-TASK 2: EXTRACT ORIGINAL HEADING (Critical)
-═══════════════════════════════════════════════════════════════
-
-Read the FULL page context and extract the ONE best heading that represents
-the primary topic of the page.
-
-MULTIPLE HEADINGS RULE:
-If the page has more than one heading, do NOT simply pick the largest.
-Apply this ranking:
-  1. COVERAGE: Which heading introduces the MOST content on the page?
-  2. FONT SIZE: Larger/bolder text usually outranks smaller text
-  3. POSITION: Top-of-page heading outranks bottom-of-page heading
-  4. SPECIFICITY: Broader topic beats narrow sub-topic
-     (e.g., "Program Updates" beats "As of June 30, 2023")
-  5. FIRST OCCURRENCE: If truly tied, pick the first one
-
-Place any additional headings (date lines, sub-topics) in subsection_title.
-
-ABSOLUTE RULES for original_heading:
-- NEVER use a bare date (e.g., "As of June 30, 2023")
-- NEVER use bullet point text
-- NEVER use "Page X" or footer text
-- If the page truly has NO heading, return EMPTY STRING
-
-═══════════════════════════════════════════════════════════════
-TASK 3: GENERATE DESCRIPTIVE HEADING
-═══════════════════════════════════════════════════════════════
-
-Create a concise, descriptive heading (3-8 words) based on the page content.
-This should describe the TOPIC, not copy the original heading exactly.
-Examples:
-  Original: "Program Updates" → Generated: "Biden-Harris Student Debt Relief Plan"
-  Original: "3rd Party Borrowers" → Generated: "College Assist and OCAP Borrower Guide"
-
-═══════════════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════════════
-
-Return a JSON ARRAY with exactly {num_pages} objects.
-
-Each object:
-{{
-  "page_number": integer,
-  "printed_page_number": "text from page or empty",
-  "original_heading": "the best heading extracted from the page, or empty",
-  "generated_heading": "your LLM-generated descriptive heading (3-8 words)",
-  "subsection_title": "date lines or secondary headings, or empty",
-  "section_summary": "exactly one sentence",
-  "keywords": ["keyword1", "keyword2"],
-  "keyphrases": ["keyphrase1", "keyphrase2", "keyphrase3"],
-  "contains_table": false,
-  "table_summary": ""
-}}
-
-CRITICAL:
-- original_heading = what is ACTUALLY printed on the page (best one only)
-- generated_heading = what YOU create from understanding the content
-- Return ONLY the JSON array. No markdown fences.
-"""
-    return prompt
-
-
-def run_nova_pass1(image_paths: List[Path], pdf_name: str) -> List[PageMetadata]:
-    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
-
-    content_blocks: List[Dict[str, Any]] = []
-
-    for img_path in image_paths:
-        with open(img_path, "rb") as f:
-            image_bytes = f.read()
-        content_blocks.append({
-            "image": {
-                "format": "png",
-                "source": {"bytes": image_bytes}
-            }
-        })
-
-    prompt_text = build_pass1_prompt(len(image_paths))
-    content_blocks.append({"text": prompt_text})
-
-    messages = [{"role": "user", "content": content_blocks}]
-
-    try:
-        response = bedrock.converse(
-            modelId=MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
-        )
-    except ClientError as e:
-        raise RuntimeError(f"Bedrock Converse failed for {pdf_name}: {e}") from e
-
-    output_message = response.get("output", {}).get("message", {})
-    output_text = ""
-    for block in output_message.get("content", []):
-        if "text" in block:
-            output_text += block["text"]
-
-    if not output_text:
-        raise ValueError(f"Empty response from Nova Lite for {pdf_name}")
-
-    cleaned = clean_json_response(output_text)
-    try:
-        raw_results = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        debug_path = PASS1_DIR / f"{pdf_name}_pass1_raw_error.txt"
-        debug_path.write_text(output_text, encoding="utf-8")
-        raise ValueError(f"JSON parse failed for {pdf_name}. Raw saved to {debug_path}. Error: {e}") from e
-
-    if not isinstance(raw_results, list):
-        raise ValueError(f"Expected JSON array from Nova, got {type(raw_results)} for {pdf_name}")
-
-    page_results: List[PageMetadata] = []
-    for idx, raw in enumerate(raw_results, start=1):
-        pm = PageMetadata(
-            page_number=raw.get("page_number", idx),
-            printed_page_number=str(raw.get("printed_page_number", "")).strip(),
-            original_heading=raw.get("original_heading", ""),
-            generated_heading=raw.get("generated_heading", ""),
-            subsection_title=raw.get("subsection_title", ""),
-            section_summary=raw.get("section_summary", ""),
-            keywords=raw.get("keywords", []) or [],
-            keyphrases=raw.get("keyphrases", []) or [],
-            contains_table=raw.get("contains_table", False),
-            table_summary=raw.get("table_summary", ""),
-        )
-        page_results.append(pm)
-
-    return page_results
-
-
-def save_pass1_checkpoint(pdf_name: str, page_results: List[PageMetadata]):
-    checkpoint_path = PASS1_DIR / f"{pdf_name}_pass1.json"
-    data = [asdict(p) for p in page_results]
-    checkpoint_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[Phase 2] Checkpoint saved: {checkpoint_path}")
-
-
-# =============================================================================
-# PAGE NUMBER RESOLUTION
-# =============================================================================
-
-def resolve_page_numbers(page_results: List[PageMetadata]) -> List[PageMetadata]:
-    for page in page_results:
-        printed = page.printed_page_number
-        resolved = page.page_number  # fallback
-        
-        if printed:
-            digits = re.findall(r'\d+', printed)
-            if digits:
-                try:
-                    resolved = int(digits[-1])
-                except ValueError:
-                    resolved = page.page_number
-        
-        page.resolved_page_number = resolved
-    
-    return page_results
-
-
-# =============================================================================
-# POST-PROCESSING: VALIDATED HEADING INHERITANCE
-# =============================================================================
-
-def is_date_only(text: str) -> bool:
-    if not text:
-        return False
-    text_lower = text.lower().strip()
-    date_patterns = [
-        r"^as of\s+\w+\s+\d{1,2},?\s+\d{4}",
-        r"^updated:?\s*\w+\s+\d{1,2},?\s+\d{4}",
-        r"^effective\s+\w+\s+\d{1,2},?\s+\d{4}",
-        r"^revised:?\s*\w+\s+\d{1,2},?\s+\d{4}",
-        r"^\w+\s+\d{1,2},?\s+\d{4}$",
-    ]
-    return any(re.search(p, text_lower) for p in date_patterns)
-
-
-def sanitize_and_inherit_headings(page_results: List[PageMetadata]) -> List[PageMetadata]:
-    """
-    Three-step process:
-    1. Fix date lines that leaked into original_heading
-    2. Validate inheritance using keyword overlap
-    3. Mark source of each heading
-    """
-    fixed: List[PageMetadata] = []
-    last_valid_original = ""
-    last_valid_generated = ""
-    last_keywords: List[str] = []
-
-    for page in page_results:
-        orig = page.original_heading.strip()
-        gen = page.generated_heading.strip()
-        sub = page.subsection_title.strip()
-
-        # Step 1: If original_heading is a date, move to subsection
-        if is_date_only(orig):
-            if not sub:
-                sub = orig
-            orig = ""
-
-        # Step 2: If original_heading is empty, validate before inheriting
-        if not orig:
-            if last_valid_original:
-                # Validate: check keyword overlap
-                overlap = keyword_overlap(page.keywords, last_keywords)
-                
-                if overlap >= INHERITANCE_KEYWORD_OVERLAP_THRESHOLD:
-                    # Validated: content matches previous page
-                    orig = last_valid_original
-                    source = "inherited"
-                else:
-                    # Not validated: content drifted, use generated as fallback
-                    orig = gen if gen else "General Content"
-                    source = "llm_fallback"
-            else:
-                # First page with no heading
-                orig = gen if gen else "General Content"
-                source = "llm_fallback"
-        else:
-            # Has valid original heading
-            source = "extracted"
-
-        # Step 3: Update tracking variables
-        if orig and source in ("extracted", "inherited"):
-            last_valid_original = orig
-            last_valid_generated = gen if gen else orig
-            last_keywords = page.keywords
-
-        fixed.append(PageMetadata(
-            page_number=page.page_number,
-            printed_page_number=page.printed_page_number,
-            original_heading=orig,
-            generated_heading=gen if gen else orig,
-            subsection_title=sub,
-            section_summary=page.section_summary,
-            keywords=page.keywords,
-            keyphrases=page.keyphrases,
-            contains_table=page.contains_table,
-            table_summary=page.table_summary,
-            heading_source=source,
-        ))
-
-    return fixed
-
-
-# =============================================================================
-# PHASE 3: DOCUMENT CONSOLIDATION
-# =============================================================================
-
-def consolidate_document(pdf_name: str, page_results: List[PageMetadata]) -> List[ConsolidatedSection]:
-    if not page_results:
-        return []
-
-    page_results = resolve_page_numbers(page_results)
-    page_results = sanitize_and_inherit_headings(page_results)
-
-    sections: List[ConsolidatedSection] = []
-    
-    first_resolved = getattr(page_results[0], 'resolved_page_number', page_results[0].page_number)
-
-    current = ConsolidatedSection(
-        title=page_results[0].generated_heading or page_results[0].original_heading or "Untitled Section",
-        original_heading=page_results[0].original_heading,
-        summary=page_results[0].section_summary,
-        keywords=list(page_results[0].keywords),
-        keyphrases=list(page_results[0].keyphrases),
-        table_summary=page_results[0].table_summary,
-        start_page=first_resolved,
-        end_page=first_resolved,
-    )
-
-    for page in page_results[1:]:
-        page_gen = page.generated_heading or ""
-        page_orig = page.original_heading or ""
-        resolved = getattr(page, 'resolved_page_number', page.page_number)
-        
-        # Consolidate if generated heading matches (or original matches as fallback)
-        match_title = page_gen if page_gen else page_orig
-        
-        if match_title and match_title == current.title:
-            current.end_page = resolved
-            current.keywords = list(dict.fromkeys(current.keywords + page.keywords))[:3]
-            current.keyphrases = list(dict.fromkeys(current.keyphrases + page.keyphrases))[:5]
-            if page.table_summary:
-                current.table_summary = page.table_summary
-            if not current.summary and page.section_summary:
-                current.summary = page.section_summary
-        else:
-            sections.append(current)
-            current = ConsolidatedSection(
-                title=match_title or current.title,
-                original_heading=page_orig,
-                summary=page.section_summary,
-                keywords=list(page.keywords)[:3],
-                keyphrases=list(page.keyphrases)[:5],
-                table_summary=page.table_summary,
-                start_page=resolved,
-                end_page=resolved,
-            )
-
-    sections.append(current)
-    return sections
-
-
-# =============================================================================
-# PHASE 4: OUTPUT GENERATION
-# =============================================================================
-
-def write_excel(all_documents: List[DocumentResult], output_path: Path):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Section Inventory"
-
-    headers = [
-        "Root Node", "File", "Original Heading", "Generated Heading",
-        "Section Summary", "Keywords", "Keyphrases", "Table Summary",
-        "Start Page", "End Page", "Page Range", "Hierarchy Tree"
-    ]
-    ws.append(headers)
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    for doc in all_documents:
-        for sec in doc.sections:
-            keywords_str = "; ".join(sec.keywords)
-            keyphrases_str = "; ".join(sec.keyphrases)
-            
-            if sec.start_page == sec.end_page:
-                page_range = f"p. {sec.start_page}"
-            else:
-                page_range = f"pp. {sec.start_page}-{sec.end_page}"
-                
-            hierarchy_str = f"{sec.title} ({page_range}) → {keywords_str}" if keywords_str else f"{sec.title} ({page_range})"
-
-            row = [
-                doc.root_node,
-                doc.file_name,
-                sec.original_heading,
-                sec.title,
-                sec.summary,
-                keywords_str,
-                keyphrases_str,
-                sec.table_summary,
-                sec.start_page,
-                sec.end_page,
-                page_range,
-                hierarchy_str,
-            ]
-            ws.append(row)
-
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            except Exception:
-                pass
-        ws.column_dimensions[column].width = min(max_length + 2, 80)
-
-    wb.save(str(output_path))
-    print(f"[Phase 4] Excel saved: {output_path}")
-
-
-def write_hierarchy_tree(all_documents: List[DocumentResult], output_path: Path):
-    lines: List[str] = []
-    lines.append("ROOT")
-    lines.append("")
-
-    website_docs = [d for d in all_documents if d.root_node == ROOT_WEBSITE]
-    onenote_docs = [d for d in all_documents if d.root_node == ROOT_ONENOTE]
-
-    def render_docs(docs: List[DocumentResult], indent: str = "├─ "):
-        for doc in docs:
-            lines.append(f"{indent}{doc.file_name}")
-            for sec in doc.sections:
-                keywords_str = ", ".join(sec.keywords) if sec.keywords else ""
-                if sec.start_page == sec.end_page:
-                    page_range = f"p.{sec.start_page}"
-                else:
-                    page_range = f"pp.{sec.start_page}-{sec.end_page}"
-                    
-                sec_line = f"{indent}    ├─ {sec.title} [{page_range}]"
-                if keywords_str:
-                    sec_line += f" → {keywords_str}"
-                lines.append(sec_line)
-            lines.append("")
-
-    if website_docs:
-        lines.append("├─ Website")
-        render_docs(website_docs, indent="│   ├─ ")
-
-    if onenote_docs:
-        lines.append("└─ OneNote")
-        render_docs(onenote_docs, indent="    ├─ ")
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[Phase 4] Tree saved: {output_path}")
-
-
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
-
-def main():
-    print("=" * 60)
-    print("ECMC PDF Hierarchy — Dual Heading + Inheritance Validation")
-    print(f"Started: {datetime.now().isoformat()}")
-    print("=" * 60)
-
-    ensure_dirs()
-
-    pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
-    if not pdf_files:
-        print(f"No PDFs found in {INPUT_DIR}")
-        return
-
-    print(f"\nDiscovered {len(pdf_files)} PDF(s):")
-    for p in pdf_files:
-        print(f"  - {p.relative_to(INPUT_DIR)}")
-
-    all_results: List[DocumentResult] = []
-
-    for pdf_path in pdf_files:
-        pdf_name = pdf_path.stem
-        root_node = classify_root_node(pdf_path)
-
-        print(f"\n{'─' * 50}")
-        print(f"Processing: {pdf_name} | Root: {root_node}")
-        print(f"{'─' * 50}")
-
-        # Phase 1
-        _, image_paths = convert_pdf_to_images(pdf_path, dpi=DPI)
-
-        if not image_paths:
-            print(f"  WARNING: No images extracted. Skipping.")
-            continue
-
-        # Phase 2
-        page_results: List[PageMetadata] = []
-
-        for i in range(0, len(image_paths), MAX_PAGES_PER_BATCH):
-            chunk = image_paths[i:i + MAX_PAGES_PER_BATCH]
-            try:
-                chunk_results = run_nova_pass1(chunk, pdf_name)
-                page_results.extend(chunk_results)
-            except Exception as e:
-                print(f"  ERROR in Pass 1 chunk {i//MAX_PAGES_PER_BATCH + 1}: {e}")
-                continue
-
-        save_pass1_checkpoint(pdf_name, page_results)
-
-        # Phase 3
-        if not page_results:
-            print(f"  WARNING: No page results. Skipping.")
-            continue
-
-        consolidated = consolidate_document(pdf_name, page_results)
-
-        doc_result = DocumentResult(
-            root_node=root_node,
-            file_name=pdf_path.name,
-            file_path=pdf_path,
-            sections=consolidated,
-        )
-        all_results.append(doc_result)
-
-    # Phase 4
-    print(f"\n{'=' * 60}")
-    print("Generating final outputs...")
-    print(f"{'=' * 60}")
-
-    write_excel(all_results, FINAL_EXCEL_FILE)
-    write_hierarchy_tree(all_results, FINAL_TREE_FILE)
-
-    print(f"\n{'=' * 60}")
-    print("Pipeline complete.")
-    print(f"Excel : {FINAL_EXCEL_FILE}")
-    print(f"Tree  : {FINAL_TREE_FILE}")
-    print(f"{'=' * 60}")
-
-
-if __name__ == "__main__":
-    main()
-###################################################################################
-"""
-ECMC PDF Hierarchy Extraction — Page Number Resolution
-Changes:
-  1. Nova Lite now extracts printed page numbers from page images
-  2. If printed page number found -> use it; else -> fallback to sequential counter
-  3. Excel/Tree show resolved page numbers (document-accurate)
-"""
-
-import os
-import json
-import re
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, asdict
-from datetime import datetime
-
-import boto3
-from botocore.exceptions import ClientError
-from pdf2image import convert_from_path
-import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill
-
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-POPPLER_PATH = Path(r"D:\Users\ntrinadh\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin")
-
-INPUT_DIR = Path(r"D:\Users\ntrinadh\OneDrive - ECMC group, Inc\Documents\Ecmc\all documents")
-OUTPUT_DIR = INPUT_DIR / "output"
-TEMP_IMAGE_DIR = OUTPUT_DIR / "temp_images"
-PASS1_DIR = OUTPUT_DIR / "pass1_metadata"
-FINAL_TREE_FILE = OUTPUT_DIR / "hierarchy_tree.txt"
-FINAL_EXCEL_FILE = OUTPUT_DIR / "section_inventory.xlsx"
-
-AWS_REGION = "us-east-1"
-MODEL_ID = "us.amazon.nova-2-lite-v1:0"
-
-DPI = 200
-MAX_PAGES_PER_BATCH = 2
-
-ROOT_WEBSITE = "Website"
-ROOT_ONENOTE = "OneNote"
-
-
-# =============================================================================
-# DATA SCHEMAS
-# =============================================================================
-
-@dataclass
-class PageMetadata:
-    page_number: int              # Sequential counter (1, 2, 3...)
-    printed_page_number: str      # What Nova reads from the image ("6", "Phone Guide Page 6", "")
-    generated_heading: str
-    subsection_title: str
-    section_summary: str
-    keywords: List[str]
-    keyphrases: List[str]
-    contains_table: bool
-    table_summary: str
-
-
-@dataclass
-class ConsolidatedSection:
-    title: str
-    summary: str
-    keywords: List[str]
-    keyphrases: List[str]
-    table_summary: str
-    start_page: int               # RESOLVED page number
-    end_page: int                 # RESOLVED page number
-
-
-@dataclass
-class DocumentResult:
-    root_node: str
-    file_name: str
-    file_path: Path
-    sections: List[ConsolidatedSection]
-
-
-# =============================================================================
-# UTILITIES
-# =============================================================================
-
-def classify_root_node(pdf_path: Path) -> str:
-    if "onenote" in str(pdf_path).lower():
-        return ROOT_ONENOTE
-    return ROOT_WEBSITE
-
-
-def clean_json_response(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-    text = re.sub(r",\s*(\]|\})", r"\1", text)
-    return text
-
-
-def ensure_dirs():
-    for d in [OUTPUT_DIR, TEMP_IMAGE_DIR, PASS1_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
-
-
-# =============================================================================
-# PHASE 1: PDF TO IMAGE CONVERSION
-# =============================================================================
-
-def convert_pdf_to_images(pdf_path: Path, dpi: int = 200) -> Tuple[Path, List[Path]]:
-    pdf_stem = pdf_path.stem
-    image_folder = TEMP_IMAGE_DIR / f"{pdf_stem}_images"
-    image_folder.mkdir(parents=True, exist_ok=True)
-
-    for old in image_folder.glob("*.png"):
-        old.unlink()
-
-    pages = convert_from_path(
-        str(pdf_path),
-        dpi=dpi,
-        fmt="png",
-        poppler_path=str(POPPLER_PATH),
-        thread_count=os.cpu_count()
-    )
-
-    image_paths: List[Path] = []
-    for page_num, page in enumerate(pages, start=1):
-        image_name = f"{pdf_stem}_page_{page_num:04d}.png"
-        image_path = image_folder / image_name
-        page.save(str(image_path), "PNG")
-        image_paths.append(image_path)
-
-    print(f"[Phase 1] {pdf_stem}: {len(image_paths)} pages -> {image_folder}")
-    return image_folder, image_paths
-
-
-# =============================================================================
-# PHASE 2: PASS 1 — LLM WITH PRINTED PAGE NUMBER EXTRACTION
-# =============================================================================
-
-def build_pass1_prompt(num_pages: int) -> str:
-    prompt = f"""Analyze these {num_pages} pages visually from an ECMC document.
-
-═══════════════════════════════════════════════════════════════
-TASK 1: EXTRACT PRINTED PAGE NUMBER
-═══════════════════════════════════════════════════════════════
-
-Look at the TOP or BOTTOM of each page for a printed page number.
-Examples of what to look for:
-  - "Phone Guide Page 6"
-  - "Page 6"
-  - "6"
-  - "6 of 12"
-
-Report ONLY the number or text you see. If no page number is visible, return an EMPTY STRING.
-
-═══════════════════════════════════════════════════════════════
-TASK 2: GENERATE HEADING
-═══════════════════════════════════════════════════════════════
-
-Generate a concise, descriptive heading (3-8 words) based on the page content.
-- Describe the TOPIC, not the format.
-- NEVER use a bare date as the heading.
-- If the page continues the same topic as the previous page, you may use the same heading.
-
-═══════════════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════════════
-
-Return a JSON ARRAY with exactly {num_pages} objects.
-
-Each object:
-{{
-  "page_number": integer,
-  "printed_page_number": "the text/number printed on the page, or empty string",
-  "generated_heading": "Your generated heading (3-8 words)",
-  "subsection_title": "Date line or sub-topic, or empty",
-  "section_summary": "Exactly one sentence",
-  "keywords": ["keyword1", "keyword2"],
-  "keyphrases": ["keyphrase1", "keyphrase2", "keyphrase3"],
-  "contains_table": false,
-  "table_summary": ""
-}}
-
-CRITICAL:
-- printed_page_number: extract ONLY what is printed on the page. Do NOT invent numbers.
-- Return ONLY the JSON array. No markdown fences.
-"""
-    return prompt
-
-
-def run_nova_pass1(image_paths: List[Path], pdf_name: str) -> List[PageMetadata]:
-    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
-
-    content_blocks: List[Dict[str, Any]] = []
-
-    for img_path in image_paths:
-        with open(img_path, "rb") as f:
-            image_bytes = f.read()
-        content_blocks.append({
-            "image": {
-                "format": "png",
-                "source": {"bytes": image_bytes}
-            }
-        })
-
-    prompt_text = build_pass1_prompt(len(image_paths))
-    content_blocks.append({"text": prompt_text})
-
-    messages = [{"role": "user", "content": content_blocks}]
-
-    try:
-        response = bedrock.converse(
-            modelId=MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
-        )
-    except ClientError as e:
-        raise RuntimeError(f"Bedrock Converse failed for {pdf_name}: {e}") from e
-
-    output_message = response.get("output", {}).get("message", {})
-    output_text = ""
-    for block in output_message.get("content", []):
-        if "text" in block:
-            output_text += block["text"]
-
-    if not output_text:
-        raise ValueError(f"Empty response from Nova Lite for {pdf_name}")
-
-    cleaned = clean_json_response(output_text)
-    try:
-        raw_results = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        debug_path = PASS1_DIR / f"{pdf_name}_pass1_raw_error.txt"
-        debug_path.write_text(output_text, encoding="utf-8")
-        raise ValueError(f"JSON parse failed for {pdf_name}. Raw saved to {debug_path}. Error: {e}") from e
-
-    if not isinstance(raw_results, list):
-        raise ValueError(f"Expected JSON array from Nova, got {type(raw_results)} for {pdf_name}")
-
-    page_results: List[PageMetadata] = []
-    for idx, raw in enumerate(raw_results, start=1):
-        pm = PageMetadata(
-            page_number=raw.get("page_number", idx),
-            printed_page_number=str(raw.get("printed_page_number", "")).strip(),
-            generated_heading=raw.get("generated_heading", ""),
-            subsection_title=raw.get("subsection_title", ""),
-            section_summary=raw.get("section_summary", ""),
-            keywords=raw.get("keywords", []) or [],
-            keyphrases=raw.get("keyphrases", []) or [],
-            contains_table=raw.get("contains_table", False),
-            table_summary=raw.get("table_summary", ""),
-        )
-        page_results.append(pm)
-
-    return page_results
-
-
-def save_pass1_checkpoint(pdf_name: str, page_results: List[PageMetadata]):
-    checkpoint_path = PASS1_DIR / f"{pdf_name}_pass1.json"
-    data = [asdict(p) for p in page_results]
-    checkpoint_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[Phase 2] Checkpoint saved: {checkpoint_path}")
-
-
-# =============================================================================
-# PAGE NUMBER RESOLUTION
-# =============================================================================
-
-def resolve_page_numbers(page_results: List[PageMetadata]) -> List[PageMetadata]:
-    """
-    For each page:
-      - If printed_page_number is detected and looks valid -> keep it
-      - Else -> fallback to sequential counter (page_number)
-    
-    Also stores the resolved number back for downstream use.
-    """
-    resolved_results = []
-    
-    for page in page_results:
-        printed = page.printed_page_number
-        
-        # Try to extract a clean number from printed_page_number
-        resolved = page.page_number  # default fallback
-        
-        if printed:
-            # Look for digits in the printed text (e.g., "Phone Guide Page 6" -> 6)
-            digits = re.findall(r'\d+', printed)
-            if digits:
-                # Use the last group of digits (usually the actual page number)
-                try:
-                    resolved = int(digits[-1])
-                except ValueError:
-                    resolved = page.page_number
-        
-        # Store resolved page number in a new field by creating updated dataclass
-        # We'll attach it as an extra attribute for consolidation
-        page.resolved_page_number = resolved
-        resolved_results.append(page)
-    
-    return resolved_results
-
-
-# =============================================================================
-# POST-PROCESSING: SANITIZE HEADINGS
-# =============================================================================
-
-def is_date_only(text: str) -> bool:
-    if not text:
-        return False
-    text_lower = text.lower().strip()
-    date_patterns = [
-        r"^as of\s+\w+\s+\d{1,2},?\s+\d{4}",
-        r"^updated:?\s*\w+\s+\d{1,2},?\s+\d{4}",
-        r"^effective\s+\w+\s+\d{1,2},?\s+\d{4}",
-        r"^revised:?\s*\w+\s+\d{1,2},?\s+\d{4}",
-        r"^\w+\s+\d{1,2},?\s+\d{4}$",
-    ]
-    return any(re.search(p, text_lower) for p in date_patterns)
-
-
-def sanitize_page_results(page_results: List[PageMetadata]) -> List[PageMetadata]:
-    fixed = []
-    last_good_heading = ""
-
-    for page in page_results:
-        heading = page.generated_heading
-        sub = page.subsection_title
-
-        if is_date_only(heading):
-            if last_good_heading:
-                heading = last_good_heading
-            else:
-                heading = "General Content"
-            if not sub:
-                sub = page.generated_heading
-
-        if heading and not is_date_only(heading):
-            last_good_heading = heading
-
-        fixed.append(PageMetadata(
-            page_number=page.page_number,
-            printed_page_number=page.printed_page_number,
-            generated_heading=heading,
-            subsection_title=sub,
-            section_summary=page.section_summary,
-            keywords=page.keywords,
-            keyphrases=page.keyphrases,
-            contains_table=page.contains_table,
-            table_summary=page.table_summary,
-        ))
-
-    return fixed
-
-
-# =============================================================================
-# PHASE 3: DOCUMENT CONSOLIDATION (USES RESOLVED PAGE NUMBERS)
-# =============================================================================
-
-def consolidate_document(pdf_name: str, page_results: List[PageMetadata]) -> List[ConsolidatedSection]:
-    if not page_results:
-        return []
-
-    # Resolve page numbers first
-    page_results = resolve_page_numbers(page_results)
-    
-    sections: List[ConsolidatedSection] = []
-    
-    first_resolved = getattr(page_results[0], 'resolved_page_number', page_results[0].page_number)
-    
-    current = ConsolidatedSection(
-        title=page_results[0].generated_heading or "Untitled Section",
-        summary=page_results[0].section_summary,
-        keywords=list(page_results[0].keywords),
-        keyphrases=list(page_results[0].keyphrases),
-        table_summary=page_results[0].table_summary,
-        start_page=first_resolved,
-        end_page=first_resolved,
-    )
-
-    for page in page_results[1:]:
-        page_heading = page.generated_heading or ""
-        resolved = getattr(page, 'resolved_page_number', page.page_number)
-        
-        if page_heading and page_heading == current.title:
-            current.end_page = resolved
-            current.keywords = list(dict.fromkeys(current.keywords + page.keywords))[:3]
-            current.keyphrases = list(dict.fromkeys(current.keyphrases + page.keyphrases))[:5]
-            if page.table_summary:
-                current.table_summary = page.table_summary
-            if not current.summary and page.section_summary:
-                current.summary = page.section_summary
-        else:
-            sections.append(current)
-            current = ConsolidatedSection(
-                title=page_heading or current.title,
-                summary=page.section_summary,
-                keywords=list(page.keywords)[:3],
-                keyphrases=list(page.keyphrases)[:5],
-                table_summary=page.table_summary,
-                start_page=resolved,
-                end_page=resolved,
-            )
-
-    sections.append(current)
-    return sections
-
-
-# =============================================================================
-# PHASE 4: OUTPUT GENERATION
-# =============================================================================
-
-def write_excel(all_documents: List[DocumentResult], output_path: Path):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Section Inventory"
-
-    headers = [
-        "Root Node", "File", "Generated Heading", "Section Summary",
-        "Keywords", "Keyphrases", "Table Summary",
-        "Start Page", "End Page", "Page Range", "Hierarchy Tree"
-    ]
-    ws.append(headers)
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    for doc in all_documents:
-        for sec in doc.sections:
-            keywords_str = "; ".join(sec.keywords)
-            keyphrases_str = "; ".join(sec.keyphrases)
-            
-            if sec.start_page == sec.end_page:
-                page_range = f"p. {sec.start_page}"
-            else:
-                page_range = f"pp. {sec.start_page}-{sec.end_page}"
-                
-            hierarchy_str = f"{sec.title} ({page_range}) → {keywords_str}" if keywords_str else f"{sec.title} ({page_range})"
-
-            row = [
-                doc.root_node,
-                doc.file_name,
-                sec.title,
-                sec.summary,
-                keywords_str,
-                keyphrases_str,
-                sec.table_summary,
-                sec.start_page,
-                sec.end_page,
-                page_range,
-                hierarchy_str,
-            ]
-            ws.append(row)
-
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            except Exception:
-                pass
-        ws.column_dimensions[column].width = min(max_length + 2, 80)
-
-    wb.save(str(output_path))
-    print(f"[Phase 4] Excel saved: {output_path}")
-
-
-def write_hierarchy_tree(all_documents: List[DocumentResult], output_path: Path):
-    lines: List[str] = []
-    lines.append("ROOT")
-    lines.append("")
-
-    website_docs = [d for d in all_documents if d.root_node == ROOT_WEBSITE]
-    onenote_docs = [d for d in all_documents if d.root_node == ROOT_ONENOTE]
-
-    def render_docs(docs: List[DocumentResult], indent: str = "├─ "):
-        for doc in docs:
-            lines.append(f"{indent}{doc.file_name}")
-            for sec in doc.sections:
-                keywords_str = ", ".join(sec.keywords) if sec.keywords else ""
-                if sec.start_page == sec.end_page:
-                    page_range = f"p.{sec.start_page}"
-                else:
-                    page_range = f"pp.{sec.start_page}-{sec.end_page}"
-                    
-                sec_line = f"{indent}    ├─ {sec.title} [{page_range}]"
-                if keywords_str:
-                    sec_line += f" → {keywords_str}"
-                lines.append(sec_line)
-            lines.append("")
-
-    if website_docs:
-        lines.append("├─ Website")
-        render_docs(website_docs, indent="│   ├─ ")
-
-    if onenote_docs:
-        lines.append("└─ OneNote")
-        render_docs(onenote_docs, indent="    ├─ ")
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[Phase 4] Tree saved: {output_path}")
-
-
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
-
-def main():
-    print("=" * 60)
-    print("ECMC PDF Hierarchy — Page Number Resolution")
-    print(f"Started: {datetime.now().isoformat()}")
-    print("=" * 60)
-
-    ensure_dirs()
-
-    pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
-    if not pdf_files:
-        print(f"No PDFs found in {INPUT_DIR}")
-        return
-
-    print(f"\nDiscovered {len(pdf_files)} PDF(s):")
-    for p in pdf_files:
-        print(f"  - {p.relative_to(INPUT_DIR)}")
-
-    all_results: List[DocumentResult] = []
-
-    for pdf_path in pdf_files:
-        pdf_name = pdf_path.stem
-        root_node = classify_root_node(pdf_path)
-
-        print(f"\n{'─' * 50}")
-        print(f"Processing: {pdf_name} | Root: {root_node}")
-        print(f"{'─' * 50}")
-
-        # Phase 1
-        _, image_paths = convert_pdf_to_images(pdf_path, dpi=DPI)
-
-        if not image_paths:
-            print(f"  WARNING: No images extracted. Skipping.")
-            continue
-
-        # Phase 2
-        page_results: List[PageMetadata] = []
-
-        for i in range(0, len(image_paths), MAX_PAGES_PER_BATCH):
-            chunk = image_paths[i:i + MAX_PAGES_PER_BATCH]
-            try:
-                chunk_results = run_nova_pass1(chunk, pdf_name)
-                page_results.extend(chunk_results)
-            except Exception as e:
-                print(f"  ERROR in Pass 1 chunk {i//MAX_PAGES_PER_BATCH + 1}: {e}")
-                continue
-
-        # Sanitize headings
-        page_results = sanitize_page_results(page_results)
-        save_pass1_checkpoint(pdf_name, page_results)
-
-        # Phase 3
-        if not page_results:
-            print(f"  WARNING: No page results. Skipping.")
-            continue
-
-        consolidated = consolidate_document(pdf_name, page_results)
-
-        doc_result = DocumentResult(
-            root_node=root_node,
-            file_name=pdf_path.name,
-            file_path=pdf_path,
-            sections=consolidated,
-        )
-        all_results.append(doc_result)
-
-    # Phase 4
-    print(f"\n{'=' * 60}")
-    print("Generating final outputs...")
-    print(f"{'=' * 60}")
-
-    write_excel(all_results, FINAL_EXCEL_FILE)
-    write_hierarchy_tree(all_results, FINAL_TREE_FILE)
-
-    print(f"\n{'=' * 60}")
-    print("Pipeline complete.")
-    print(f"Excel : {FINAL_EXCEL_FILE}")
-    print(f"Tree  : {FINAL_TREE_FILE}")
-    print(f"{'=' * 60}")
-
-
-if __name__ == "__main__":
-    main()
-##############################
-"""
-ECMC PDF Hierarchy Extraction — LLM-Generated Headings + Poppler Path
-Changes:
-  1. Headings are GENERATED by Nova Lite from content, not extracted visually
-  2. Poppler path explicitly configured for Windows
-  3. Start Page / End Page in all outputs
-"""
-
-import os
-import json
-import re
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, asdict
-from datetime import datetime
-
-import boto3
-from botocore.exceptions import ClientError
-from pdf2image import convert_from_path
-import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill
-
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-# --- Windows Poppler (from your screenshot) ---
-POPPLER_PATH = Path(r"D:\Users\ntrinadh\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin")
-
-# --- Paths ---
-INPUT_DIR = Path(r"D:\Users\ntrinadh\OneDrive - ECMC group, Inc\Documents\Ecmc\all documents")
-OUTPUT_DIR = INPUT_DIR / "output"
-TEMP_IMAGE_DIR = OUTPUT_DIR / "temp_images"
-PASS1_DIR = OUTPUT_DIR / "pass1_metadata"
-FINAL_TREE_FILE = OUTPUT_DIR / "hierarchy_tree.txt"
-FINAL_EXCEL_FILE = OUTPUT_DIR / "section_inventory.xlsx"
-
-# --- AWS / Model ---
-AWS_REGION = "us-east-1"
-MODEL_ID = "us.amazon.nova-2-lite-v1:0"
-
-# --- Processing ---
-DPI = 200
-MAX_PAGES_PER_BATCH = 2
-
-# --- Classification ---
-ROOT_WEBSITE = "Website"
-ROOT_ONENOTE = "OneNote"
-
-
-# =============================================================================
-# DATA SCHEMAS
-# =============================================================================
-
-@dataclass
-class PageMetadata:
-    page_number: int
-    generated_heading: str           # LLM-generated heading from content
-    subsection_title: str            # Any date line or sub-topic
-    section_summary: str
-    keywords: List[str]
-    keyphrases: List[str]
-    contains_table: bool
-    table_summary: str
-
-
-@dataclass
-class ConsolidatedSection:
-    title: str                       # The generated heading
-    summary: str
-    keywords: List[str]
-    keyphrases: List[str]
-    table_summary: str
-    start_page: int
-    end_page: int
-
-
-@dataclass
-class DocumentResult:
-    root_node: str
-    file_name: str
-    file_path: Path
-    sections: List[ConsolidatedSection]
-
-
-# =============================================================================
-# UTILITIES
-# =============================================================================
-
-def classify_root_node(pdf_path: Path) -> str:
-    if "onenote" in str(pdf_path).lower():
-        return ROOT_ONENOTE
-    return ROOT_WEBSITE
-
-
-def clean_json_response(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-    text = re.sub(r",\s*(\]|\})", r"\1", text)
-    return text
-
-
-def ensure_dirs():
-    for d in [OUTPUT_DIR, TEMP_IMAGE_DIR, PASS1_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
-
-
-# =============================================================================
-# PHASE 1: PDF TO IMAGE CONVERSION (WITH POPLER PATH)
-# =============================================================================
-
-def convert_pdf_to_images(pdf_path: Path, dpi: int = 200) -> Tuple[Path, List[Path]]:
-    """
-    Convert PDF to images using explicit Poppler path.
-    Naming: {pdf_stem}_page_{NNNN}.png (matches your existing convention)
-    """
-    pdf_stem = pdf_path.stem
-    image_folder = TEMP_IMAGE_DIR / f"{pdf_stem}_images"
-    image_folder.mkdir(parents=True, exist_ok=True)
-
-    for old in image_folder.glob("*.png"):
-        old.unlink()
-
-    pages = convert_from_path(
-        str(pdf_path),
-        dpi=dpi,
-        fmt="png",
-        poppler_path=str(POPPLER_PATH),
-        thread_count=os.cpu_count()
-    )
-
-    image_paths: List[Path] = []
-    for page_num, page in enumerate(pages, start=1):
-        image_name = f"{pdf_stem}_page_{page_num:04d}.png"
-        image_path = image_folder / image_name
-        page.save(str(image_path), "PNG")
-        image_paths.append(image_path)
-
-    print(f"[Phase 1] {pdf_stem}: {len(image_paths)} pages -> {image_folder}")
-    return image_folder, image_paths
-
-
-# =============================================================================
-# PHASE 2: PASS 1 — LLM-GENERATED HEADINGS
-# =============================================================================
-
-def build_pass1_prompt(num_pages: int) -> str:
-    """
-    CRITICAL CHANGE: Nova Lite now GENERATES headings from content,
-    not extracts existing visual headings.
-    """
-    prompt = f"""Analyze these {num_pages} pages visually from an ECMC document.
-
-Your task is to READ the content and GENERATE a concise, descriptive heading for each page.
-Do NOT simply copy the largest bold text. Instead, understand what the page is ABOUT
-and create a short, meaningful heading (3-8 words).
-
-═══════════════════════════════════════════════════════════════
-HEADING GENERATION RULES
-═══════════════════════════════════════════════════════════════
-
-1. generated_heading = A SHORT, DESCRIPTIVE heading you CREATE based on the page content.
-   - 3 to 8 words maximum.
-   - Must accurately describe what the page is about.
-   - Examples of GOOD generated headings:
-       "Biden-Harris Student Debt Relief Plan"
-       "FFELP Borrower Consolidation Eligibility Rules"
-       "PSLF Waiver Program End Date"
-       "Federal Court Blocking Debt Relief"
-   - Examples of BAD generated headings:
-       "As of June 30, 2023"  (this is a date, not a topic)
-       "Program Updates"  (too vague — be specific about WHICH program)
-       ""  (empty — always generate something)
-
-2. subsection_title = Any date line or sub-topic found on the page.
-   - "As of September 29, 2022"
-   - "As of June 30, 2023"
-   - "Updated: November 10, 2022"
-   - Leave EMPTY if no date or sub-topic exists.
-
-3. ABSOLUTE RULES:
-   - NEVER use a bare date as the generated_heading.
-   - NEVER use "Program Updates" unless you cannot determine the specific topic.
-   - If a page continues the same topic as the previous page, you MAY use the same generated_heading.
-   - If a page has no clear topic, generate the best heading you can from the visible text.
-
-═══════════════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════════════
-
-Return a JSON ARRAY with exactly {num_pages} objects, in page order.
-
-Each object:
-{{
-  "page_number": integer,
-  "generated_heading": "Your generated heading here (3-8 words)",
-  "subsection_title": "Date line or sub-topic, or empty",
-  "section_summary": "Exactly one sentence summarizing the page",
-  "keywords": ["keyword1", "keyword2"],
-  "keyphrases": ["keyphrase1", "keyphrase2", "keyphrase3"],
-  "contains_table": false,
-  "table_summary": ""
-}}
-
-CRITICAL:
-- generated_heading MUST be 3-8 words describing the TOPIC, not a date.
-- Return ONLY the JSON array. No markdown fences, no explanations.
-"""
-    return prompt
-
-
-def run_nova_pass1(image_paths: List[Path], pdf_name: str) -> List[PageMetadata]:
-    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
-
-    content_blocks: List[Dict[str, Any]] = []
-
-    for img_path in image_paths:
-        with open(img_path, "rb") as f:
-            image_bytes = f.read()
-        content_blocks.append({
-            "image": {
-                "format": "png",
-                "source": {"bytes": image_bytes}
-            }
-        })
-
-    prompt_text = build_pass1_prompt(len(image_paths))
-    content_blocks.append({"text": prompt_text})
-
-    messages = [{"role": "user", "content": content_blocks}]
-
-    try:
-        response = bedrock.converse(
-            modelId=MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
-        )
-    except ClientError as e:
-        raise RuntimeError(f"Bedrock Converse failed for {pdf_name}: {e}") from e
-
-    output_message = response.get("output", {}).get("message", {})
-    output_text = ""
-    for block in output_message.get("content", []):
-        if "text" in block:
-            output_text += block["text"]
-
-    if not output_text:
-        raise ValueError(f"Empty response from Nova Lite for {pdf_name}")
-
-    cleaned = clean_json_response(output_text)
-    try:
-        raw_results = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        debug_path = PASS1_DIR / f"{pdf_name}_pass1_raw_error.txt"
-        debug_path.write_text(output_text, encoding="utf-8")
-        raise ValueError(f"JSON parse failed for {pdf_name}. Raw saved to {debug_path}. Error: {e}") from e
-
-    if not isinstance(raw_results, list):
-        raise ValueError(f"Expected JSON array from Nova, got {type(raw_results)} for {pdf_name}")
-
-    page_results: List[PageMetadata] = []
-    for idx, raw in enumerate(raw_results, start=1):
-        pm = PageMetadata(
-            page_number=raw.get("page_number", idx),
-            generated_heading=raw.get("generated_heading", ""),
-            subsection_title=raw.get("subsection_title", ""),
-            section_summary=raw.get("section_summary", ""),
-            keywords=raw.get("keywords", []) or [],
-            keyphrases=raw.get("keyphrases", []) or [],
-            contains_table=raw.get("contains_table", False),
-            table_summary=raw.get("table_summary", ""),
-        )
-        page_results.append(pm)
-
-    return page_results
-
-
-def save_pass1_checkpoint(pdf_name: str, page_results: List[PageMetadata]):
-    checkpoint_path = PASS1_DIR / f"{pdf_name}_pass1.json"
-    data = [asdict(p) for p in page_results]
-    checkpoint_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[Phase 2] Checkpoint saved: {checkpoint_path}")
-
-
-# =============================================================================
-# POST-PROCESSING: SANITIZE LEAKED DATE HEADINGS
-# =============================================================================
-
-def is_date_only(text: str) -> bool:
-    """Detect if the heading is just a date line that leaked through."""
-    if not text:
-        return False
-    text_lower = text.lower().strip()
-    date_patterns = [
-        r"^as of\s+\w+\s+\d{1,2},?\s+\d{4}",
-        r"^updated:?\s*\w+\s+\d{1,2},?\s+\d{4}",
-        r"^effective\s+\w+\s+\d{1,2},?\s+\d{4}",
-        r"^revised:?\s*\w+\s+\d{1,2},?\s+\d{4}",
-        r"^\w+\s+\d{1,2},?\s+\d{4}$",
-    ]
-    return any(re.search(p, text_lower) for p in date_patterns)
-
-
-def sanitize_page_results(page_results: List[PageMetadata]) -> List[PageMetadata]:
-    """
-    If the LLM generated a date as a heading, move it to subsection_title
-    and inherit the previous page's heading.
-    """
-    fixed = []
-    last_good_heading = ""
-
-    for page in page_results:
-        heading = page.generated_heading
-        sub = page.subsection_title
-
-        # If heading is a date, fix it
-        if is_date_only(heading):
-            if last_good_heading:
-                heading = last_good_heading
-            else:
-                heading = "General Content"  # fallback
-            if not sub:
-                sub = page.generated_heading  # move original date to subsection
-
-        # Update last good heading if this one is valid
-        if heading and not is_date_only(heading):
-            last_good_heading = heading
-
-        fixed.append(PageMetadata(
-            page_number=page.page_number,
-            generated_heading=heading,
-            subsection_title=sub,
-            section_summary=page.section_summary,
-            keywords=page.keywords,
-            keyphrases=page.keyphrases,
-            contains_table=page.contains_table,
-            table_summary=page.table_summary,
-        ))
-
-    return fixed
-
-
-# =============================================================================
-# PHASE 3: DOCUMENT CONSOLIDATION
-# =============================================================================
-
-def consolidate_document(pdf_name: str, page_results: List[PageMetadata]) -> List[ConsolidatedSection]:
-    if not page_results:
-        return []
-
-    sections: List[ConsolidatedSection] = []
-    current = ConsolidatedSection(
-        title=page_results[0].generated_heading or "Untitled Section",
-        summary=page_results[0].section_summary,
-        keywords=list(page_results[0].keywords),
-        keyphrases=list(page_results[0].keyphrases),
-        table_summary=page_results[0].table_summary,
-        start_page=page_results[0].page_number,
-        end_page=page_results[0].page_number,
-    )
-
-    for page in page_results[1:]:
-        page_heading = page.generated_heading or ""
-        if page_heading and page_heading == current.title:
-            # Same heading, merge pages
-            current.end_page = page.page_number
-            current.keywords = list(dict.fromkeys(current.keywords + page.keywords))[:3]
-            current.keyphrases = list(dict.fromkeys(current.keyphrases + page.keyphrases))[:5]
-            if page.table_summary:
-                current.table_summary = page.table_summary
-            if not current.summary and page.section_summary:
-                current.summary = page.section_summary
-        else:
-            # New heading, flush current
-            sections.append(current)
-            current = ConsolidatedSection(
-                title=page_heading or current.title,
-                summary=page.section_summary,
-                keywords=list(page.keywords)[:3],
-                keyphrases=list(page.keyphrases)[:5],
-                table_summary=page.table_summary,
-                start_page=page.page_number,
-                end_page=page.page_number,
-            )
-
-    sections.append(current)
-    return sections
-
-
-# =============================================================================
-# PHASE 4: OUTPUT GENERATION (WITH PAGE NUMBERS)
-# =============================================================================
-
-def write_excel(all_documents: List[DocumentResult], output_path: Path):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Section Inventory"
-
-    headers = [
-        "Root Node", "File", "Generated Heading", "Section Summary",
-        "Keywords", "Keyphrases", "Table Summary",
-        "Start Page", "End Page", "Page Range", "Hierarchy Tree"
-    ]
-    ws.append(headers)
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    for doc in all_documents:
-        for sec in doc.sections:
-            keywords_str = "; ".join(sec.keywords)
-            keyphrases_str = "; ".join(sec.keyphrases)
-            page_range = f"pp. {sec.start_page}-{sec.end_page}" if sec.start_page != sec.end_page else f"p. {sec.start_page}"
-            hierarchy_str = f"{sec.title} ({page_range}) → {keywords_str}" if sec.keywords else f"{sec.title} ({page_range})"
-
-            row = [
-                doc.root_node,
-                doc.file_name,
-                sec.title,
-                sec.summary,
-                keywords_str,
-                keyphrases_str,
-                sec.table_summary,
-                sec.start_page,
-                sec.end_page,
-                page_range,
-                hierarchy_str,
-            ]
-            ws.append(row)
-
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            except Exception:
-                pass
-        ws.column_dimensions[column].width = min(max_length + 2, 80)
-
-    wb.save(str(output_path))
-    print(f"[Phase 4] Excel saved: {output_path}")
-
-
-def write_hierarchy_tree(all_documents: List[DocumentResult], output_path: Path):
-    lines: List[str] = []
-    lines.append("ROOT")
-    lines.append("")
-
-    website_docs = [d for d in all_documents if d.root_node == ROOT_WEBSITE]
-    onenote_docs = [d for d in all_documents if d.root_node == ROOT_ONENOTE]
-
-    def render_docs(docs: List[DocumentResult], indent: str = "├─ "):
-        for doc in docs:
-            lines.append(f"{indent}{doc.file_name}")
-            for sec in doc.sections:
-                keywords_str = ", ".join(sec.keywords) if sec.keywords else ""
-                page_range = f"pp.{sec.start_page}-{sec.end_page}" if sec.start_page != sec.end_page else f"p.{sec.start_page}"
-                sec_line = f"{indent}    ├─ {sec.title} [{page_range}]"
-                if keywords_str:
-                    sec_line += f" → {keywords_str}"
-                lines.append(sec_line)
-            lines.append("")
-
-    if website_docs:
-        lines.append("├─ Website")
-        render_docs(website_docs, indent="│   ├─ ")
-
-    if onenote_docs:
-        lines.append("└─ OneNote")
-        render_docs(onenote_docs, indent="    ├─ ")
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[Phase 4] Tree saved: {output_path}")
-
-
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
-
-def main():
-    print("=" * 60)
-    print("ECMC PDF Hierarchy — LLM-Generated Headings + Poppler Path")
-    print(f"Started: {datetime.now().isoformat()}")
-    print("=" * 60)
-
-    ensure_dirs()
-
-    pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
-    if not pdf_files:
-        print(f"No PDFs found in {INPUT_DIR}")
-        return
-
-    print(f"\nDiscovered {len(pdf_files)} PDF(s):")
-    for p in pdf_files:
-        print(f"  - {p.relative_to(INPUT_DIR)}")
-
-    all_results: List[DocumentResult] = []
-
-    for pdf_path in pdf_files:
-        pdf_name = pdf_path.stem
-        root_node = classify_root_node(pdf_path)
-
-        print(f"\n{'─' * 50}")
-        print(f"Processing: {pdf_name} | Root: {root_node}")
-        print(f"{'─' * 50}")
-
-        # Phase 1: PDF to Images (with Poppler path)
-        _, image_paths = convert_pdf_to_images(pdf_path, dpi=DPI)
-
-        if not image_paths:
-            print(f"  WARNING: No images extracted. Skipping.")
-            continue
-
-        # Phase 2: Pass 1 Nova Lite
-        page_results: List[PageMetadata] = []
-
-        for i in range(0, len(image_paths), MAX_PAGES_PER_BATCH):
-            chunk = image_paths[i:i + MAX_PAGES_PER_BATCH]
-            try:
-                chunk_results = run_nova_pass1(chunk, pdf_name)
-                page_results.extend(chunk_results)
-            except Exception as e:
-                print(f"  ERROR in Pass 1 chunk {i//MAX_PAGES_PER_BATCH + 1}: {e}")
-                continue
-
-        # Sanitize + checkpoint
-        page_results = sanitize_page_results(page_results)
-        save_pass1_checkpoint(pdf_name, page_results)
-
-        # Phase 3: Consolidation
-        if not page_results:
-            print(f"  WARNING: No page results. Skipping.")
-            continue
-
-        consolidated = consolidate_document(pdf_name, page_results)
-
-        doc_result = DocumentResult(
-            root_node=root_node,
-            file_name=pdf_path.name,
-            file_path=pdf_path,
-            sections=consolidated,
-        )
-        all_results.append(doc_result)
-
-    # Phase 4: Generate Outputs
-    print(f"\n{'=' * 60}")
-    print("Generating final outputs...")
-    print(f"{'=' * 60}")
-
-    write_excel(all_results, FINAL_EXCEL_FILE)
-    write_hierarchy_tree(all_results, FINAL_TREE_FILE)
-
-    print(f"\n{'=' * 60}")
-    print("Pipeline complete.")
-    print(f"Excel : {FINAL_EXCEL_FILE}")
-    print(f"Tree  : {FINAL_TREE_FILE}")
-    print(f"{'=' * 60}")
-
-
-if __name__ == "__main__":
-    main()
-#################################################
-# Since we now properly use subsection_title, update the consolidation to also track subsections:
-
-def consolidate_document_v2(pdf_name: str, page_results: List[PageMetadata]) -> List[ConsolidatedSection]:
-    """
-    Merge consecutive pages with same section_title.
-    Track subsection changes within the same section.
-    """
-    if not page_results:
-        return []
-
-    sections: List[ConsolidatedSection] = []
-    current = ConsolidatedSection(
-        title=page_results[0].section_title or "Untitled Section",
-        summary=page_results[0].section_summary,
-        keywords=list(page_results[0].keywords),
-        keyphrases=list(page_results[0].keyphrases),
-        table_summary=page_results[0].table_summary,
-        start_page=page_results[0].page_number,
-        end_page=page_results[0].page_number,
-    )
-    # Track subsections for future use (SUBSECTION_ENABLED flag)
-    current_subsections = []
-
-    for page in page_results[1:]:
-        page_main = page.section_title or ""
-        page_sub = page.subsection_title or ""
-
-        if page_main and page_main == current.title:
-            # Same main section, new page
-            current.end_page = page.page_number
-            current.keywords = list(dict.fromkeys(current.keywords + page.keywords))[:3]
-            current.keyphrases = list(dict.fromkeys(current.keyphrases + page.keyphrases))[:5]
-            if page.table_summary:
-                current.table_summary = page.table_summary
-            if not current.summary and page.section_summary:
-                current.summary = page.section_summary
-            # Track subsection for future expansion
-            if page_sub and page_sub not in [s["title"] for s in current_subsections]:
-                current_subsections.append({"title": page_sub, "page": page.page_number})
-        else:
-            sections.append(current)
-            current = ConsolidatedSection(
-                title=page_main or current.title,
-                summary=page.section_summary,
-                keywords=list(page.keywords)[:3],
-                keyphrases=list(page.keyphrases)[:5],
-                table_summary=page.table_summary,
-                start_page=page.page_number,
-                end_page=page.page_number,
-            )
-            current_subsections = []
-
-    sections.append(current)
-    return sections
-###########
-#Then call it in main() before consolidation:
-
-# --- Phase 2: Pass 1 Nova Lite ---
-page_results = []
-for i in range(0, len(image_paths), MAX_PAGES_PER_BATCH):
-    chunk = image_paths[i:i + MAX_PAGES_PER_BATCH]
-    chunk_results = run_nova_pass1(chunk, pdf_name)
-    page_results.extend(chunk_results)
-
-# FIX: Sanitize leaked date sections
-page_results = sanitize_page_results(page_results)
-
-save_pass1_checkpoint(pdf_name, page_results)
-
-########
-#Post-Processing Guard (Catch Escaped Date Sections)
-#Add this function to Phase 3 (Consolidation) to catch any "As of..." that still leaked into section_title:
-import re
-
-def is_date_subheading(title: str) -> bool:
-    """Detect date-based subheadings that should never be top-level sections."""
-    if not title:
-        return False
-    title_lower = title.lower().strip()
-    # Patterns like: "As of June 30, 2023", "Updated: 2023-06-30", "Effective Date: ..."
-    date_patterns = [
-        r"^as of\s+\w+\s+\d{1,2},?\s+\d{4}",
-        r"^updated:?\s*\w+\s+\d{1,2},?\s+\d{4}",
-        r"^effective\s+\w+\s+\d{1,2},?\s+\d{4}",
-        r"^\w+\s+\d{1,2},?\s+\d{4}$",  # "June 30, 2023" bare date
-    ]
-    return any(re.search(p, title_lower) for p in date_patterns)
-
-
-def sanitize_page_results(page_results: List[PageMetadata]) -> List[PageMetadata]:
-    """
-    Fix any page where a date line leaked into section_title.
-    Move it to subsection_title and inherit the previous section_title.
-    """
-    fixed = []
-    last_main_section = ""
-
-    for page in page_results:
-        # If current section_title is actually a date subheading
-        if is_date_subheading(page.section_title):
-            # Move it to subsection_title
-            page = PageMetadata(
-                page_number=page.page_number,
-                section_title=last_main_section,  # Inherit previous main section
-                subsection_title=page.section_title,  # Move date here
-                section_summary=page.section_summary,
-                keywords=page.keywords,
-                keyphrases=page.keyphrases,
-                contains_table=page.contains_table,
-                table_summary=page.table_summary,
-            )
-        else:
-            # This is a real main section, remember it
-            if page.section_title:
-                last_main_section = page.section_title
-
-        fixed.append(page)
-
-    return fixed
-
-#################
-#Replace the build_pass1_prompt() function with this improved version:
-
-def build_pass1_prompt(num_pages: int) -> str:
-    """
-    Improved prompt that distinguishes MAJOR sections from date subsections.
-    """
-    prompt = f"""Analyze these {num_pages} pages visually from an ECMC Phone Guide document.
-
-You are extracting a DOCUMENT HIERARCHY. Be extremely careful about heading levels.
-
-HEADING RULES (Critical):
-1. section_title = ONLY the MAIN section heading. This is usually:
-   - The largest, boldest text on the page
-   - A major topic change (e.g., "Program Updates", "Biden Debt Relief", "Check Verification")
-   - NOT a date line
-   - NOT a bullet point title
-   - NOT a smaller bold line indented under a larger heading
-
-2. subsection_title = A sub-heading UNDER the main section. This includes:
-   - Date lines like "As of September 29, 2022"
-   - Date lines like "As of June 30, 2023"
-   - Sub-topics under a main section
-   - Leave EMPTY if no subsection exists
-
-3. If a page continues the SAME main section from the previous page:
-   - section_title = same as previous page (or empty if truly none)
-   - subsection_title = the date line or sub-heading on THIS page
-
-For EACH page, provide:
-- page_number: integer
-- section_title: MAIN section heading only (empty if page continues previous section with no new main heading)
-- subsection_title: Date line or sub-heading (e.g., "As of June 30, 2023")
-- section_summary: exactly one sentence for the ENTIRE page content
-- keywords: 1-3 broad topics (only from main section content, not date lines)
-- keyphrases: 3-5 business concepts
-- contains_table: boolean
-- table_summary: one sentence if table exists
-
-CRITICAL:
-- "As of [Date]" is NEVER a section_title. It is ALWAYS a subsection_title.
-- If you see "As of June 30, 2023" → put it in subsection_title, NOT section_title.
-- Return a JSON ARRAY with {num_pages} objects.
-- Return ONLY JSON. No markdown fences.
-"""
-    return prompt
-##################################################################################################
-"""
-ECMC PDF Hierarchy Extraction — Small File Pipeline
-Phases: 1-PDF2Image | 2-Pass1 Nova | 3-Pass2 Consolidation | 4-Outputs
-Optimized for 2-page PDFs (both pages batched into one Nova request).
-"""
-
-import os
-import json
-import re
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, asdict
-from datetime import datetime
-
-import boto3
-from botocore.exceptions import ClientError
-from pdf2image import convert_from_path
-import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill
-
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-# --- Paths ---
-INPUT_DIR = Path(r"D:\Users\ntrinadh\OneDrive ECMC group, Inc\Documents\Ecms\all documents")
-OUTPUT_DIR = INPUT_DIR / "output"
-TEMP_IMAGE_DIR = OUTPUT_DIR / "temp_images"          # xyz_image/ folders
-PASS1_DIR = OUTPUT_DIR / "pass1_metadata"              # checkpoint JSONs
-FINAL_TREE_FILE = OUTPUT_DIR / "hierarchy_tree.txt"
-FINAL_EXCEL_FILE = OUTPUT_DIR / "section_inventory.xlsx"
-
-# --- AWS / Model ---
-AWS_REGION = "us-east-1"
-MODEL_ID = "us.amazon.nova-2-lite-v1:0"                # verify in your Bedrock console
-
-# --- Processing ---
-DPI = 200
-MAX_PAGES_PER_BATCH = 2                                # set to 2 for small files; 1 or 5 for big files
-SUBSECTION_ENABLED = False                             # future flag from your design doc
-
-# --- Classification ---
-ROOT_WEBSITE = "Website"
-ROOT_ONENOTE = "OneNote"
-
-
-# =============================================================================
-# DATA SCHEMAS
-# =============================================================================
-
-@dataclass
-class PageMetadata:
-    """Pass 1 output schema per page."""
-    page_number: int
-    section_title: str
-    subsection_title: str
-    section_summary: str
-    keywords: List[str]
-    keyphrases: List[str]
-    contains_table: bool
-    table_summary: str
-
-
-@dataclass
-class ConsolidatedSection:
-    """Pass 2 output schema per section."""
-    title: str
-    summary: str
-    keywords: List[str]
-    keyphrases: List[str]
-    table_summary: str
-    start_page: int
-    end_page: int
-
-
-@dataclass
-class DocumentResult:
-    """Final per-document container."""
-    root_node: str
-    file_name: str
-    file_path: Path
-    sections: List[ConsolidatedSection]
-
-
-# =============================================================================
-# UTILITIES
-# =============================================================================
-
-def classify_root_node(pdf_path: Path) -> str:
-    """Rule: if 'onenote' in path -> OneNote, else Website."""
-    if "onenote" in str(pdf_path).lower():
-        return ROOT_ONENOTE
-    return ROOT_WEBSITE
-
-
-def clean_json_response(text: str) -> str:
-    """
-    Nova Lite sometimes wraps JSON in markdown fences or adds trailing commas.
-    Strip fences and sanitize before parsing.
-    """
-    text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-    # Remove trailing commas before ] or }
-    text = re.sub(r",\s*(\]|\})", r"\1", text)
-    return text
-
-
-def ensure_dirs():
-    """Create output directories if missing."""
-    for d in [OUTPUT_DIR, TEMP_IMAGE_DIR, PASS1_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
-
-
-# =============================================================================
-# PHASE 1: PDF TO IMAGE CONVERSION
-# =============================================================================
-
-def convert_pdf_to_images(pdf_path: Path, dpi: int = 200) -> Tuple[Path, List[Path]]:
-    """
-    Convert PDF to images.
-    Returns: (image_folder_path, list_of_image_paths)
-    Naming: {pdf_stem}_images / page_{NNN}.png
-    """
-    pdf_stem = pdf_path.stem
-    image_folder = TEMP_IMAGE_DIR / f"{pdf_stem}_images"
-    image_folder.mkdir(parents=True, exist_ok=True)
-
-    # Clear old images in this folder to avoid stale data
-    for old in image_folder.glob("*.png"):
-        old.unlink()
-
-    images = convert_from_path(str(pdf_path), dpi=dpi)
-    image_paths: List[Path] = []
-
-    for i, img in enumerate(images, start=1):
-        img_path = image_folder / f"page_{i:03d}.png"
-        img.save(str(img_path), "PNG")
-        image_paths.append(img_path)
-
-    print(f"[Phase 1] {pdf_stem}: {len(image_paths)} pages -> {image_folder}")
-    return image_folder, image_paths
-
-
-# =============================================================================
-# PHASE 2: PASS 1 — NOVA LITE PAGE ANALYSIS (BATCHED)
-# =============================================================================
-
-def build_pass1_prompt(num_pages: int) -> str:
-    """
-    Build the prompt for N pages.
-    For small files, N=2 and both images are sent in one request.
-    """
-    prompt = f"""Analyze these {num_pages} pages visually from an ECMC document.
-
-For EACH page, provide the following in a JSON object:
-- page_number: integer (1-based, in the order images are provided)
-- section_title: primary section heading (or empty string if none)
-- subsection_title: subsection heading if present (or empty string)
-- section_summary: exactly one sentence summarizing the page content
-- keywords: array of 1-3 broad business topic keywords
-- keyphrases: array of 3-5 business concept keyphrases
-- contains_table: boolean (true if page contains a table)
-- table_summary: one sentence describing the table (empty if no table)
-
-CRITICAL RULES:
-1. Section summary must be exactly ONE sentence. No paragraphs, no bullets.
-2. Keywords are broad topics (e.g., "Bankruptcy", "Eligibility").
-3. Keyphrases are specific concepts (e.g., "Title IV Eligibility").
-4. If a page is PRIMARILY a table, generate table_summary and leave keywords/keyphrases EMPTY.
-5. Do NOT use table cell content for keyword extraction.
-6. Return a JSON ARRAY with exactly {num_pages} objects, in page order.
-7. Return ONLY the JSON array. No markdown fences, no explanations.
-
-Example output format:
-[
-  {{
-    "page_number": 1,
-    "section_title": "Chapter 13 Borrowers",
-    "subsection_title": "Repayment Requirements",
-    "section_summary": "Explains repayment requirements for borrowers in Chapter 13 bankruptcy.",
-    "keywords": ["Bankruptcy", "Eligibility"],
-    "keyphrases": ["Title IV Eligibility", "Satisfactory Repayment Arrangement"],
-    "contains_table": false,
-    "table_summary": ""
-  }}
+from .paths import S3Paths, ChunkingParams, HybridSearchParams, TextractParams, NovaPrompts
+from .settings import Settings, load_settings
+
+__all__ = [
+    "S3Paths",
+    "ChunkingParams", 
+    "HybridSearchParams",
+    "TextractParams",
+    "NovaPrompts",
+    "Settings",
+    "load_settings",
 ]
+###########################
+## paths.py
+"""Centralized S3 path definitions and pipeline constants.
+
+All paths are immutable dataclasses. Import the singleton instances
+(S3_PATHS, CHUNKING, etc.) from any module — never hardcode S3 strings.
 """
-    return prompt
+
+from dataclasses import dataclass, field
+from typing import Tuple
 
 
-def run_nova_pass1(image_paths: List[Path], pdf_name: str) -> List[PageMetadata]:
-    """
-    Send all page images for one PDF to Nova Lite in a single Converse API call.
-    For small files (2 pages), this is one request per PDF.
-    """
-    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+@dataclass(frozen=True)
+class S3Paths:
+    """Immutable S3 path definitions. Change once, propagate everywhere."""
 
-    # Build content blocks: images first, then text prompt
-    content_blocks: List[Dict[str, Any]] = []
+    # ── Source inputs 
+    SOURCE_FILES: str = "ecmc_org/source_files/"
 
-    for img_path in image_paths:
-        with open(img_path, "rb") as f:
-            image_bytes = f.read()
-        content_blocks.append({
-            "image": {
-                "format": "png",
-                "source": {"bytes": image_bytes}
-            }
-        })
+    # ── Textract raw output 
+    TEXTRACT_OUTPUT: str = "ecmc_org/textract_output/"
 
-    prompt_text = build_pass1_prompt(len(image_paths))
-    content_blocks.append({"text": prompt_text})
+    # ── Processed pipeline outputs 
+    PROCESSED_BASE: str = "ecmc_org/ECMC_RAG/"
+    MARKDOWN: str = "ecmc_org/ECMC_RAG/01_markdown/"
+    JSON: str = "ecmc_org/ECMC_RAG/02_json/"
+    TEXT: str = "ecmc_org/ECMC_RAG/03_text/"
+    EMBEDDINGS: str = "ecmc_org/ECMC_RAG/04_embeddings/"
+    INDEXES: str = "ecmc_org/ECMC_RAG/05_indexes/"
+    EVALUATION: str = "ecmc_org/ECMC_RAG/06_evaluation/"
 
-    messages = [{"role": "user", "content": content_blocks}]
+    # ── Index files (within 05_indexes/) 
+    FAISS_INDEX: str = "ecmc_org/ECMC_RAG/05_indexes/faiss.index"
+    BM25_INDEX: str = "ecmc_org/ECMC_RAG/05_indexes/bm25.pkl"
+    CHUNK_METADATA: str = "ecmc_org/ECMC_RAG/05_indexes/chunk_metadata.json"
+    PARENT_LOOKUP: str = "ecmc_org/ECMC_RAG/05_indexes/parent_lookup.json"
 
-    try:
-        response = bedrock.converse(
-            modelId=MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
-        )
-    except ClientError as e:
-        raise RuntimeError(f"Bedrock Converse failed for {pdf_name}: {e}") from e
+    def textract_doc_path(self, doc_id: str) -> str:
+        """Return S3 prefix for Textract output of a specific document."""
+        return f"{self.TEXTRACT_OUTPUT}{doc_id}/"
 
-    # Extract text response
-    output_message = response.get("output", {}).get("message", {})
-    output_text = ""
-    for block in output_message.get("content", []):
-        if "text" in block:
-            output_text += block["text"]
+    def markdown_doc_path(self, doc_id: str) -> str:
+        """Return S3 prefix for markdown output of a specific document."""
+        return f"{self.MARKDOWN}{doc_id}/"
 
-    if not output_text:
-        raise ValueError(f"Empty response from Nova Lite for {pdf_name}")
+    def json_doc_path(self, doc_id: str) -> str:
+        """Return S3 prefix for JSON output of a specific document."""
+        return f"{self.JSON}{doc_id}/"
 
-    # Parse JSON
-    cleaned = clean_json_response(output_text)
-    try:
-        raw_results = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        # Save raw text for debugging
-        debug_path = PASS1_DIR / f"{pdf_name}_pass1_raw_error.txt"
-        debug_path.write_text(output_text, encoding="utf-8")
-        raise ValueError(f"JSON parse failed for {pdf_name}. Raw saved to {debug_path}. Error: {e}") from e
+    def text_doc_path(self, doc_id: str) -> str:
+        """Return S3 prefix for text output of a specific document."""
+        return f"{self.TEXT}{doc_id}/"
 
-    if not isinstance(raw_results, list):
-        raise ValueError(f"Expected JSON array from Nova, got {type(raw_results)} for {pdf_name}")
-
-    # Map to PageMetadata objects
-    page_results: List[PageMetadata] = []
-    for idx, raw in enumerate(raw_results, start=1):
-        pm = PageMetadata(
-            page_number=raw.get("page_number", idx),
-            section_title=raw.get("section_title", ""),
-            subsection_title=raw.get("subsection_title", ""),
-            section_summary=raw.get("section_summary", ""),
-            keywords=raw.get("keywords", []) or [],
-            keyphrases=raw.get("keyphrases", []) or [],
-            contains_table=raw.get("contains_table", False),
-            table_summary=raw.get("table_summary", ""),
-        )
-        page_results.append(pm)
-
-    return page_results
+    def embeddings_doc_path(self, doc_id: str) -> str:
+        """Return S3 prefix for embeddings of a specific document."""
+        return f"{self.EMBEDDINGS}{doc_id}/"
 
 
-def save_pass1_checkpoint(pdf_name: str, page_results: List[PageMetadata]):
-    """Append-only checkpoint: save Pass 1 results as JSON."""
-    checkpoint_path = PASS1_DIR / f"{pdf_name}_pass1.json"
-    data = [asdict(p) for p in page_results]
-    checkpoint_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[Phase 2] Checkpoint saved: {checkpoint_path}")
+@dataclass(frozen=True)
+class ChunkingParams:
+    """Parent-Child chunking configuration."""
+
+    PARENT_MAX_TOKENS: int = 2000
+    CHILD_MAX_TOKENS: int = 300
+    CHILD_OVERLAP_TOKENS: int = 50
+    TABLE_CONTEXT_TOKENS: int = 200
 
 
-# =============================================================================
-# PHASE 3: PASS 2 — DOCUMENT CONSOLIDATION
-# =============================================================================
+@dataclass(frozen=True)
+class HybridSearchParams:
+    """RRF and retrieval configuration."""
 
-def consolidate_document(pdf_name: str, page_results: List[PageMetadata]) -> List[ConsolidatedSection]:
-    """
-    Merge consecutive pages with identical section titles.
-    For 2-page files, this usually produces 1 or 2 sections.
-    """
-    if not page_results:
-        return []
+    RRF_K: int = 60
+    VECTOR_TOP_K: int = 20
+    KEYWORD_TOP_K: int = 20
+    FINAL_TOP_K: int = 10
 
-    sections: List[ConsolidatedSection] = []
-    current = ConsolidatedSection(
-        title=page_results[0].section_title,
-        summary=page_results[0].section_summary,
-        keywords=list(page_results[0].keywords),
-        keyphrases=list(page_results[0].keyphrases),
-        table_summary=page_results[0].table_summary,
-        start_page=page_results[0].page_number,
-        end_page=page_results[0].page_number,
+
+@dataclass(frozen=True)
+class TextractParams:
+    """Textract API configuration."""
+
+    FEATURES: Tuple[str, ...] = ("TABLES", "LAYOUT", "FORMS")
+    POLLING_INTERVAL_SECONDS: int = 5
+    MAX_POLLING_ATTEMPTS: int = 60
+
+
+@dataclass(frozen=True)
+class NovaPrompts:
+    """Prompts for Nova Lite enrichment and generation tasks."""
+
+    TABLE_ENRICHMENT: str = (
+        "Describe what this table represents, its column meanings, "
+        "and key values. Be concise but complete."
     )
 
-    for page in page_results[1:]:
-        if page.section_title and page.section_title == current.title:
-            # Same section: merge
-            current.end_page = page.page_number
-            # Deduplicate and extend keywords/keyphrases
-            current.keywords = list(dict.fromkeys(current.keywords + page.keywords))
-            current.keyphrases = list(dict.fromkeys(current.keyphrases + page.keyphrases))
-            # If later page has table summary, prefer it (or append)
-            if page.table_summary:
-                current.table_summary = page.table_summary
-            # If summary is empty on current but present on page, use page's
-            if not current.summary and page.section_summary:
-                current.summary = page.section_summary
-        else:
-            # New section: flush current
-            sections.append(current)
-            current = ConsolidatedSection(
-                title=page.section_title,
-                summary=page.section_summary,
-                keywords=list(page.keywords),
-                keyphrases=list(page.keyphrases),
-                table_summary=page.table_summary,
-                start_page=page.page_number,
-                end_page=page.page_number,
-            )
+    IMAGE_CAPTION: str = (
+        "Describe this figure or chart and its key data points "
+        "in 2-3 sentences. Include specific numbers if visible."
+    )
 
-    sections.append(current)
+    SYSTEM_COT: str = (
+        "You are a helpful assistant analyzing federal student aid documents. "
+        "Think step by step. First identify the relevant section, "
+        "then locate specific tables or paragraphs, extract exact values, "
+        "and synthesize the final answer. Cite document name and page number. "
+        "If unsure, state 'I don't have enough information'."
+    )
 
-    # Enforce limits from design doc
-    for sec in sections:
-        sec.keywords = sec.keywords[:3]
-        sec.keyphrases = sec.keyphrases[:5]
-
-    print(f"[Phase 3] {pdf_name}: {len(sections)} consolidated section(s)")
-    return sections
+    QUERY_EXPANSION: str = (
+        "Generate 3 different ways to ask the following question, "
+        "focusing on different aspects (e.g., eligibility, process, requirements). "
+        "Return only the 3 questions, one per line."
+    )
 
 
-# =============================================================================
-# PHASE 4: OUTPUT GENERATION
-# =============================================================================
+# ── Singleton instances 
+# Import these from any module. Never instantiate again.
+S3_PATHS = S3Paths()
+CHUNKING = ChunkingParams()
+HYBRID = HybridSearchParams()
+TEXTRACT = TextractParams()
+PROMPTS = NovaPrompts()
+###############
+##### settings.py
+"""Environment configuration loader.
 
-def write_excel(all_documents: List[DocumentResult], output_path: Path):
-    """
-    Generate section_inventory.xlsx per design doc schema.
-    Columns: Root Node | File | Section | Section Summary | Keywords | Keyphrases | Table Summary | Hierarchy Tree
-    """
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Section Inventory"
+Merges .env secrets (region, bucket, model IDs) with paths.py constants.
+Returns a single Settings dataclass that every module imports.
+"""
 
-    headers = [
-        "Root Node", "File", "Section", "Section Summary",
-        "Keywords", "Keyphrases", "Table Summary", "Hierarchy Tree"
-    ]
-    ws.append(headers)
-
-    # Header styling
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    for doc in all_documents:
-        for sec in doc.sections:
-            keywords_str = "; ".join(sec.keywords)
-            keyphrases_str = "; ".join(sec.keyphrases)
-            hierarchy_str = f"{sec.title} → {keywords_str}" if sec.keywords else sec.title
-
-            row = [
-                doc.root_node,
-                doc.file_name,
-                sec.title,
-                sec.summary,
-                keywords_str,
-                keyphrases_str,
-                sec.table_summary,
-                hierarchy_str,
-            ]
-            ws.append(row)
-
-    # Auto-adjust column widths
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            except Exception:
-                pass
-        adjusted_width = min(max_length + 2, 80)
-        ws.column_dimensions[column].width = adjusted_width
-
-    wb.save(str(output_path))
-    print(f"[Phase 4] Excel saved: {output_path}")
-
-
-def write_hierarchy_tree(all_documents: List[DocumentResult], output_path: Path):
-    """
-    Generate hierarchy_tree.txt per design doc.
-    Only includes: Section + Keywords. No summaries, no table summaries, no keyphrases.
-    """
-    lines: List[str] = []
-    lines.append("ROOT")
-    lines.append("")
-
-    # Group by root node
-    website_docs = [d for d in all_documents if d.root_node == ROOT_WEBSITE]
-    onenote_docs = [d for d in all_documents if d.root_node == ROOT_ONENOTE]
-
-    def render_docs(docs: List[DocumentResult], indent: str = "├─ "):
-        for doc in docs:
-            doc_line = f"{indent}{doc.file_name}"
-            lines.append(doc_line)
-            for sec in doc.sections:
-                keywords_str = ", ".join(sec.keywords) if sec.keywords else ""
-                sec_line = f"{indent}    ├─ {sec.title}"
-                if keywords_str:
-                    sec_line += f" → {keywords_str}"
-                lines.append(sec_line)
-            lines.append("")
-
-    if website_docs:
-        lines.append("├─ Website")
-        render_docs(website_docs, indent="│   ├─ ")
-
-    if onenote_docs:
-        lines.append("└─ OneNote")
-        render_docs(onenote_docs, indent="    ├─ ")
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[Phase 4] Tree saved: {output_path}")
-
-
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
-
-def main():
-    print("=" * 60)
-    print("ECMC PDF Hierarchy Extraction — Small File Pipeline")
-    print(f"Started: {datetime.now().isoformat()}")
-    print("=" * 60)
-
-    ensure_dirs()
-
-    # Discover PDFs
-    pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
-    if not pdf_files:
-        print(f"No PDFs found in {INPUT_DIR}")
-        return
-
-    print(f"\nDiscovered {len(pdf_files)} PDF(s):")
-    for p in pdf_files:
-        print(f"  - {p.relative_to(INPUT_DIR)}")
-
-    all_results: List[DocumentResult] = []
-
-    for pdf_path in pdf_files:
-        pdf_name = pdf_path.stem
-        root_node = classify_root_node(pdf_path)
-
-        print(f"\n{'─' * 50}")
-        print(f"Processing: {pdf_name} | Root: {root_node}")
-        print(f"{'─' * 50}")
-
-        # --- Phase 1: PDF to Images ---
-        _, image_paths = convert_pdf_to_images(pdf_path, dpi=DPI)
-
-        # --- Phase 2: Pass 1 Nova Lite ---
-        # For small files, we send all pages in one batch (MAX_PAGES_PER_BATCH >= page count)
-        # If a file has more pages than MAX_PAGES_PER_BATCH, chunk it.
-        page_results: List[PageMetadata] = []
-        for i in range(0, len(image_paths), MAX_PAGES_PER_BATCH):
-            chunk = image_paths[i:i + MAX_PAGES_PER_BATCH]
-            chunk_results = run_nova_pass1(chunk, pdf_name)
-            page_results.extend(chunk_results)
-
-        save_pass1_checkpoint(pdf_name, page_results)
-
-        # --- Phase 3: Consolidation ---
-        consolidated = consolidate_document(pdf_name, page_results)
-
-        doc_result = DocumentResult(
-            root_node=root_node,
-            file_name=pdf_path.name,
-            file_path=pdf_path,
-            sections=consolidated,
-        )
-        all_results.append(doc_result)
-
-    # --- Phase 4: Generate Outputs ---
-    print(f"\n{'=' * 60}")
-    print("Generating final outputs...")
-    print(f"{'=' * 60}")
-
-    write_excel(all_results, FINAL_EXCEL_FILE)
-    write_hierarchy_tree(all_results, FINAL_TREE_FILE)
-
-    print(f"\n{'=' * 60}")
-    print("Pipeline complete.")
-    print(f"Excel : {FINAL_EXCEL_FILE}")
-    print(f"Tree  : {FINAL_TREE_FILE}")
-    print(f"{'=' * 60}")
-
-
-if __name__ == "__main__":
-    main()
-####################
-from pathlib import Path
-from pdf2image import convert_from_path
 import os
+from dataclasses import dataclass
+from typing import Optional
+
+from dotenv import load_dotenv
+
+from .paths import S3Paths, ChunkingParams, HybridSearchParams, TextractParams, NovaPrompts
+from .paths import S3_PATHS, CHUNKING, HYBRID, TEXTRACT, PROMPTS
 
 
-# Windows Poppler bin folder
-POPPLER_PATH = r"C:\poppler\Library\bin"
+@dataclass(frozen=True)
+class Settings:
+    """Single source of truth for all configuration.
 
-# Input PDF
-pdf_path = r"D:\Users\ntrinadh\OneDrive ECMC group, Inc\Documents\Ecms\all documents\sample.pdf"
-
-# Temporary image folder
-output_dir = Path("temp_images")
-output_dir.mkdir(parents=True, exist_ok=True)
-
-
-def pdf_to_images(pdf_file, output_folder, dpi=200):
+    Attributes:
+        AWS_REGION: AWS region for all boto3 clients.
+        S3_BUCKET: Source-of-truth S3 bucket name.
+        BEDROCK_CHAT_MODEL_ID: Nova Lite model ID for generation.
+        BEDROCK_EMBED_MODEL_ID: Titan Embed model ID for vectorization.
+        s3_paths: Immutable S3 path definitions.
+        chunking: Parent-child chunking parameters.
+        hybrid: Hybrid search (RRF) parameters.
+        textract: Textract API configuration.
+        prompts: Nova prompt templates.
     """
-    Convert PDF pages into PNG images.
+
+    AWS_REGION: str
+    S3_BUCKET: str
+    BEDROCK_CHAT_MODEL_ID: str
+    BEDROCK_EMBED_MODEL_ID: str
+
+    s3_paths: S3Paths = S3_PATHS
+    chunking: ChunkingParams = CHUNKING
+    hybrid: HybridSearchParams = HYBRID
+    textract: TextractParams = TEXTRACT
+    prompts: NovaPrompts = PROMPTS
+
+
+# Module-level singleton cache
+_SETTINGS_CACHE: Optional[Settings] = None
+
+
+def load_settings(dotenv_path: Optional[str] = None) -> Settings:
+    """Load .env and merge with path constants.
+
+    Args:
+        dotenv_path: Optional path to .env file. If None, searches cwd upward.
 
     Returns:
-        List of generated image paths
+        Settings dataclass with all configuration merged.
+
+    Raises:
+        ValueError: If required .env variables are missing.
     """
+    global _SETTINGS_CACHE
+    if _SETTINGS_CACHE is not None:
+        return _SETTINGS_CACHE
 
-    generated_images = []
+    load_dotenv(dotenv_path=dotenv_path)
 
-    pages = convert_from_path(
-        pdf_file,
-        dpi=dpi,
-        fmt="png",
-        poppler_path=POPPLER_PATH,
-        thread_count=os.cpu_count()
+    region = os.getenv("AWS_REGION", "us-east-1")
+    bucket = os.getenv("S3_BUCKET", "bankrupcy-data-bkt")
+    chat_model = os.getenv("BEDROCK_CHAT_MODEL_ID", "us.amazon.nova-2-lite-v1:0")
+    embed_model = os.getenv("BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
+
+    # Validate required vars
+    missing = []
+    if not region:
+        missing.append("AWS_REGION")
+    if not bucket:
+        missing.append("S3_BUCKET")
+    if not chat_model:
+        missing.append("BEDROCK_CHAT_MODEL_ID")
+    if not embed_model:
+        missing.append("BEDROCK_EMBED_MODEL_ID")
+
+    if missing:
+        raise ValueError(
+            f"Missing required environment variables: {', '.join(missing)}. "
+            f"Please set them in .env file."
+        )
+
+    _SETTINGS_CACHE = Settings(
+        AWS_REGION=region,
+        S3_BUCKET=bucket,
+        BEDROCK_CHAT_MODEL_ID=chat_model,
+        BEDROCK_EMBED_MODEL_ID=embed_model,
     )
-
-    pdf_name = Path(pdf_file).stem
-
-    for page_num, page in enumerate(pages, start=1):
-
-        image_name = f"{pdf_name}_page_{page_num:04d}.png"
-        image_path = output_folder / image_name
-
-        page.save(image_path, "PNG")
-
-        generated_images.append(str(image_path))
-
-    return generated_images
+    return _SETTINGS_CACHE
 
 
-if __name__ == "__main__":
+def clear_settings_cache() -> None:
+    """Clear the cached Settings instance. Useful for testing."""
+    global _SETTINGS_CACHE
+    _SETTINGS_CACHE = None
+########################################################
+##__init__.py
 
-    images = pdf_to_images(
-        pdf_path,
-        output_dir,
-        dpi=200
-    )
+"""ECMC RAG Pipeline Utility Modules.
 
-    print(f"Generated {len(images)} images")
-#################
-def save_to_s3(self, name="faiss_index"):
-    if self.index is None:
-        raise ValueError("Index is empty; nothing to save.")
-
-    import tempfile
-    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
-    tmp_dir = tempfile.gettempdir()
-
-    # Save FAISS index
-    local_index = os.path.join(tmp_dir, f"{name}.faiss")
-    faiss.write_index(self.index, local_index)
-    index_key = f"{config.S3_VECTORSTORE_PREFIX}{name}.faiss"
-    s3.upload_file(local_index, index_key)
-    os.remove(local_index)
-
-    # Save metadata
-    local_meta = os.path.join(tmp_dir, f"{name}_meta.pkl")
-    with open(local_meta, "wb") as f:
-        pickle.dump({"chunks": self.chunks, "id_map": self._id_map}, f)
-    meta_key = f"{config.S3_VECTORSTORE_PREFIX}{name}_meta.pkl"
-    s3.upload_file(local_meta, meta_key)
-    os.remove(local_meta)
-
-    print(f"Saved FAISS index to {index_key}")
-    return index_key, meta_key
-
-def load_from_s3(self, name="faiss_index"):
-    import tempfile
-    s3 = S3Manager(bucket_name=config.S3_BUCKET_NAME, region=config.AWS_REGION)
-    tmp_dir = tempfile.gettempdir()
-
-    index_key = f"{config.S3_VECTORSTORE_PREFIX}{name}.faiss"
-    meta_key = f"{config.S3_VECTORSTORE_PREFIX}{name}_meta.pkl"
-
-    local_index = os.path.join(tmp_dir, f"{name}.faiss")
-    if not s3.download_file(index_key, local_index):
-        raise FileNotFoundError(f"FAISS index not found at {index_key}")
-    self.index = faiss.read_index(local_index)
-    os.remove(local_index)
-
-    local_meta = os.path.join(tmp_dir, f"{name}_meta.pkl")
-    if not s3.download_file(meta_key, local_meta):
-        raise FileNotFoundError(f"Metadata not found at {meta_key}")
-    with open(local_meta, "rb") as f:
-        data = pickle.load(f)
-    self.chunks = data["chunks"]
-    self._id_map = data["id_map"]
-    os.remove(local_meta)
-
-    print(f"Loaded FAISS index with {self.index.ntotal} vectors from S3")
-################################################
-from faiss_vector_store import FAISSVectorStore
-from retrieval_engine import RetrievalEngine
-
-store = FAISSVectorStore()
-store.load_from_s3("ecmc_index")
-retriever = RetrievalEngine(vector_store=store)
-
-for q in ["what is a t4 letter?", "i want to consolidate"]:
-    result = retriever.retrieve(q, top_k=5)
-    print(f"\n{'='*50}")
-    print(f"Query: {q}")
-    print(f"Chunks found: {result['total_chunks']}")
-    for c in result["chunks"]:
-        print(f"  → {c['chunk_id']} | score={c.get('score',0):.3f} | {c['text'][:80]}...")
-
-## retrieval_engine.py
-"""
-Retrieval engine for RAG pipeline.
-Orchestrates query embedding, vector search, optional re-ranking,
-and context expansion to produce rich context for generation.
-
-Optimized for Nova/Claude consumption:
-  - Clean context formatting with clear source citations
-  - Graceful handling when 0 chunks retrieved
-  - Optional LLM-based re-ranking hook (for future enhancement)
-
-Works with ANY vector store that implements:
-  - search(query_embedding, k, filters) -> List[chunk_dict]
-  - get_chunk_by_id(chunk_id) -> Optional[chunk_dict]
+Reusable functions across all pipeline steps:
+  - aws_clients: Singleton boto3 clients
+  - s3_utils: All S3 read/write operations
+  - text_utils: Token counting, ID generation, table→markdown
+  - logging_config: Structured JSON logging
+  - decorators: Retry, timing, input validation
 """
 
-import logging
-from typing import Any, Dict, List, Optional
-
-from config import config
-from embedding_engine import EmbeddingEngine
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+from .aws_clients import get_bedrock_runtime_client, get_textract_client, get_s3_client
+from .s3_utils import (
+    upload_json, upload_text, upload_markdown, upload_bytes,
+    download_json, download_text, download_bytes,
+    list_objects, check_exists, ensure_prefix
 )
-logger = logging.getLogger(__name__)
+from .text_utils import (
+    estimate_token_count, generate_doc_id, generate_parent_id, generate_child_id,
+    textract_table_to_markdown, clean_markdown, truncate_at_boundary,
+    extract_context_around_table
+)
+from .logging_config import get_logger, log_operation
+from .decorators import retry, timing, validate_input
 
+__all__ = [
+    # aws_clients
+    "get_bedrock_runtime_client",
+    "get_textract_client",
+    "get_s3_client",
+    # s3_utils
+    "upload_json",
+    "upload_text",
+    "upload_markdown",
+    "upload_bytes",
+    "download_json",
+    "download_text",
+    "download_bytes",
+    "list_objects",
+    "check_exists",
+    "ensure_prefix",
+    # text_utils
+    "estimate_token_count",
+    "generate_doc_id",
+    "generate_parent_id",
+    "generate_child_id",
+    "textract_table_to_markdown",
+    "clean_markdown",
+    "truncate_at_boundary",
+    "extract_context_around_table",
+    # logging_config
+    "get_logger",
+    "log_operation",
+    # decorators
+    "retry",
+    "timing",
+    "validate_input",
+]
+###################
+######aws_clients.py
+"""Singleton boto3 clients with retry configuration.
 
-class RetrievalEngine:
-    """
-    End-to-end retrieval: embed query -> search -> [re-rank] -> expand context.
-    Vector store is pluggable (OpenSearch, FAISS, or any custom store).
-    """
-
-    def __init__(
-        self,
-        vector_store: Optional[Any] = None,
-        embedding_engine: Optional[EmbeddingEngine] = None,
-    ):
-        self.embedder = embedding_engine or EmbeddingEngine()
-        self.store = vector_store
-
-    # ------------------------------------------------------------------
-    # Main retrieval API
-    # ------------------------------------------------------------------
-
-    def retrieve(
-        self,
-        query: str,
-        top_k: int = 0,
-        filters: Optional[Dict[str, Any]] = None,
-        expand_context: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        """
-        Retrieve relevant chunks for a user query.
-
-        Args:
-            query: Raw user query text.
-            top_k: Number of chunks to retrieve. Defaults to config.RETRIEVAL_TOP_K.
-            filters: Metadata filters (e.g., {"document_id": "loan-guide"}).
-            expand_context: Whether to fetch prev/next neighbors.
-                Defaults to config.ENABLE_CONTEXT_EXPANSION.
-
-        Returns:
-            Dict with keys:
-                - "query": original query
-                - "chunks": list of retrieved chunk dicts
-                - "context_text": concatenated text of all chunks (for prompt)
-                - "total_chunks": number of chunks
-                - "expanded": whether context expansion was applied
-        """
-        if self.store is None:
-            raise ValueError(
-                "No vector store provided. "
-                "Pass a FAISSVectorStore or OpenSearchVectorStore instance."
-            )
-
-        top_k = top_k or config.RETRIEVAL_TOP_K
-        expand = expand_context if expand_context is not None else config.ENABLE_CONTEXT_EXPANSION
-
-        # 1. Embed query via Bedrock Titan (same model used for indexing)
-        query_embedding = self.embedder.embed_text(query)
-
-        # 2. Search vector store (works with BOTH FAISS and OpenSearch)
-        chunks = self.store.search(
-            query_embedding=query_embedding,
-            k=top_k,
-            filters=filters,
-        )
-
-        # 3. Optional: re-rank chunks (placeholder for future LLM re-ranking)
-        # chunks = self._rerank_chunks(query, chunks)
-
-        # 4. Context expansion (fetch prev/next neighbors)
-        if expand and chunks:
-            chunks = self._expand_context(chunks)
-
-        # 5. Build context text for LLM prompt
-        context_text = self._build_context_text(chunks, query)
-
-        result = {
-            "query": query,
-            "chunks": chunks,
-            "context_text": context_text,
-            "total_chunks": len(chunks),
-            "expanded": expand,
-        }
-
-        logger.info(
-            f"Retrieved {len(chunks)} chunks for query: '{query[:60]}...' "
-            f"(expanded={expand})"
-        )
-        return result
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _expand_context(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        For each chunk, fetch its prev and next neighbors from the vector store
-        and insert them in correct order.
-        """
-        expanded = []
-        seen_ids = set()
-
-        for chunk in chunks:
-            # Fetch prev
-            prev_id = chunk.get("metadata", {}).get("prev_chunk_id") or chunk.get("prev_chunk_id")
-            if prev_id and prev_id not in seen_ids:
-                prev_doc = self.store.get_chunk_by_id(prev_id)
-                if prev_doc:
-                    prev_doc = dict(prev_doc)
-                    prev_doc["score"] = 0.0
-                    prev_doc["is_neighbor"] = True
-                    expanded.append(prev_doc)
-                    seen_ids.add(prev_id)
-
-            # Main chunk
-            cid = chunk.get("chunk_id", "")
-            if cid not in seen_ids:
-                chunk = dict(chunk)
-                chunk["is_neighbor"] = False
-                expanded.append(chunk)
-                seen_ids.add(cid)
-
-            # Fetch next
-            next_id = chunk.get("metadata", {}).get("next_chunk_id") or chunk.get("next_chunk_id")
-            if next_id and next_id not in seen_ids:
-                next_doc = self.store.get_chunk_by_id(next_id)
-                if next_doc:
-                    next_doc = dict(next_doc)
-                    next_doc["score"] = 0.0
-                    next_doc["is_neighbor"] = True
-                    expanded.append(next_doc)
-                    seen_ids.add(next_id)
-
-        return expanded
-
-    @staticmethod
-    def _build_context_text(chunks: List[Dict[str, Any]], query: str = "") -> str:
-        """
-        Concatenate chunk texts into a single context string for LLM prompting.
-        Optimized for Nova/Claude consumption with clear source citations.
-        """
-        if not chunks:
-            return (
-                "[NO RELEVANT DOCUMENTS FOUND]\n\n"
-                "No matching documents were found in the knowledge base for this query. "
-                "Please answer based on general knowledge, but clearly state that "
-                "this information may not be from official ECMC documents."
-            )
-
-        parts = []
-        parts.append(f"The following documents were retrieved for the query: "{query}"\n")
-
-        for i, chunk in enumerate(chunks, 1):
-            tag = "[NEIGHBOR]" if chunk.get("is_neighbor") else f"[DOCUMENT {i}]"
-            meta = chunk.get("metadata", chunk)
-
-            # Build citation header
-            doc_id = meta.get("document_id", "unknown")
-            page = meta.get("page_number", 0)
-            section = meta.get("section", "")
-            score = chunk.get("score", 0)
-
-            header = f"{tag} Source: {doc_id} | Page: {page} | Section: {section}"
-            if not chunk.get("is_neighbor"):
-                header += f" | Relevance: {score:.3f}"
-
-            parts.append(header)
-            parts.append(chunk.get("text", "").strip())
-            parts.append("")  # blank line between chunks
-
-        parts.append("--- END OF DOCUMENTS ---")
-        return "\n".join(parts)
-
-    # ------------------------------------------------------------------
-    # Future: LLM-based re-ranking (optional enhancement)
-    # ------------------------------------------------------------------
-
-    def _rerank_chunks(
-        self,
-        query: str,
-        chunks: List[Dict[str, Any]],
-        top_n: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """
-        [PLACEHOLDER] Re-rank chunks using an LLM cross-encoder.
-        Currently returns chunks as-is. For future enhancement:
-        use Bedrock Nova/Claude to score each chunk's relevance to query.
-        """
-        # TODO: Implement LLM-based re-ranking for better retrieval quality
-        # Example approach:
-        #   scores = []
-        #   for chunk in chunks:
-        #       prompt = f"Rate relevance (0-10): Query: {query}\nChunk: {chunk['text'][:500]}"
-        #       score = call_bedrock(prompt)
-        #       scores.append((score, chunk))
-        #   return [c for _, c in sorted(scores, reverse=True)[:top_n]]
-        return chunks[:top_n]
-
-    # ------------------------------------------------------------------
-    # Convenience methods
-    # ------------------------------------------------------------------
-
-    def retrieve_simple(self, query: str, top_k: int = 0) -> str:
-        """
-        Simplest API: query -> context text string (for direct prompt injection).
-
-        Returns:
-            Concatenated context text ready for LLM prompt.
-        """
-        result = self.retrieve(query, top_k=top_k)
-        return result["context_text"]
-########
-#rag_chatbot.py
+All modules import clients from here. Never create boto3.client() directly.
+This ensures consistent region, retry policy, and connection pooling.
 """
-RAG ChatBot with session memory, retrieval, and Bedrock generation.
-Nova-compatible: system prompt passed via 'system' param, not message role.
-Integrates: ChatSession + RetrievalEngine + Bedrock Nova/Claude.
-"""
-
-import json
-import logging
-from typing import Any, Dict, List, Optional
 
 import boto3
+from botocore.config import Config
+from typing import Optional
 
-from chat_memory import ChatSession, SessionManager
-from config import config
-from embedding_engine import EmbeddingEngine
-from faiss_vector_store import FAISSVectorStore
-from retrieval_engine import RetrievalEngine
+from config.settings import load_settings
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Module-level singleton cache
+_bedrock_runtime: Optional[boto3.client] = None
+_textract: Optional[boto3.client] = None
+_s3: Optional[boto3.client] = None
 
 
-class RAGChatBot:
+def _get_region() -> str:
+    """Fetch region from Settings singleton."""
+    return load_settings().AWS_REGION
+
+
+def get_bedrock_runtime_client() -> boto3.client:
+    """Return singleton Bedrock Runtime client.
+
+    Used for: Converse API (Nova Lite), InvokeModel (Titan Embed).
+    Retry mode: adaptive (handles throttling automatically).
     """
-    End-to-end RAG chatbot with Nova/Claude generation.
+    global _bedrock_runtime
+    if _bedrock_runtime is None:
+        _bedrock_runtime = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=_get_region(),
+            config=Config(
+                retries={"max_attempts": 3, "mode": "adaptive"},
+                max_pool_connections=25,
+            ),
+        )
+    return _bedrock_runtime
+
+
+def get_textract_client() -> boto3.client:
+    """Return singleton Textract client.
+
+    Used for: analyze_document, start_document_analysis, get_document_analysis.
+    Retry mode: standard (Textract has long-running jobs, adaptive not needed).
     """
-
-    DEFAULT_SYSTEM_PROMPT = (
-        "You are a helpful assistant for ECMC student loan services. "
-        "Answer questions based ONLY on the provided context. "
-        "If the answer is not in the context, say "I don't have enough information." "
-        "Always cite the document name and page number when possible."
-    )
-
-    def __init__(
-        self,
-        vector_store: Optional[Any] = None,
-        model_id: Optional[str] = None,
-        session_manager: Optional[SessionManager] = None,
-    ):
-        self.store = vector_store or self._load_default_store()
-        self.retriever = RetrievalEngine(vector_store=self.store)
-        self.sessions = session_manager or SessionManager(default_window_size=5)
-        self.bedrock = boto3.client("bedrock-runtime", region_name=config.AWS_REGION)
-        self.model_id = model_id or "amazon.nova-pro-v1:0"
-        self.is_nova = "nova" in self.model_id.lower()
-
-    def _load_default_store(self) -> FAISSVectorStore:
-        store = FAISSVectorStore()
-        try:
-            store.load_from_s3(name="ecmc_index")
-        except FileNotFoundError:
-            logger.warning("No saved FAISS index found. Call build_index() first.")
-        return store
-
-    def build_index(self) -> None:
-        self.store.build_from_s3()
-        self.store.save_to_s3(name="ecmc_index")
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def chat(
-        self,
-        user_message: str,
-        session_id: Optional[str] = None,
-        top_k: int = 5,
-        expand_context: bool = True,
-    ) -> Dict[str, Any]:
-        session = self.sessions.get_or_create(
-            session_id=session_id,
-            system_prompt=self.DEFAULT_SYSTEM_PROMPT,
+    global _textract
+    if _textract is None:
+        _textract = boto3.client(
+            service_name="textract",
+            region_name=_get_region(),
+            config=Config(
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
         )
+    return _textract
 
-        # 1. Retrieve chunks
-        retrieval_result = self.retriever.retrieve(
-            query=user_message,
-            top_k=top_k,
-            expand_context=expand_context,
-        )
-        chunks = retrieval_result["chunks"]
-        context = retrieval_result["context_text"]
 
-        # 2. Build prompt
-        if chunks:
-            user_prompt = self._build_user_prompt(user_message, context)
-        else:
-            # No chunks found — inform user we lack info
-            user_prompt = (
-                f"Question: {user_message}\n\n"
-                f"Note: No relevant documents were found for this query. "
-                f"Please answer based on your general knowledge, but clearly state "
-                f"that this information may not be from the official ECMC documents."
-            )
-            logger.warning(f"No chunks retrieved for query: {user_message[:60]}")
+def get_s3_client() -> boto3.client:
+    """Return singleton S3 client.
 
-        session.add_message("user", user_prompt)
-
-        # 3. Generate
-        messages = session.get_history(include_system=False)
-        answer = self._generate(messages, system_prompt=session.messages[0].content if session.messages else self.DEFAULT_SYSTEM_PROMPT)
-
-        session.add_message("assistant", answer, metadata={"sources": [c.get("chunk_id") for c in chunks]})
-
-        return {
-            "session_id": session.session_id,
-            "answer": answer,
-            "chunks": chunks,
-            "context_used": bool(chunks),
-            "history_length": len(session.messages),
-        }
-
-    def new_chat(self, session_id: Optional[str] = None) -> str:
-        if session_id:
-            session = self.sessions.new_chat(session_id, system_prompt=self.DEFAULT_SYSTEM_PROMPT)
-            return session.session_id
-        else:
-            session = self.sessions.get_or_create(system_prompt=self.DEFAULT_SYSTEM_PROMPT)
-            session.new_chat()
-            return session.session_id
-
-    def get_history(self, session_id: str) -> List[Dict[str, str]]:
-        session = self.sessions.get_or_create(session_id)
-        return session.get_history(include_system=False)
-
-    # ------------------------------------------------------------------
-    # Generation (Nova-compatible)
-    # ------------------------------------------------------------------
-
-    def _generate(self, messages: List[Dict[str, str]], system_prompt: str = "") -> str:
-        """Call Bedrock Converse API with Nova/Claude compatibility."""
-        try:
-            # Format messages for Converse API (only user/assistant, no system)
-            converse_messages = [
-                {"role": m["role"], "content": [{"text": m["content"]}]}
-                for m in messages
-                if m["role"] in ("user", "assistant")
-            ]
-
-            kwargs = {
-                "modelId": self.model_id,
-                "messages": converse_messages,
-                "inferenceConfig": {"maxTokens": 1024, "temperature": 0.3},
-            }
-
-            # Nova requires system prompt as top-level param, not in messages
-            if self.is_nova and system_prompt:
-                kwargs["system"] = [{"text": system_prompt}]
-
-            response = self.bedrock.converse(**kwargs)
-            return response["output"]["message"]["content"][0]["text"]
-
-        except Exception as e:
-            logger.error(f"Bedrock generation failed: {e}")
-            return self._generate_fallback(messages, system_prompt)
-
-    def _generate_fallback(self, messages: List[Dict[str, str]], system_prompt: str = "") -> str:
-        """Fallback using InvokeModel with native Nova payload."""
-        # Build Nova-native payload (NO system role in messages)
-        nova_messages = []
-        for m in messages:
-            if m["role"] in ("user", "assistant"):
-                nova_messages.append({
-                    "role": m["role"],
-                    "content": [{"text": m["content"]}]
-                })
-
-        native_request = {
-            "messages": nova_messages,
-            "inferenceConfig": {"max_new_tokens": 1024, "temperature": 0.3},
-        }
-
-        # Nova native format uses top-level "system" field
-        if self.is_nova and system_prompt:
-            native_request["system"] = [{"text": system_prompt}]
-
-        request = json.dumps(native_request)
-
-        try:
-            response = self.bedrock.invoke_model(
-                modelId=self.model_id,
-                body=request,
-            )
-            model_response = json.loads(response["body"].read())
-            # Nova response format
-            return (
-                model_response.get("output", {})
-                .get("message", {})
-                .get("content", [{}])[0]
-                .get("text", "")
-            )
-        except Exception as e:
-            logger.error(f"Fallback generation also failed: {e}")
-            return "I apologize, but I'm unable to generate a response right now."
-
-    @staticmethod
-    def _build_user_prompt(question: str, context: str) -> str:
-        return (
-            f"Context:\n{context}\n\n"
-            f"Question: {question}\n\n"
-            f"Please answer based on the context above."
-        )
-########################
-"""
-Terminal-based chat interface for the RAG ChatBot.
-Displays conversation like a real chatbot in the terminal.
-
-Commands:
-  /new      — Start a new chat (clear history, keep session)
-  /history  — Show conversation history
-  /sources  — Show sources used in last response
-  /quit     — Exit
-
-Usage:
-    python chat_cli.py
-"""
-
-import os
-import sys
-import textwrap
-from datetime import datetime
-
-from rag_chatbot import RAGChatBot
-
-
-# ── Terminal Colors ─────────────────────────────────────────────
-class Colors:
-    HEADER = "\033[95m"      # Purple
-    BLUE = "\033[94m"       # Blue
-    CYAN = "\033[96m"       # Cyan
-    GREEN = "\033[92m"      # Green
-    YELLOW = "\033[93m"     # Yellow
-    RED = "\033[91m"        # Red
-    BOLD = "\033[1m"        # Bold
-    UNDERLINE = "\033[4m"   # Underline
-    END = "\033[0m"         # Reset
-
-
-def print_banner():
-    """Print welcome banner."""
-    banner = f"""
-{Colors.CYAN}{Colors.BOLD}╔══════════════════════════════════════════════════════════════╗
-║                  ECMC RAG CHATBOT                              ║
-║         Student Loan & Financial Aid Assistant                ║
-╚══════════════════════════════════════════════════════════════╝{Colors.END}
-
-{Colors.YELLOW}Commands:{Colors.END}
-  {Colors.GREEN}/new{Colors.END}      — Start a new chat
-  {Colors.GREEN}/history{Colors.END}  — Show conversation history
-  {Colors.GREEN}/sources{Colors.END}  — Show sources from last response
-  {Colors.GREEN}/quit{Colors.END}     — Exit
-
-{Colors.CYAN}Type your question below...{Colors.END}
-"""
-    print(banner)
-
-
-def print_user(msg: str):
-    """Print user message."""
-    width = 60
-    wrapped = textwrap.fill(msg, width=width)
-    lines = wrapped.split("\n")
-    print(f"\n{Colors.GREEN}┌─ You ─{'─' * 52}┐{Colors.END}")
-    for line in lines:
-        print(f"{Colors.GREEN}│{Colors.END}  {line:<{width}}  {Colors.GREEN}│{Colors.END}")
-    print(f"{Colors.GREEN}└{'─' * 60}┘{Colors.END}")
-
-
-def print_bot(msg: str, sources: list = None):
-    """Print bot response."""
-    width = 60
-    wrapped = textwrap.fill(msg, width=width)
-    lines = wrapped.split("\n")
-    print(f"\n{Colors.BLUE}┌─ ECMC Bot ─{'─' * 47}┐{Colors.END}")
-    for line in lines:
-        print(f"{Colors.BLUE}│{Colors.END}  {line:<{width}}  {Colors.BLUE}│{Colors.END}")
-    print(f"{Colors.BLUE}└{'─' * 60}┘{Colors.END}")
-
-    if sources:
-        print(f"{Colors.YELLOW}   📚 Sources: {', '.join(sources[:3])}{Colors.END}")
-
-
-def print_system(msg: str):
-    """Print system message."""
-    print(f"\n{Colors.YELLOW}⚡ {msg}{Colors.END}")
-
-
-def print_history(history: list):
-    """Print conversation history."""
-    if not history:
-        print_system("No conversation history yet.")
-        return
-
-    print(f"\n{Colors.CYAN}{Colors.BOLD}─── Conversation History ───{Colors.END}")
-    for i, msg in enumerate(history, 1):
-        role = msg["role"]
-        content = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
-        if role == "user":
-            print(f"{Colors.GREEN}  [{i}] You:{Colors.END} {content}")
-        elif role == "assistant":
-            print(f"{Colors.BLUE}  [{i}] Bot:{Colors.END} {content}")
-    print(f"{Colors.CYAN}{'─' * 30}{Colors.END}")
-
-
-def print_sources(chunks: list):
-    """Print source chunks."""
-    if not chunks:
-        print_system("No sources available.")
-        return
-
-    print(f"\n{Colors.CYAN}{Colors.BOLD}─── Sources ───{Colors.END}")
-    for i, chunk in enumerate(chunks[:5], 1):
-        meta = chunk.get("metadata", chunk)
-        doc = meta.get("document_id", "unknown")
-        page = meta.get("page_number", 0)
-        section = meta.get("section", "")[:40]
-        score = chunk.get("score", 0)
-        print(f"{Colors.YELLOW}  [{i}]{Colors.END} {doc} | Page {page} | {section}")
-        print(f"       Score: {score:.4f} | {chunk.get('text', '')[:80]}...")
-    print(f"{Colors.CYAN}{'─' * 30}{Colors.END}")
-
-
-# ── Main Chat Loop ──────────────────────────────────────────────
-
-def main():
-    print_banner()
-
-    # Initialize bot
-    print_system("Loading RAG ChatBot...")
-    try:
-        bot = RAGChatBot()
-        print_system("✅ Bot ready! Session started.")
-    except Exception as e:
-        print(f"{Colors.RED}❌ Failed to initialize bot: {e}{Colors.END}")
-        sys.exit(1)
-
-    session_id = None
-    last_chunks = []
-
-    while True:
-        try:
-            # Get user input
-            user_input = input(f"\n{Colors.GREEN}You > {Colors.END}").strip()
-
-            if not user_input:
-                continue
-
-            # ── Commands ──
-            if user_input.lower() == "/quit":
-                print_system("Goodbye! 👋")
-                break
-
-            elif user_input.lower() == "/new":
-                session_id = bot.new_chat(session_id)
-                print_system("🆕 New chat started. History cleared.")
-                continue
-
-            elif user_input.lower() == "/history":
-                history = bot.get_history(session_id) if session_id else []
-                print_history(history)
-                continue
-
-            elif user_input.lower() == "/sources":
-                print_sources(last_chunks)
-                continue
-
-            # ── Normal Chat ──
-            print_user(user_input)
-
-            # Show thinking indicator
-            print(f"{Colors.YELLOW}   🤖 Thinking...{Colors.END}", end="", flush=True)
-
-            # Get response
-            response = bot.chat(
-                user_message=user_input,
-                session_id=session_id,
-                top_k=5,
-                expand_context=True,
-            )
-
-            # Clear thinking indicator
-            print("\r" + " " * 20 + "\r", end="")
-
-            # Store session ID for continuity
-            session_id = response["session_id"]
-            last_chunks = response.get("chunks", [])
-
-            # Print response
-            sources = [c.get("chunk_id", "") for c in last_chunks]
-            print_bot(response["answer"], sources=sources if sources else None)
-
-            # Show session info
-            print(f"{Colors.CYAN}   📋 Session: {session_id[:8]}... | History: {response['history_length']} msgs{Colors.END}")
-
-        except KeyboardInterrupt:
-            print(f"\n{Colors.YELLOW}\n⚡ Interrupted. Type /quit to exit.{Colors.END}")
-        except Exception as e:
-            print(f"{Colors.RED}❌ Error: {e}{Colors.END}")
-
-
-if __name__ == "__main__":
-    main()
-###########################
-#chat_memory.py
-"""
-Chat session memory with sliding window.
-Maintains conversation history per session, keeping only the last N messages.
-"""
-
-import json
-import logging
-import time
-import uuid
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
-
-from config import config
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ChatMessage:
-    """Single message in a chat session."""
-    role: str  # "system", "user", "assistant"
-    content: str
-    timestamp: float = 0.0
-    metadata: Optional[Dict[str, any]] = None
-
-    def __post_init__(self):
-        if self.timestamp == 0.0:
-            self.timestamp = time.time()
-
-
-class ChatSession:
+    Used for: all upload/download/list operations.
+    No transfer acceleration (cost control).
     """
-    Manages conversation history for a single chat session.
-    Implements sliding window: keeps only last `max_window_size` messages
-    (excluding system prompt, which is always preserved).
-    """
-
-    def __init__(
-        self,
-        session_id: Optional[str] = None,
-        max_window_size: int = 5,
-        system_prompt: Optional[str] = None,
-    ):
-        self.session_id = session_id or str(uuid.uuid4())
-        self.max_window_size = max_window_size
-        self.messages: List[ChatMessage] = []
-        self.created_at = time.time()
-        self.last_active = time.time()
-
-        # System prompt is always message 0, never evicted
-        if system_prompt:
-            self.messages.append(
-                ChatMessage(role="system", content=system_prompt, timestamp=self.created_at)
-            )
-
-    def add_message(self, role: str, content: str, metadata: Optional[Dict] = None) -> None:
-        """Add a message and apply sliding window."""
-        self.messages.append(
-            ChatMessage(role=role, content=content, metadata=metadata)
+    global _s3
+    if _s3 is None:
+        _s3 = boto3.client(
+            service_name="s3",
+            region_name=_get_region(),
+            config=Config(
+                retries={"max_attempts": 3, "mode": "standard"},
+                max_pool_connections=50,
+            ),
         )
-        self.last_active = time.time()
-        self._apply_sliding_window()
-
-    def _apply_sliding_window(self) -> None:
-        """
-        Keep only the last `max_window_size` non-system messages.
-        System prompt (index 0) is never removed.
-        """
-        if len(self.messages) <= 1:
-            return  # Only system prompt or empty
-
-        non_system = [m for m in self.messages if m.role != "system"]
-        system = [m for m in self.messages if m.role == "system"]
-
-        if len(non_system) > self.max_window_size:
-            # Keep only last N non-system messages
-            kept_non_system = non_system[-self.max_window_size:]
-            self.messages = system + kept_non_system
-            logger.debug(
-                f"Session {self.session_id}: slid window to {len(self.messages)} messages"
-            )
-
-    def get_history(self, include_system: bool = True) -> List[Dict[str, str]]:
-        """
-        Return messages as list of dicts for LLM prompt.
-        Format: [{"role": "user", "content": "..."}, ...]
-        """
-        msgs = self.messages if include_system else [m for m in self.messages if m.role != "system"]
-        return [{"role": m.role, "content": m.content} for m in msgs]
-
-    def new_chat(self, system_prompt: Optional[str] = None) -> None:
-        """Clear all messages except system prompt (or set new one)."""
-        old_system = self.messages[0] if self.messages and self.messages[0].role == "system" else None
-        self.messages = []
-        if system_prompt:
-            self.messages.append(ChatMessage(role="system", content=system_prompt))
-        elif old_system:
-            self.messages.append(old_system)
-        self.last_active = time.time()
-        logger.info(f"Session {self.session_id}: new chat started")
-
-    def to_dict(self) -> Dict:
-        """Serialize for storage."""
-        return {
-            "session_id": self.session_id,
-            "max_window_size": self.max_window_size,
-            "created_at": self.created_at,
-            "last_active": self.last_active,
-            "messages": [asdict(m) for m in self.messages],
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict) -> "ChatSession":
-        """Deserialize from storage."""
-        session = cls(
-            session_id=data["session_id"],
-            max_window_size=data.get("max_window_size", 5),
-        )
-        session.created_at = data.get("created_at", time.time())
-        session.last_active = data.get("last_active", time.time())
-        session.messages = [
-            ChatMessage(**m) for m in data.get("messages", [])
-        ]
-        return session
+    return _s3
 
 
-class SessionManager:
-    """
-    Manages multiple concurrent chat sessions.
-    For Lambda: sessions can be stored in DynamoDB; this is the in-memory cache.
-    """
-
-    def __init__(self, default_window_size: int = 5):
-        self.sessions: Dict[str, ChatSession] = {}
-        self.default_window_size = default_window_size
-
-    def get_or_create(
-        self,
-        session_id: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-    ) -> ChatSession:
-        """Get existing session or create new one."""
-        if session_id and session_id in self.sessions:
-            return self.sessions[session_id]
-
-        session = ChatSession(
-            session_id=session_id,
-            max_window_size=self.default_window_size,
-            system_prompt=system_prompt,
-        )
-        self.sessions[session.session_id] = session
-        return session
-
-    def new_chat(self, session_id: str, system_prompt: Optional[str] = None) -> ChatSession:
-        """Start a new chat in an existing session."""
-        session = self.get_or_create(session_id)
-        session.new_chat(system_prompt=system_prompt)
-        return session
-
-    def delete_session(self, session_id: str) -> bool:
-        """Remove a session from memory."""
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            return True
-        return False
-
-    def get_all_sessions(self) -> List[str]:
-        """Return all active session IDs."""
-        return list(self.sessions.keys())
-
+def clear_client_cache() -> None:
+    """Clear all cached boto3 clients. Useful for testing or region changes."""
+    global _bedrock_runtime, _textract, _s3
+    _bedrock_runtime = None
+    _textract = None
+    _s3 = None
 ##########################
-#rag_chatbot.py
-"""
-RAG ChatBot with session memory, retrieval, and Bedrock generation.
-Integrates: ChatSession + RetrievalEngine + Bedrock Nova/Claude.
+##s3_utils.py
+"""All S3 read/write operations with centralized error handling.
+
+Every S3 interaction in the pipeline goes through this module.
+Provides format-aware upload/download (JSON, text, markdown, bytes)
+and utility functions (list, exists, prefix normalization).
 """
 
 import json
 import logging
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 import boto3
+from botocore.exceptions import ClientError
 
-from chat_memory import ChatSession, SessionManager
-from config import config
-from embedding_engine import EmbeddingEngine
-from faiss_vector_store import FAISSVectorStore  # or OpenSearchVectorStore
-from retrieval_engine import RetrievalEngine
+from .aws_clients import get_s3_client
+from .logging_config import get_logger
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger("s3_utils")
 
 
-class RAGChatBot:
+# ── Upload Operations ──────────────────────────────────────────────────────
+
+def upload_json(bucket: str, key: str, data: Dict[str, Any]) -> None:
+    """Serialize dict to JSON bytes and upload to S3.
+
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key (should end with .json).
+        data: Python dictionary to serialize.
+
+    Raises:
+        ClientError: On S3 upload failure.
     """
-    End-to-end RAG chatbot:
-      1. Maintain session memory (sliding window)
-      2. Retrieve relevant chunks from vector store
-      3. Build prompt with history + context
-      4. Generate answer via Bedrock (Nova/Claude)
-    """
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    upload_bytes(bucket, key, body, content_type="application/json")
+    logger.info("Uploaded JSON", extra={"bucket": bucket, "key": key, "bytes": len(body)})
 
-    DEFAULT_SYSTEM_PROMPT = (
-        "You are a helpful assistant for ECMC student loan services. "
-        "Answer questions based ONLY on the provided context. "
-        "If the answer is not in the context, say 'I don't have enough information.' "
-        "Always cite the document name and page number when possible."
+
+def upload_text(bucket: str, key: str, text: str) -> None:
+    """Upload plain text string to S3.
+
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key (should end with .txt).
+        text: UTF-8 string content.
+    """
+    body = text.encode("utf-8")
+    upload_bytes(bucket, key, body, content_type="text/plain; charset=utf-8")
+    logger.info("Uploaded text", extra={"bucket": bucket, "key": key, "bytes": len(body)})
+
+
+def upload_markdown(bucket: str, key: str, markdown: str) -> None:
+    """Upload markdown string to S3 with validation.
+
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key (must end with .md).
+        markdown: Markdown-formatted string.
+
+    Raises:
+        ValueError: If key does not end with .md.
+    """
+    if not key.endswith(".md"):
+        raise ValueError(f"Markdown upload requires .md extension. Got: {key}")
+    body = markdown.encode("utf-8")
+    upload_bytes(bucket, key, body, content_type="text/markdown; charset=utf-8")
+    logger.info("Uploaded markdown", extra={"bucket": bucket, "key": key, "bytes": len(body)})
+
+
+def upload_bytes(
+    bucket: str,
+    key: str,
+    data: bytes,
+    content_type: str = "application/octet-stream",
+) -> None:
+    """Upload raw bytes to S3.
+
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key.
+        data: Raw bytes payload.
+        content_type: MIME type for the object.
+
+    Raises:
+        ClientError: On S3 upload failure.
+    """
+    s3 = get_s3_client()
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+    except ClientError as exc:
+        logger.error(
+            "S3 upload failed",
+            extra={"bucket": bucket, "key": key, "error": str(exc)},
+        )
+        raise
+
+
+# ── Download Operations ──────────────────────────────────────────────────────
+
+def download_json(bucket: str, key: str) -> Dict[str, Any]:
+    """Download S3 object and deserialize JSON.
+
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key.
+
+    Returns:
+        Python dictionary. Returns empty dict if key does not exist (404).
+
+    Raises:
+        ClientError: On non-404 S3 errors (permissions, network).
+    """
+    try:
+        body = download_bytes(bucket, key)
+        return json.loads(body.decode("utf-8"))
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        if error_code == "NoSuchKey":
+            logger.warning("S3 key not found, returning empty dict", extra={"bucket": bucket, "key": key})
+            return {}
+        raise
+
+
+def download_text(bucket: str, key: str) -> str:
+    """Download S3 object as UTF-8 string.
+
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key.
+
+    Returns:
+        UTF-8 decoded string.
+
+    Raises:
+        ClientError: On S3 download failure.
+    """
+    body = download_bytes(bucket, key)
+    return body.decode("utf-8")
+
+
+def download_bytes(bucket: str, key: str) -> bytes:
+    """Download S3 object as raw bytes.
+
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key.
+
+    Returns:
+        Raw bytes payload.
+
+    Raises:
+        ClientError: On S3 download failure (including 404).
+    """
+    s3 = get_s3_client()
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+        body = response["Body"].read()
+        logger.info(
+            "Downloaded bytes",
+            extra={"bucket": bucket, "key": key, "bytes": len(body)},
+        )
+        return body
+    except ClientError as exc:
+        logger.error(
+            "S3 download failed",
+            extra={"bucket": bucket, "key": key, "error": str(exc)},
+        )
+        raise
+
+
+# ── Listing & Existence Operations ─────────────────────────────────────────
+
+def list_objects(bucket: str, prefix: str) -> List[str]:
+    """List all object keys under a prefix.
+
+    Handles pagination automatically (S3 returns max 1000 per call).
+
+    Args:
+        bucket: S3 bucket name.
+        prefix: S3 key prefix (e.g., 'ecmc_org/ECMC_RAG/01_markdown/').
+
+    Returns:
+        List of full object keys.
+    """
+    s3 = get_s3_client()
+    keys: List[str] = []
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+
+    logger.info(
+        "Listed S3 objects",
+        extra={"bucket": bucket, "prefix": prefix, "count": len(keys)},
     )
+    return keys
 
-    def __init__(
-        self,
-        vector_store: Optional[Any] = None,
-        model_id: Optional[str] = None,
-        session_manager: Optional[SessionManager] = None,
-    ):
-        # Vector store (FAISS or OpenSearch)
-        self.store = vector_store or self._load_default_store()
 
-        # Retrieval engine
-        self.retriever = RetrievalEngine(vector_store=self.store)
+def check_exists(bucket: str, key: str) -> bool:
+    """Check if an S3 object exists using HeadObject.
 
-        # Session manager
-        self.sessions = session_manager or SessionManager(default_window_size=5)
+    Args:
+        bucket: S3 bucket name.
+        key: S3 object key.
 
-        # Bedrock generation
-        self.bedrock = boto3.client("bedrock-runtime", region_name=config.AWS_REGION)
-        self.model_id = model_id or "amazon.nova-pro-v1:0"  # or your preferred model
-
-    def _load_default_store(self) -> FAISSVectorStore:
-        """Load FAISS index from S3 vectorstore/ folder."""
-        store = FAISSVectorStore()
-        try:
-            store.load_from_s3(name="ecmc_index")
-        except FileNotFoundError:
-            logger.warning("No saved FAISS index found. Call build_index() first.")
-        return store
-
-    def build_index(self) -> None:
-        """Build FAISS index from S3 embeddings and save."""
-        self.store.build_from_s3()
-        self.store.save_to_s3(name="ecmc_index")
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def chat(
-        self,
-        user_message: str,
-        session_id: Optional[str] = None,
-        top_k: int = 5,
-        expand_context: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Main chat entry point.
-
-        Args:
-            user_message: User's question.
-            session_id: Existing session ID, or None to create new.
-            top_k: Number of chunks to retrieve.
-            expand_context: Whether to fetch prev/next chunks.
-
-        Returns:
-            Dict with:
-                - "session_id": session ID
-                - "answer": generated answer
-                - "chunks": retrieved chunks (for UI display)
-                - "context_used": whether RAG context was used
-        """
-        # 1. Get or create session
-        session = self.sessions.get_or_create(
-            session_id=session_id,
-            system_prompt=self.DEFAULT_SYSTEM_PROMPT,
+    Returns:
+        True if object exists, False otherwise.
+    """
+    s3 = get_s3_client()
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        if error_code == "404":
+            return False
+        logger.error(
+            "S3 head_object failed",
+            extra={"bucket": bucket, "key": key, "error": str(exc)},
         )
+        raise
 
-        # 2. Retrieve relevant chunks
-        retrieval_result = self.retriever.retrieve(
-            query=user_message,
-            top_k=top_k,
-            expand_context=expand_context,
-        )
-        context = retrieval_result["context_text"]
-        chunks = retrieval_result["chunks"]
 
-        # 3. Build messages for LLM
-        # Add user message with context injected
-        user_prompt = self._build_user_prompt(user_message, context)
-        session.add_message("user", user_prompt)
+def ensure_prefix(prefix: str) -> str:
+    """Ensure prefix ends with '/' for safe concatenation.
 
-        # 4. Call Bedrock
-        messages = session.get_history(include_system=True)
-        answer = self._generate(messages)
+    Args:
+        prefix: S3 key prefix string.
 
-        # 5. Add assistant response to history
-        session.add_message("assistant", answer, metadata={"sources": [c.get("chunk_id") for c in chunks]})
+    Returns:
+        Prefix with trailing slash.
+    """
+    return prefix if prefix.endswith("/") else prefix + "/"
 
-        return {
-            "session_id": session.session_id,
-            "answer": answer,
-            "chunks": chunks,
-            "context_used": bool(context.strip()),
-            "history_length": len(session.messages),
-        }
+##############################
+###########text_utils.py
+"""Text processing utilities for chunking, ID generation, and table conversion.
 
-    def new_chat(self, session_id: Optional[str] = None) -> str:
-        """
-        Start a new chat. Clears history but keeps session ID.
-        Returns the session ID.
-        """
-        if session_id:
-            session = self.sessions.new_chat(session_id, system_prompt=self.DEFAULT_SYSTEM_PROMPT)
-            return session.session_id
+All token counting is approximate (whitespace-based) for fast, dependency-free
+chunking decisions. Exact tokenization happens inside Bedrock.
+"""
+
+import re
+import uuid
+from typing import Dict, List, Optional, Set, Tuple
+
+from config.paths import CHUNKING
+
+
+# ── Token Estimation ───────────────────────────────────────────────────────
+
+def estimate_token_count(text: str) -> int:
+    """Approximate token count using whitespace-based heuristic.
+
+    Rule of thumb: 1 token ≈ 0.75 English words.
+    This is fast, dependency-free, and accurate within ±15% for chunking.
+
+    Args:
+        text: Input text string.
+
+    Returns:
+        Estimated integer token count.
+
+    Example:
+        >>> estimate_token_count("Income-driven repayment plans calculate.")
+        6
+    """
+    if not text or not text.strip():
+        return 0
+    # Split on whitespace to get word count
+    word_count = len(text.split())
+    # Apply 0.75 tokens-per-word ratio and round up
+    return max(1, int(word_count * 0.75))
+
+
+# ── ID Generation ──────────────────────────────────────────────────────────
+
+def generate_doc_id(filename: str, existing_ids: Optional[Set[str]] = None) -> str:
+    """Generate sequential doc_id from filename.
+
+    Format: doc_001, doc_002, ...
+    If existing_ids provided, finds next available sequence number.
+
+    Args:
+        filename: Original file name (e.g., 'Federal_Student_Aid_Guide_2024.pdf').
+        existing_ids: Set of already-assigned doc_ids. If None, generates doc_001.
+
+    Returns:
+        New unique doc_id string.
+
+    Example:
+        >>> generate_doc_id("guide.pdf")
+        'doc_001'
+        >>> generate_doc_id("guide2.pdf", {"doc_001"})
+        'doc_002'
+    """
+    existing_ids = existing_ids or set()
+    if not existing_ids:
+        return "doc_001"
+
+    # Extract numeric suffixes from existing doc_ids
+    max_num = 0
+    for doc_id in existing_ids:
+        match = re.match(r"doc_(\d{3})", doc_id)
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+
+    next_num = max_num + 1
+    return f"doc_{next_num:03d}"
+
+
+def generate_parent_id(doc_id: str, sequence: int) -> str:
+    """Generate parent chunk ID.
+
+    Format: {doc_id}_parent_{sequence:03d}
+
+    Args:
+        doc_id: Document identifier (e.g., 'doc_001').
+        sequence: Parent sequence number within document (1-indexed).
+
+    Returns:
+        Parent chunk ID string.
+    """
+    return f"{doc_id}_parent_{sequence:03d}"
+
+
+def generate_child_id(doc_id: str, parent_sequence: int, child_sequence: int) -> str:
+    """Generate child chunk ID.
+
+    Format: {doc_id}_child_{parent_sequence:03d}_{child_sequence:03d}
+    This embeds parent_sequence for easy tracing.
+
+    Args:
+        doc_id: Document identifier.
+        parent_sequence: Parent sequence number.
+        child_sequence: Child sequence within parent (1-indexed).
+
+    Returns:
+        Child chunk ID string.
+    """
+    return f"{doc_id}_child_{parent_sequence:03d}_{child_sequence:03d}"
+
+
+def generate_uuid() -> str:
+    """Generate a short unique identifier for internal tracking.
+
+    Returns:
+        8-character hex string (first 8 chars of UUID4).
+    """
+    return uuid.uuid4().hex[:8]
+
+
+# ── Table Conversion ───────────────────────────────────────────────────────
+
+def textract_table_to_markdown(
+    table_block: Dict[str, Any],
+    blocks_by_id: Dict[str, Dict[str, Any]],
+) -> str:
+    """Convert an AWS Textract TABLE block to pipe-delimited markdown.
+
+    Handles merged cells by filling empty cells with placeholder.
+    Detects header row from WORD block confidence or first row.
+
+    Args:
+        table_block: Textract Block with BlockType="TABLE".
+        blocks_by_id: Dict mapping all block IDs to their block objects.
+
+    Returns:
+        Markdown table string.
+
+    Example Output:
+        | Income Range | Family Size 1 | Family Size 2 |
+        | --- | --- | --- |
+        | $0 - $20,000 | $0 | $0 |
+    """
+    # Extract relationships: TABLE → CELL blocks
+    cells = []
+    for rel in table_block.get("Relationships", []):
+        if rel.get("Type") == "CHILD":
+            for cell_id in rel.get("Ids", []):
+                cell = blocks_by_id.get(cell_id)
+                if cell and cell.get("BlockType") == "CELL":
+                    cells.append(cell)
+
+    if not cells:
+        return ""
+
+    # Build grid: row_index -> {col_index -> text}
+    grid: Dict[int, Dict[int, str]] = {}
+    max_row = 0
+    max_col = 0
+
+    for cell in cells:
+        row = cell.get("RowIndex", 1)
+        col = cell.get("ColumnIndex", 1)
+        # Extract text from cell's child WORD blocks
+        cell_text = ""
+        for rel in cell.get("Relationships", []):
+            if rel.get("Type") == "CHILD":
+                for word_id in rel.get("Ids", []):
+                    word = blocks_by_id.get(word_id)
+                    if word and word.get("BlockType") == "WORD":
+                        cell_text += word.get("Text", "") + " "
+        cell_text = cell_text.strip()
+
+        if row not in grid:
+            grid[row] = {}
+        grid[row][col] = cell_text
+        max_row = max(max_row, row)
+        max_col = max(max_col, col)
+
+    # Build markdown rows
+    rows: List[str] = []
+    for r in range(1, max_row + 1):
+        cols = [grid.get(r, {}).get(c, "") for c in range(1, max_col + 1)]
+        rows.append("| " + " | ".join(cols) + " |")
+
+    # Insert header separator after first row (assume first row is header)
+    if len(rows) >= 1:
+        separator = "| " + " | ".join(["---"] * max_col) + " |"
+        rows.insert(1, separator)
+
+    return "\n".join(rows)
+
+
+# ── Markdown Cleaning ──────────────────────────────────────────────────────
+
+def clean_markdown(text: str) -> str:
+    """Normalize markdown text for consistent formatting.
+
+    Operations:
+      - Collapse multiple blank lines to single blank line
+      - Strip trailing whitespace from each line
+      - Ensure single newline between paragraphs
+      - Standardize heading levels (no space between # and text)
+
+    Args:
+        text: Raw markdown string.
+
+    Returns:
+        Cleaned markdown string.
+    """
+    # Normalize line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Strip trailing whitespace per line
+    lines = [line.rstrip() for line in text.split("\n")]
+
+    # Collapse multiple blank lines
+    cleaned_lines = []
+    prev_blank = False
+    for line in lines:
+        is_blank = line == ""
+        if is_blank and prev_blank:
+            continue
+        cleaned_lines.append(line)
+        prev_blank = is_blank
+
+    # Fix heading spacing: "#  Title" → "# Title"
+    result_lines = []
+    for line in cleaned_lines:
+        match = re.match(r"^(#{1,6})\s+(.*)", line)
+        if match:
+            result_lines.append(f"{match.group(1)} {match.group(2).strip()}")
         else:
-            session = self.sessions.get_or_create(system_prompt=self.DEFAULT_SYSTEM_PROMPT)
-            session.new_chat()
-            return session.session_id
+            result_lines.append(line)
 
-    def get_history(self, session_id: str) -> List[Dict[str, str]]:
-        """Return chat history for a session."""
-        session = self.sessions.get_or_create(session_id)
-        return session.get_history(include_system=False)
+    return "\n".join(result_lines)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_user_prompt(question: str, context: str) -> str:
-        """Inject retrieved context into the user message."""
-        return (
-            f"Context:\\n{context}\\n\\n"
-            f"Question: {question}\\n\\n"
-            f"Please answer based on the context above."
-        )
+# ── Smart Truncation ───────────────────────────────────────────────────────
 
-    def _generate(self, messages: List[Dict[str, str]]) -> str:
-        """
-        Call Bedrock for text generation.
-        Supports Nova, Claude, and other Bedrock models.
-        """
-        try:
-            # Converse API (recommended for Nova/Claude)
-            response = self.bedrock.converse(
-                modelId=self.model_id,
-                messages=[
-                    {"role": m["role"], "content": [{"text": m["content"]}]}
-                    for m in messages
-                ],
-                inferenceConfig={"maxTokens": 1024, "temperature": 0.3},
-            )
-            return response["output"]["message"]["content"][0]["text"]
+def truncate_at_boundary(
+    text: str,
+    max_tokens: int,
+    boundary: str = "sentence",
+) -> str:
+    """Truncate text at sentence or paragraph boundary without mid-sentence cuts.
 
-        except Exception as e:
-            logger.error(f"Bedrock generation failed: {e}")
-            # Fallback: try InvokeModel for older APIs
-            return self._generate_fallback(messages)
+    Args:
+        text: Input text to truncate.
+        max_tokens: Maximum estimated tokens allowed.
+        boundary: "sentence" or "paragraph". Default is sentence.
 
-    def _generate_fallback(self, messages: List[Dict[str, str]]) -> str:
-        """Fallback using InvokeModel with native payload format."""
-        # Format for Nova
-        native_request = {
-            "messages": [
-                {"role": m["role"], "content": {"text": m["content"]}}
-                for m in messages
-            ],
-            "inferenceConfig": {"max_new_tokens": 1024, "temperature": 0.3},
+    Returns:
+        Truncated text ending at a natural boundary.
+
+    Raises:
+        ValueError: If boundary is not 'sentence' or 'paragraph'.
+    """
+    if boundary not in ("sentence", "paragraph"):
+        raise ValueError(f"boundary must be 'sentence' or 'paragraph', got {boundary}")
+
+    if estimate_token_count(text) <= max_tokens:
+        return text
+
+    if boundary == "sentence":
+        # Split on sentence endings (.!? followed by space or newline)
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+    else:
+        sentences = text.split("\n\n")
+
+    result = []
+    current_tokens = 0
+    for segment in sentences:
+        seg_tokens = estimate_token_count(segment)
+        if current_tokens + seg_tokens > max_tokens:
+            break
+        result.append(segment)
+        current_tokens += seg_tokens
+
+    return " ".join(result) if boundary == "sentence" else "\n\n".join(result)
+
+
+# ── Context Extraction ─────────────────────────────────────────────────────
+
+def extract_context_around_table(
+    reading_order: List[Dict[str, Any]],
+    table_block_id: str,
+    max_tokens: int = 200,
+) -> str:
+    """Extract text blocks immediately before and after a table.
+
+    Used for table enrichment: provides Nova Lite with surrounding context
+    to generate accurate captions.
+
+    Args:
+        reading_order: List of blocks sorted by reading order.
+        table_block_id: The block ID of the TABLE block.
+        max_tokens: Maximum tokens of context to extract (split before/after).
+
+    Returns:
+        Concatenated surrounding text.
+    """
+    # Find table position in reading order
+    table_idx = -1
+    for i, block in enumerate(reading_order):
+        if block.get("block_id") == table_block_id:
+            table_idx = i
+            break
+
+    if table_idx == -1:
+        return ""
+
+    half_tokens = max_tokens // 2
+    before_text = []
+    after_text = []
+
+    # Collect text before table (reverse order, stop when token limit reached)
+    before_tokens = 0
+    for i in range(table_idx - 1, -1, -1):
+        block = reading_order[i]
+        if block.get("block_type") in ("LAYOUT_TEXT", "LAYOUT_SECTION_HEADER"):
+            text = block.get("text", "")
+            tokens = estimate_token_count(text)
+            if before_tokens + tokens > half_tokens:
+                break
+            before_text.insert(0, text)
+            before_tokens += tokens
+
+    # Collect text after table
+    after_tokens = 0
+    for i in range(table_idx + 1, len(reading_order)):
+        block = reading_order[i]
+        if block.get("block_type") in ("LAYOUT_TEXT", "LAYOUT_SECTION_HEADER"):
+            text = block.get("text", "")
+            tokens = estimate_token_count(text)
+            if after_tokens + tokens > half_tokens:
+                break
+            after_text.append(text)
+            after_tokens += tokens
+
+    return " ".join(before_text + after_text)
+
+
+######################
+################# logging_config.py
+"""Structured JSON logging for production observability.
+
+All modules use get_logger() to emit JSON-formatted logs.
+CloudWatch automatically parses these for metric filters and dashboards.
+"""
+
+import json
+import logging
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+
+class JSONFormatter(logging.Formatter):
+    """Custom formatter that outputs log records as JSON lines.
+
+    Format:
+        {
+          "timestamp": "2026-08-01T10:30:00Z",
+          "level": "INFO",
+          "module": "textract_processor",
+          "function": "analyze_document",
+          "message": "Job started",
+          "doc_id": "doc_001",
+          "duration_ms": 4500,
+          "status": "success"
+        }
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry: Dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "level": record.levelname,
+            "module": record.module,
+            "function": record.funcName,
+            "message": record.getMessage(),
         }
 
-        request = json.dumps(native_request)
+        # Merge extra fields from record.__dict__ (passed via extra=)
+        # Filter out standard LogRecord attributes to avoid noise
+        standard_attrs = {
+            "name", "msg", "args", "levelname", "levelno", "pathname",
+            "filename", "module", "exc_info", "exc_text", "stack_info",
+            "lineno", "funcName", "created", "msecs", "relativeCreated",
+            "thread", "threadName", "processName", "process", "message",
+            "asctime", "taskName",
+        }
+        for key, value in record.__dict__.items():
+            if key not in standard_attrs and not key.startswith("_"):
+                log_entry[key] = value
 
-        try:
-            response = self.bedrock.invoke_model(
-                modelId=self.model_id,
-                body=request,
-            )
-            model_response = json.loads(response["body"].read())
-            # Nova response format
-            return model_response.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
-        except Exception as e:
-            logger.error(f"Fallback generation also failed: {e}")
-            return "I apologize, but I'm unable to generate a response right now."
+        # Include exception info if present
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_entry, default=str)
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Get a configured logger with JSON formatting.
+
+    Args:
+        name: Logger name (typically module name).
+
+    Returns:
+        Configured logging.Logger instance.
+    """
+    logger = logging.getLogger(name)
+
+    # Avoid duplicate handlers if called multiple times
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+
+    # Stream handler → stdout (CloudWatch captures stdout in ECS/Lambda)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter())
+    logger.addHandler(handler)
+
+    # Prevent propagation to root logger (avoids duplicate output)
+    logger.propagate = False
+
+    return logger
+
+
+def log_operation(
+    logger: logging.Logger,
+    operation: str,
+    doc_id: Optional[str] = None,
+    duration_ms: Optional[float] = None,
+    status: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Standardized operation log entry.
+
+    Args:
+        logger: Logger instance from get_logger().
+        operation: Name of the operation (e.g., 'analyze_document').
+        doc_id: Document identifier if applicable.
+        duration_ms: Operation duration in milliseconds.
+        status: 'success', 'failure', 'started', etc.
+        extra: Additional key-value pairs to include in log.
+    """
+    log_data = {
+        "operation": operation,
+    }
+    if doc_id:
+        log_data["doc_id"] = doc_id
+    if duration_ms is not None:
+        log_data["duration_ms"] = round(duration_ms, 2)
+    if status:
+        log_data["status"] = status
+    if extra:
+        log_data.update(extra)
+
+    logger.info(f"Operation: {operation}", extra=log_data)
 
 ########
-from rag_chatbot import RAGChatBot
+## decorators.py
+"""Cross-cutting decorators for retry logic, timing, and input validation.
 
-# Initialize (loads FAISS index from S3 automatically)
-bot = RAGChatBot()
+Apply these to pipeline functions to get automatic retries, performance logging,
+and schema validation without cluttering business logic.
+"""
 
-# First message — new session created automatically
-response = bot.chat("What is income-driven repayment?")
-print(response["answer"])
-print(f"Session ID: {response['session_id']}")
+import functools
+import time
+from typing import Any, Callable, Dict, Tuple, Type, Union
 
-# Continue same session
-response2 = bot.chat(
-    "How do I apply for it?",
-    session_id=response["session_id"],  # Same session
-)
-print(response2["answer"])
+from .logging_config import get_logger
 
-# Check history
-history = bot.get_history(response["session_id"])
-for msg in history:
-    print(f"{msg['role']}: {msg['content'][:100]}...")
+logger = get_logger("decorators")
+
+
+# Retry Decorator 
+def retry(
+    max_attempts: int = 3,
+    backoff_seconds: int = 2,
+    exceptions: Tuple[Type[Exception], ...] = (Exception,),
+) -> Callable:
+    """Exponential backoff retry decorator.
+
+    Retries the decorated function up to max_attempts with exponential backoff.
+    Logs each retry attempt.
+
+    Args:
+        max_attempts: Maximum number of attempts (including first call).
+        backoff_seconds: Initial backoff in seconds. Doubles each retry.
+        exceptions: Tuple of exception types to catch and retry.
+
+    Returns:
+        Decorated function.
+
+    Example:
+        @retry(max_attempts=3, backoff_seconds=2, exceptions=(ClientError,))
+        def call_bedrock_api(...):
+            ...
+    """
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            attempt = 1
+            current_backoff = backoff_seconds
+
+            while attempt <= max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as exc:
+                    if attempt == max_attempts:
+                        logger.error(
+                            f"Function {func.__name__} failed after {max_attempts} attempts",
+                            extra={
+                                "function": func.__name__,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                "error": str(exc),
+                                "status": "failure",
+                            },
+                        )
+                        raise
+
+                    logger.warning(
+                        f"Function {func.__name__} failed, retrying in {current_backoff}s",
+                        extra={
+                            "function": func.__name__,
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "backoff_seconds": current_backoff,
+                            "error": str(exc),
+                            "status": "retry",
+                        },
+                    )
+                    time.sleep(current_backoff)
+                    current_backoff *= 2
+                    attempt += 1
+
+            # Should never reach here
+            raise RuntimeError(f"Unexpected exit from retry loop in {func.__name__}")
+
+        return wrapper
+    return decorator
+
+
+# ── Timing Decorator ───────────────────────────────────────────────────────
+
+def timing(logger_name: str = "performance") -> Callable:
+    """Log function execution duration in milliseconds.
+
+    Args:
+        logger_name: Logger name for timing logs. Default 'performance'.
+
+    Returns:
+        Decorated function.
+
+    Example:
+        @timing()
+        def process_document(doc_id: str):
+            ...
+    """
+    perf_logger = get_logger(logger_name)
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            start = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+                duration_ms = (time.perf_counter() - start) * 1000
+                perf_logger.info(
+                    f"Function {func.__name__} completed",
+                    extra={
+                        "function": func.__name__,
+                        "duration_ms": round(duration_ms, 2),
+                        "status": "success",
+                    },
+                )
+                return result
+            except Exception as exc:
+                duration_ms = (time.perf_counter() - start) * 1000
+                perf_logger.error(
+                    f"Function {func.__name__} failed",
+                    extra={
+                        "function": func.__name__,
+                        "duration_ms": round(duration_ms, 2),
+                        "status": "failure",
+                        "error": str(exc),
+                    },
+                )
+                raise
+
+        return wrapper
+    return decorator
+
+
+# ── Input Validation Decorator ────────────────────────────────────────────
+
+def validate_input(schema: Dict[str, Union[Type, Tuple[Type, ...]]]) -> Callable:
+    """Validate function keyword arguments against expected types.
+
+    Args:
+        schema: Dict mapping arg name to expected type(s).
+                Example: {"doc_id": str, "s3_key": str, "max_pages": (int, type(None))}
+
+    Returns:
+        Decorated function.
+
+    Raises:
+        TypeError: If argument type does not match schema.
+        ValueError: If required argument (no None in types) is missing.
+
+    Example:
+        @validate_input({"doc_id": str, "bucket": str})
+        def process_document(doc_id: str, bucket: str):
+            ...
+    """
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            import inspect
+            sig = inspect.signature(func)
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+
+            for arg_name, expected_types in schema.items():
+                if isinstance(expected_types, type):
+                    expected_types = (expected_types,)
+
+                value = bound.arguments.get(arg_name)
+                if value is None and type(None) not in expected_types:
+                    raise ValueError(
+                        f"Missing required argument '{arg_name}' in {func.__name__}"
+                    )
+
+                if value is not None and not isinstance(value, expected_types):
+                    raise TypeError(
+                        f"Argument '{arg_name}' in {func.__name__} "
+                        f"expected {expected_types}, got {type(value).__name__}"
+                    )
+
+            return func(*args, **kwargs)
+
+        return wrapper
+    return decorator
+
+
+###############################
+
+
