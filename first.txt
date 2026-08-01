@@ -1,3 +1,346 @@
+#!/usr/bin/env python3
+"""CLI entry point: Ingest all PDFs from S3 source_files through Textract pipeline.
+
+Usage:
+    # Process all PDFs in source_files/
+    python scripts/01_ingest.py
+
+    # Process specific PDF
+    python scripts/01_ingest.py --source-key ecmc_org/source_files/borrower_guide.pdf
+
+    # Dry run (discover files but do not process)
+    python scripts/01_ingest.py --dry-run
+
+Flow:
+    1. List all PDFs in s3://{bucket}/ecmc_org/source_files/
+    2. Assign sequential doc_ids (doc_001, doc_002, ...)
+    3. For each PDF:
+       a. Textract analysis → s3://.../textract_output/{doc_id}/layout.json
+       b. Layout parsing → s3://.../ECMC_RAG/02_json/{doc_id}/reading_order.json
+       c. Table extraction → s3://.../ECMC_RAG/02_json/{doc_id}/tables.json
+       d. Image extraction → s3://.../ECMC_RAG/02_json/{doc_id}/image_captions.json
+    4. Write manifest.json with doc_id → source_key mapping
+
+Prerequisites:
+    - .env file with AWS_REGION, S3_BUCKET, BEDROCK_CHAT_MODEL_ID, BEDROCK_EMBED_MODEL_ID
+    - AWS credentials configured (IAM role or ~/.aws/credentials)
+    - pip install -r requirements.txt
+"""
+
+import argparse
+import json
+import sys
+from typing import Dict, List, Optional, Set
+
+from config.settings import load_settings
+from utils.s3_utils import list_objects, upload_json, check_exists
+from utils.text_utils import generate_doc_id
+from utils.logging_config import get_logger, log_operation
+from ingestion.textract_processor import process_document as run_textract
+from ingestion.layout_parser import parse_layout
+from ingestion.table_extractor import extract_and_enrich_tables
+from ingestion.image_extractor import extract_and_caption_images
+
+logger = get_logger("01_ingest")
+
+
+def discover_pdfs(bucket: str, prefix: str) -> List[str]:
+    """List all PDF files under the source_files prefix.
+
+    Args:
+        bucket: S3 bucket name.
+        prefix: S3 key prefix (e.g., 'ecmc_org/source_files/').
+
+    Returns:
+        List of S3 keys ending with .pdf.
+    """
+    all_keys = list_objects(bucket, prefix)
+    pdf_keys = [k for k in all_keys if k.lower().endswith(".pdf")]
+    logger.info(
+        "Discovered PDFs",
+        extra={"bucket": bucket, "prefix": prefix, "count": len(pdf_keys)},
+    )
+    return sorted(pdf_keys)
+
+
+def load_existing_manifest(bucket: str, manifest_key: str) -> Dict[str, str]:
+    """Load existing manifest to avoid re-processing and maintain doc_id continuity.
+
+    Args:
+        bucket: S3 bucket name.
+        manifest_key: S3 key of manifest.json.
+
+    Returns:
+        Dict mapping doc_id → source_s3_key.
+    """
+    from utils.s3_utils import download_json
+    try:
+        data = download_json(bucket, manifest_key)
+        if data and "documents" in data:
+            return {d["doc_id"]: d["source_key"] for d in data["documents"]}
+    except Exception:
+        pass
+    return {}
+
+
+def process_single_document(
+    doc_id: str,
+    source_key: str,
+    bucket: str,
+    settings,
+    skip_existing: bool = True,
+) -> Dict[str, str]:
+    """Run full ingestion pipeline for one PDF.
+
+    Args:
+        doc_id: Assigned document identifier.
+        source_key: S3 key of source PDF.
+        bucket: S3 bucket name.
+        settings: Settings instance.
+        skip_existing: If True, skip steps where output already exists in S3.
+
+    Returns:
+        Dict with output S3 keys for each step.
+    """
+    outputs = {
+        "doc_id": doc_id,
+        "source_key": source_key,
+        "textract_output": None,
+        "reading_order": None,
+        "document_metadata": None,
+        "tables": None,
+        "table_enrichments": None,
+        "image_captions": None,
+    }
+
+    # ── Step 1: Textract ─────────────────────────────────────────────────
+    textract_key = settings.s3_paths.textract_doc_path(doc_id) + "layout.json"
+
+    if skip_existing and check_exists(bucket, textract_key):
+        logger.info(
+            "Textract output exists, skipping",
+            extra={"doc_id": doc_id, "s3_key": textract_key},
+        )
+        outputs["textract_output"] = textract_key
+    else:
+        logger.info(
+            "Running Textract",
+            extra={"doc_id": doc_id, "source_key": source_key},
+        )
+        outputs["textract_output"] = run_textract(doc_id, source_key)
+
+    # ── Step 2: Layout Parsing ───────────────────────────────────────────
+    reading_key = settings.s3_paths.json_doc_path(doc_id) + "reading_order.json"
+
+    if skip_existing and check_exists(bucket, reading_key):
+        logger.info(
+            "Reading order exists, skipping",
+            extra={"doc_id": doc_id, "s3_key": reading_key},
+        )
+        outputs["reading_order"] = reading_key
+    else:
+        logger.info(
+            "Parsing layout",
+            extra={"doc_id": doc_id},
+        )
+        reading_key, meta_key = parse_layout(doc_id)
+        outputs["reading_order"] = reading_key
+        outputs["document_metadata"] = meta_key
+
+    # ── Step 3: Table Extraction ─────────────────────────────────────────
+    tables_key = settings.s3_paths.json_doc_path(doc_id) + "tables.json"
+
+    if skip_existing and check_exists(bucket, tables_key):
+        logger.info(
+            "Tables exist, skipping",
+            extra={"doc_id": doc_id, "s3_key": tables_key},
+        )
+        outputs["tables"] = tables_key
+    else:
+        logger.info(
+            "Extracting tables",
+            extra={"doc_id": doc_id},
+        )
+        tables_key, enrich_key = extract_and_enrich_tables(doc_id)
+        outputs["tables"] = tables_key
+        outputs["table_enrichments"] = enrich_key
+
+    # ── Step 4: Image Extraction ─────────────────────────────────────────
+    captions_key = settings.s3_paths.json_doc_path(doc_id) + "image_captions.json"
+
+    if skip_existing and check_exists(bucket, captions_key):
+        logger.info(
+            "Image captions exist, skipping",
+            extra={"doc_id": doc_id, "s3_key": captions_key},
+        )
+        outputs["image_captions"] = captions_key
+    else:
+        logger.info(
+            "Extracting images",
+            extra={"doc_id": doc_id},
+        )
+        outputs["image_captions"] = extract_and_caption_images(doc_id, source_key)
+
+    return outputs
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Ingest PDFs from S3 through Textract pipeline"
+    )
+    parser.add_argument(
+        "--source-key",
+        type=str,
+        default=None,
+        help="Process a specific S3 key (e.g., ecmc_org/source_files/doc_001.pdf). "
+             "If omitted, processes all PDFs in source_files/.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List files that would be processed without running Textract.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-process even if outputs already exist in S3.",
+    )
+    parser.add_argument(
+        "--max-docs",
+        type=int,
+        default=None,
+        help="Limit number of documents to process (for testing).",
+    )
+
+    args = parser.parse_args()
+
+    # Load configuration
+    settings = load_settings()
+    bucket = settings.S3_BUCKET
+    source_prefix = settings.s3_paths.SOURCE_FILES
+
+    logger.info(
+        "Ingestion started",
+        extra={
+            "bucket": bucket,
+            "source_prefix": source_prefix,
+            "dry_run": args.dry_run,
+            "force": args.force,
+        },
+    )
+
+    # Discover PDFs
+    if args.source_key:
+        pdf_keys = [args.source_key]
+    else:
+        pdf_keys = discover_pdfs(bucket, source_prefix)
+
+    if not pdf_keys:
+        logger.error("No PDFs found", extra={"prefix": source_prefix})
+        sys.exit(1)
+
+    # Load manifest for doc_id continuity
+    manifest_key = settings.s3_paths.PROCESSED_BASE + "manifest.json"
+    existing = load_existing_manifest(bucket, manifest_key)
+    existing_ids = set(existing.keys())
+
+    if args.dry_run:
+        print(f"\nDry run: Would process {len(pdf_keys)} PDFs")
+        for key in pdf_keys[:args.max_docs or len(pdf_keys)]:
+            doc_id = generate_doc_id(key.split("/")[-1], existing_ids)
+            print(f"  {doc_id}: {key}")
+        sys.exit(0)
+
+    # Process documents
+    results = []
+    skip_existing = not args.force
+
+    for i, source_key in enumerate(pdf_keys):
+        if args.max_docs and i >= args.max_docs:
+            logger.info(
+                "Max documents reached",
+                extra={"max_docs": args.max_docs, "processed": i},
+            )
+            break
+
+        # Generate or reuse doc_id
+        filename = source_key.split("/")[-1]
+        doc_id = generate_doc_id(filename, existing_ids)
+        existing_ids.add(doc_id)
+
+        logger.info(
+            f"Processing [{i+1}/{len(pdf_keys)}]",
+            extra={"doc_id": doc_id, "source_key": source_key},
+        )
+
+        try:
+            outputs = process_single_document(
+                doc_id=doc_id,
+                source_key=source_key,
+                bucket=bucket,
+                settings=settings,
+                skip_existing=skip_existing,
+            )
+            results.append({
+                "doc_id": doc_id,
+                "source_key": source_key,
+                "status": "success",
+                "outputs": outputs,
+            })
+        except Exception as exc:
+            logger.error(
+                "Document processing failed",
+                extra={
+                    "doc_id": doc_id,
+                    "source_key": source_key,
+                    "error": str(exc),
+                },
+            )
+            results.append({
+                "doc_id": doc_id,
+                "source_key": source_key,
+                "status": "failed",
+                "error": str(exc),
+            })
+
+    # Update manifest
+    manifest = {
+        "bucket": bucket,
+        "source_prefix": source_prefix,
+        "total_documents": len(results),
+        "successful": sum(1 for r in results if r["status"] == "success"),
+        "failed": sum(1 for r in results if r["status"] == "failed"),
+        "documents": results,
+    }
+    upload_json(bucket, manifest_key, manifest)
+
+    logger.info(
+        "Ingestion complete",
+        extra={
+            "total": manifest["total_documents"],
+            "successful": manifest["successful"],
+            "failed": manifest["failed"],
+            "manifest_key": manifest_key,
+        },
+    )
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"Ingestion Complete")
+    print(f"{'='*60}")
+    print(f"Total:     {manifest['total_documents']}")
+    print(f"Success:   {manifest['successful']}")
+    print(f"Failed:    {manifest['failed']}")
+    print(f"Manifest:  s3://{bucket}/{manifest_key}")
+    print(f"{'='*60}")
+
+    if manifest["failed"] > 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+##################
 # ECMC RAG Pipeline Environment Variables
 # Copy this to .env and fill in your actual values.
 
