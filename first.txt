@@ -1,3 +1,128 @@
+###########
+"""Textract processor using ONLY async APIs.
+
+Last week's working approach:
+  1. start_document_analysis (async) - for layout + tables + forms
+  2. Poll until SUCCEEDED
+  3. Paginate all blocks
+  4. Upload to S3
+
+NEVER uses sync APIs (analyze_document / detect_document_text).
+Async API handles more PDF formats including OneNote exports.
+"""
+
+import time
+from typing import Any, Dict, List, Optional
+
+from botocore.exceptions import ClientError
+
+from config.settings import load_settings
+from utils.aws_clients import get_textract_client
+from utils.s3_utils import upload_json, check_exists
+from utils.logging_config import get_logger
+from utils.decorators import timing
+
+logger = get_logger("textract_processor")
+
+
+class TextractProcessor:
+    def __init__(self):
+        self.settings = load_settings()
+        self.textract = get_textract_client()
+        self.bucket = self.settings.S3_BUCKET
+        self.features = list(self.settings.textract.FEATURES)
+        self.poll_interval = self.settings.textract.POLLING_INTERVAL_SECONDS
+        self.max_polls = self.settings.textract.MAX_POLLING_ATTEMPTS
+
+    @timing()
+    def process_document(self, doc_id: str, s3_input_key: str) -> str:
+        """Process PDF via Textract async API."""
+        output_key = self.settings.s3_paths.textract_doc_path(doc_id) + "layout.json"
+
+        if check_exists(self.bucket, output_key):
+            logger.info("Textract output exists, skipping", extra={"doc_id": doc_id})
+            return output_key
+
+        logger.info(
+            "Starting Textract async analysis",
+            extra={"doc_id": doc_id, "source_key": s3_input_key},
+        )
+
+        # --- ALWAYS use async API ---
+        result = self._analyze_async(s3_input_key)
+        result["_doc_id"] = doc_id
+
+        upload_json(self.bucket, output_key, result)
+        logger.info(
+            "Textract complete",
+            extra={
+                "doc_id": doc_id,
+                "blocks": len(result.get("Blocks", [])),
+                "pages": result.get("DocumentMetadata", {}).get("Pages", 0),
+            },
+        )
+        return output_key
+
+    def _analyze_async(self, s3_input_key: str) -> Dict[str, Any]:
+        """Start async document analysis and poll for completion."""
+        start_resp = self.textract.start_document_analysis(
+            DocumentLocation={
+                "S3Object": {"Bucket": self.bucket, "Name": s3_input_key}
+            },
+            FeatureTypes=self.features,
+        )
+        job_id = start_resp["JobId"]
+        logger.info("Async job started", extra={"job_id": job_id})
+
+        # Poll
+        for attempt in range(1, self.max_polls + 1):
+            status_resp = self.textract.get_document_analysis(JobId=job_id)
+            status = status_resp["JobStatus"]
+
+            if status == "SUCCEEDED":
+                logger.info("Job succeeded", extra={"job_id": job_id, "attempts": attempt})
+                return self._paginate_async_results(job_id)
+
+            if status == "FAILED":
+                error_msg = status_resp.get("StatusMessage", "Unknown error")
+                logger.error("Job failed", extra={"job_id": job_id, "error": error_msg})
+                raise RuntimeError(f"Textract job {job_id} failed: {error_msg}")
+
+            logger.info(
+                "Polling...",
+                extra={"job_id": job_id, "attempt": attempt, "status": status},
+            )
+            time.sleep(self.poll_interval)
+
+        raise RuntimeError(f"Textract job {job_id} timed out after {self.max_polls} polls")
+
+    def _paginate_async_results(self, job_id: str) -> Dict[str, Any]:
+        """Paginate through all blocks."""
+        all_blocks: List[Dict[str, Any]] = []
+        next_token: Optional[str] = None
+
+        while True:
+            kwargs = {"JobId": job_id}
+            if next_token:
+                kwargs["NextToken"] = next_token
+
+            page = self.textract.get_document_analysis(**kwargs)
+            all_blocks.extend(page.get("Blocks", []))
+
+            next_token = page.get("NextToken")
+            if not next_token:
+                break
+
+        return {
+            "DocumentMetadata": page.get("DocumentMetadata", {}),
+            "Blocks": all_blocks,
+            "JobId": job_id,
+        }
+
+
+def process_document(doc_id: str, s3_input_key: str) -> str:
+    processor = TextractProcessor()
+    return processor.process_document(doc_id, s3_input_key)
 #
 def _process_via_images(self, doc_id: str, s3_key: str) -> Dict[str, Any]:
         """Download PDF, render each page to PNG, send each PNG to Textract via Bytes."""
