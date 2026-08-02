@@ -1,4 +1,163 @@
 """
+Extracts text, tables, and form fields from PDFs stored in S3 using AWS
+Textract, via the official amazon-textract-textractor library
+(https://github.com/aws-samples/amazon-textract-textractor). Reading order,
+table structure, and form key-value pairing are all handled by that library
+directly — this script only calls it and writes the results out.
+
+Writes, per document:
+    - {doc_id}.json  -> the raw, unmodified Textract response (document.response)
+    - {doc_id}.md    -> full document text plus tables and form fields
+    - {doc_id}.txt   -> full document text (document.text)
+
+Install:
+    pip install amazon-textract-textractor boto3 python-dotenv
+
+Usage:
+    python textract_sequential_pipeline.py
+    python textract_sequential_pipeline.py --doc-id website_nod
+"""
+
+import argparse
+import json
+import logging
+import sys
+
+import boto3
+from textractor import Textractor
+from textractor.data.constants import TextractFeatures
+
+from config import (
+    AWS_REGION,
+    S3_BUCKET,
+    SOURCE_PREFIX,
+    OUTPUT_JSON_PREFIX,
+    OUTPUT_MD_PREFIX,
+    OUTPUT_TEXT_PREFIX,
+    FEATURE_TYPES,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger(__name__)
+
+FEATURE_MAP = {
+    "LAYOUT": TextractFeatures.LAYOUT,
+    "TABLES": TextractFeatures.TABLES,
+    "FORMS": TextractFeatures.FORMS,
+    "SIGNATURES": TextractFeatures.SIGNATURES,
+}
+TEXTRACT_FEATURES = [FEATURE_MAP[f] for f in FEATURE_TYPES if f in FEATURE_MAP]
+
+
+def list_source_documents(s3_client, bucket, prefix):
+    keys = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].lower().endswith(".pdf"):
+                keys.append(obj["Key"])
+    return keys
+
+
+def doc_id_from_key(key):
+    filename = key.rsplit("/", 1)[-1]
+    if filename.lower().endswith(".pdf"):
+        filename = filename[:-4]
+    safe = "".join(c if c.isalnum() or c in ("-", "_") else "-" for c in filename)
+    return safe.strip("-") or "unnamed-doc"
+
+
+def put_json(s3_client, key, payload):
+    s3_client.put_object(Bucket=S3_BUCKET, Key=key,
+                          Body=json.dumps(payload, indent=2, default=str).encode("utf-8"),
+                          ContentType="application/json")
+
+
+def put_text(s3_client, key, text):
+    s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=text.encode("utf-8"), ContentType="text/plain")
+
+
+def build_markdown(doc_id, document):
+    sections = [f"# {doc_id}", "", document.text, ""]
+
+    if len(document.tables) > 0:
+        sections.append("## Tables")
+        sections.append(document.tables.to_markdown())
+        sections.append("")
+
+    if len(document.key_values) > 0:
+        sections.append("## Form fields")
+        sections.append(document.key_values.get_text())
+        sections.append("")
+
+    return "\n".join(sections)
+
+
+def process_document(s3_client, extractor, key):
+    doc_id = doc_id_from_key(key)
+    log.info("Processing %s (%s)", key, doc_id)
+
+    document = extractor.start_document_analysis(
+        file_source=f"s3://{S3_BUCKET}/{key}",
+        features=TEXTRACT_FEATURES,
+        save_image=False,
+    )
+
+    # start_document_analysis returns a LazyDocument. Accessing any property
+    # below triggers Textractor to poll the async Textract job and block
+    # until it completes — no manual polling loop needed.
+    log.info("Waiting on Textract job for %s...", doc_id)
+    raw_response = document.response
+    text = document.text
+    n_tables = len(document.tables)
+    n_key_values = len(document.key_values)
+    pages = raw_response.get("DocumentMetadata", {}).get("Pages", "?")
+    log.info("Textract done for %s: %s pages, %d tables, %d key-value pairs",
+             doc_id, pages, n_tables, n_key_values)
+
+    put_json(s3_client, f"{OUTPUT_JSON_PREFIX}/{doc_id}/{doc_id}.json", raw_response)
+    put_text(s3_client, f"{OUTPUT_MD_PREFIX}/{doc_id}/{doc_id}.md", build_markdown(doc_id, document))
+    put_text(s3_client, f"{OUTPUT_TEXT_PREFIX}/{doc_id}/{doc_id}.txt", text)
+
+    log.info("Saved json/md/txt for %s", doc_id)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--doc-id", help="Process only the source PDF matching this doc_id")
+    args = parser.parse_args()
+
+    session = boto3.Session(region_name=AWS_REGION)
+    s3_client = session.client("s3")
+    extractor = Textractor(region_name=AWS_REGION)
+
+    keys = list_source_documents(s3_client, S3_BUCKET, SOURCE_PREFIX)
+    if args.doc_id:
+        keys = [k for k in keys if doc_id_from_key(k) == args.doc_id]
+
+    if not keys:
+        log.error("No matching documents found under s3://%s/%s", S3_BUCKET, SOURCE_PREFIX)
+        sys.exit(1)
+
+    log.info("Found %d document(s) to process", len(keys))
+
+    failed = []
+    for key in keys:
+        try:
+            process_document(s3_client, extractor, key)
+        except Exception as e:
+            log.error("Failed on %s: %s", key, e)
+            failed.append(key)
+
+    log.info("Done: %d succeeded, %d failed", len(keys) - len(failed), len(failed))
+    if failed:
+        log.info("Failed documents: %s", failed)
+
+
+if __name__ == "__main__":
+    main()
+##########
+"""
 Config for the ECMC RAG Textract pipeline.
 Loads AWS_REGION / S3_BUCKET from .env, and defines the S3 prefixes and
 Textract feature-type settings used by textract_sequential_pipeline.py
