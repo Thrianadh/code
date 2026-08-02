@@ -1,3 +1,1107 @@
+"""
+Stage 2 — Structure-aware, multimodal parent-child chunking pipeline
+ECMC RAG Pipeline
+
+Consumes the raw Textract block output produced by Stage 1
+(textract_ingestion_pipeline.py) and produces the six artifacts described in
+the design doc (Parent_Child_Multimodal_Approach.md, section 11-13):
+
+    json/{doc_id}/reading_order.json
+    json/{doc_id}/parent_chunks.json
+    json/{doc_id}/child_chunks.json
+    json/{doc_id}/chunk_metadata.json
+    markdown/{doc_id}/full_document.md
+    text/{doc_id}/clean_text.txt
+
+What this implements, per the design doc:
+  - Column-aware reading order from LAYOUT_* blocks (section 4, 11.1)
+  - Section (parent) grouping on LAYOUT_SECTION_HEADER, one-section-per-page
+    fallback when no headers are detected (section 4, 8)
+  - Paragraph, table, form, figure, and signature elements (section 6)
+  - Multi-page table detection + stitching + row-group chunking (section 12)
+  - Figure render + crop + context-aware Nova captioning (section 10)
+  - Two text representations for tables: Markdown (parent/audit) and
+    linearized text (BM25) are kept separate from the Nova summary used for
+    the embedded child (section 11.2, 13)
+  - Signatures stored as metadata, never chunked/embedded (section 6)
+
+What this deliberately does NOT do yet (out of scope for Stage 2):
+  - Embedding (Titan) and index building (FAISS/BM25) — Stage 3/4
+  - Query-time retrieval and generation — Stage 5
+  - referenced_by / footnote_ref relationship detection — deferred per
+    section 9.3 item 4 until confirmed necessary on real client documents
+
+Requirements
+------------
+    pip install boto3 pymupdf
+
+IAM / model access needed
+--------------------------
+    s3:GetObject, s3:PutObject, s3:ListBucket on the ECMC_RAG prefixes
+    bedrock:InvokeModel / Converse on the Nova Lite model
+    (Bedrock model access for the Nova model must be enabled in the account)
+
+Usage
+-----
+    export AWS_REGION=us-east-1
+    python textract_chunking_pipeline.py                 # process every doc_id with a Stage 1 layout.json
+    python textract_chunking_pipeline.py --doc-id website_nod   # process one document
+    python textract_chunking_pipeline.py --no-nova        # skip Bedrock calls (structural dry run)
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import logging
+import re
+import sys
+from dataclasses import dataclass, field, asdict
+from typing import Any, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+try:
+    import fitz  # PyMuPDF — used only to rasterize PDF pages for figure cropping
+except ImportError:
+    fitz = None
+
+
+# ==========================================================================
+# Config
+# ==========================================================================
+
+AWS_REGION = "us-east-1"
+S3_BUCKET = "bankrupcy-data-bkt"
+SOURCE_PREFIX = "ecmc_org/ECMC_RAG/source_files"
+TEXTRACT_OUTPUT_PREFIX = "ecmc_org/ECMC_RAG/textract_output"          # Stage 1 raw blocks live here: {prefix}/{doc_id}/layout.json
+PROCESSED_JSON_PREFIX = "ecmc_org/ECMC_RAG/ECMC_RAG/textract_output/json"
+PROCESSED_MD_PREFIX = "ecmc_org/ECMC_RAG/ECMC_RAG/textract_output/markdown"
+PROCESSED_TEXT_PREFIX = "ecmc_org/ECMC_RAG/ECMC_RAG/textract_output/text"
+
+NOVA_MODEL_ID = "us.amazon.nova-2-lite-v1:0"   # matches PROJECT_CONTEXT.md .env
+
+# --- Chunking tuning knobs -------------------------------------------------
+PARAGRAPH_CHILD_MAX_TOKENS = 300
+# Rough token estimate: no tokenizer dependency, ~1.3 tokens per whitespace word.
+TOKENS_PER_WORD = 1.3
+
+TABLE_ROW_GROUP_SIZE = 25          # rows per child for stitched/large tables (section 12.3)
+SINGLE_CHILD_ROW_THRESHOLD = 25    # tables with <= this many rows stay a single child
+
+# --- Multi-page table continuation heuristics (section 12.1) --------------
+BOTTOM_MARGIN_THRESHOLD = 0.85     # table's last row must end below this normalized page Y to be a continuation candidate
+TOP_MARGIN_THRESHOLD = 0.15        # next table must start above this normalized page Y
+HEADER_SIMILARITY_THRESHOLD = 0.6  # Jaccard similarity of header-row tokens to treat a row as a repeated header
+
+# --- Figure rendering -------------------------------------------------------
+RENDER_DPI = 170
+CROP_PAD_PCT = 0.03                # pad each bbox by this fraction of page dimensions before cropping
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("chunking_pipeline")
+
+
+# ==========================================================================
+# Data models
+# ==========================================================================
+
+@dataclass
+class Element:
+    element_id: str
+    element_type: str          # paragraph | table | form | figure | signature
+    doc_id: str
+    section_id: str
+    page_number: Optional[int] = None
+    page_range: Optional[dict] = None   # {"start": int, "end": int} for multi-page tables
+    bbox: Optional[dict] = None
+    reading_order_index: int = 0
+    prev_sibling_id: Optional[str] = None
+    next_sibling_id: Optional[str] = None
+    source_block_ids: list = field(default_factory=list)
+
+    # content, populated per type
+    text: Optional[str] = None                 # paragraph
+    markdown_table: Optional[str] = None        # table
+    linearized_table_text: Optional[str] = None # table (for BM25)
+    table_rows: Optional[list] = None           # table, raw grid: list[list[str]], row 0 = header
+    row_page_map: Optional[list] = None         # table, per-row source page number
+    key_values: Optional[list] = None           # form: list of {"key": str, "value": str}
+    has_signature: bool = False                 # attached to whichever section/form it sits near
+    figure_caption: Optional[str] = None        # figure, filled in after Nova call
+
+
+@dataclass
+class Section:
+    section_id: str
+    doc_id: str
+    page_start: int
+    page_end: int
+    element_ids: list = field(default_factory=list)
+
+
+@dataclass
+class ChildChunk:
+    child_id: str
+    parent_id: str          # section_id
+    element_id: str
+    element_type: str
+    text: str                # the embeddable text (per-type meaning, see design doc section 6/11/12)
+    doc_id: str
+    page_number: Optional[int]
+    reading_order_index: int
+    prev_sibling_id: Optional[str] = None
+    next_sibling_id: Optional[str] = None
+    row_range: Optional[dict] = None   # for table row-group children: {"start_row": int, "end_row": int}
+
+
+# ==========================================================================
+# Textract block helpers
+# ==========================================================================
+
+def index_blocks(blocks: list[dict]) -> dict[str, dict]:
+    return {b["Id"]: b for b in blocks}
+
+
+def get_child_ids(block: dict, rel_type: str = "CHILD") -> list[str]:
+    ids = []
+    for rel in block.get("Relationships", []) or []:
+        if rel.get("Type") == rel_type:
+            ids.extend(rel.get("Ids", []))
+    return ids
+
+
+def block_text(block: dict, block_index: dict[str, dict]) -> str:
+    """Concatenate WORD text for a block that has direct CHILD word relationships (e.g. LINE, CELL)."""
+    words = []
+    for child_id in get_child_ids(block):
+        child = block_index.get(child_id)
+        if not child:
+            continue
+        if child["BlockType"] == "WORD":
+            words.append(child.get("Text", ""))
+        elif child["BlockType"] == "SELECTION_ELEMENT":
+            words.append("[X]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(words)
+
+
+def layout_block_text(layout_block: dict, block_index: dict[str, dict]) -> str:
+    """LAYOUT_* blocks' CHILD relationship points to LINE blocks; concatenate those."""
+    lines = []
+    for child_id in get_child_ids(layout_block):
+        child = block_index.get(child_id)
+        if child and child["BlockType"] == "LINE":
+            lines.append(child.get("Text", ""))
+    return "\n".join(lines)
+
+
+# ==========================================================================
+# Step 1 — load Stage 1 raw output
+# ==========================================================================
+
+def load_textract_output(s3_client, bucket: str, doc_id: str) -> tuple[list[dict], dict]:
+    key = f"{TEXTRACT_OUTPUT_PREFIX}/{doc_id}/layout.json"
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    payload = json.loads(obj["Body"].read())
+    return payload["blocks"], payload.get("document_metadata", {})
+
+
+def list_available_doc_ids(s3_client, bucket: str, prefix: str) -> list[str]:
+    doc_ids = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix + "/", Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            # {prefix}/{doc_id}/
+            doc_id = cp["Prefix"][len(prefix) + 1:].rstrip("/")
+            if doc_id:
+                doc_ids.append(doc_id)
+    return doc_ids
+
+
+# ==========================================================================
+# Step 2 — reading order (column-aware)
+# ==========================================================================
+
+LAYOUT_TEXT_TYPES = {"LAYOUT_TEXT", "LAYOUT_TITLE", "LAYOUT_HEADER", "LAYOUT_LIST", "LAYOUT_FOOTER"}
+LAYOUT_ORDERABLE_TYPES = LAYOUT_TEXT_TYPES | {"LAYOUT_SECTION_HEADER", "LAYOUT_TABLE", "LAYOUT_FIGURE", "LAYOUT_KEY_VALUE"}
+
+
+def order_page_blocks(page_blocks: list[dict]) -> list[dict]:
+    """
+    Heuristic column-aware ordering for one page (design doc section 4).
+
+    Two-column detection: if the blocks' left edges cluster clearly into a
+    left half and a right half of the page, treat it as two columns and
+    read all of column 1 top-to-bottom before column 2. Otherwise, a
+    single top-to-bottom sort (with left as a tiebreaker) is used.
+
+    This is a heuristic approximation, not a general N-column layout
+    solver — flagged in the design doc as something to refine once real
+    multi-column client documents are seen (section 9.2).
+    """
+    if not page_blocks:
+        return []
+
+    lefts = [b["Geometry"]["BoundingBox"]["Left"] for b in page_blocks]
+    left_cluster = [l for l in lefts if l < 0.5]
+    right_cluster = [l for l in lefts if l >= 0.5]
+
+    is_two_column = (
+        len(page_blocks) >= 4
+        and len(left_cluster) >= 2
+        and len(right_cluster) >= 2
+    )
+
+    def top(b):
+        return b["Geometry"]["BoundingBox"]["Top"]
+
+    def left(b):
+        return b["Geometry"]["BoundingBox"]["Left"]
+
+    if is_two_column:
+        col1 = sorted([b for b in page_blocks if left(b) < 0.5], key=top)
+        col2 = sorted([b for b in page_blocks if left(b) >= 0.5], key=top)
+        return col1 + col2
+
+    return sorted(page_blocks, key=lambda b: (round(top(b), 2), left(b)))
+
+
+def build_reading_order(blocks: list[dict], block_index: dict[str, dict]) -> list[dict]:
+    """
+    Returns a flat, ordered list of layout-block descriptors:
+    {block_id, block_type, page, bbox, reading_order_index}
+    This is the reading_order.json content (section 11.1).
+    """
+    layout_blocks = [b for b in blocks if b["BlockType"] in LAYOUT_ORDERABLE_TYPES]
+
+    by_page: dict[int, list[dict]] = {}
+    for b in layout_blocks:
+        page = b.get("Page", 1)
+        by_page.setdefault(page, []).append(b)
+
+    ordered: list[dict] = []
+    idx = 0
+    for page in sorted(by_page.keys()):
+        for b in order_page_blocks(by_page[page]):
+            ordered.append({
+                "block_id": b["Id"],
+                "block_type": b["BlockType"],
+                "page": page,
+                "bbox": b["Geometry"]["BoundingBox"],
+                "reading_order_index": idx,
+            })
+            idx += 1
+    return ordered
+
+
+# ==========================================================================
+# Step 3 — section (parent) grouping
+# ==========================================================================
+
+def group_into_sections(reading_order: list[dict], doc_id: str) -> list[list[dict]]:
+    """
+    Groups the ordered block list into sections on LAYOUT_SECTION_HEADER.
+    Falls back to one section per page if the document has no section
+    headers at all (design doc section 4, 8).
+    """
+    has_any_header = any(item["block_type"] == "LAYOUT_SECTION_HEADER" for item in reading_order)
+
+    groups: list[list[dict]] = []
+    if has_any_header:
+        current: list[dict] = []
+        for item in reading_order:
+            if item["block_type"] == "LAYOUT_SECTION_HEADER" and current:
+                groups.append(current)
+                current = []
+            current.append(item)
+        if current:
+            groups.append(current)
+    else:
+        current_page = None
+        current: list[dict] = []
+        for item in reading_order:
+            if current_page is None:
+                current_page = item["page"]
+            if item["page"] != current_page:
+                groups.append(current)
+                current = []
+                current_page = item["page"]
+            current.append(item)
+        if current:
+            groups.append(current)
+
+    return groups
+
+
+# ==========================================================================
+# Step 4 — element construction
+# ==========================================================================
+
+def build_elements_for_section(
+    section_items: list[dict],
+    section_id: str,
+    doc_id: str,
+    block_index: dict[str, dict],
+) -> list[Element]:
+    """
+    Walks one section's ordered block list and produces typed Elements:
+    contiguous LAYOUT_TEXT-family blocks merge into paragraph elements;
+    LAYOUT_TABLE resolves to its TABLE block; LAYOUT_FIGURE becomes a
+    figure element awaiting a caption; forms are handled separately
+    (build_form_elements) since KEY_VALUE_SET blocks aren't part of the
+    LAYOUT relationship tree.
+    """
+    elements: list[Element] = []
+    text_buffer: list[str] = []
+    text_buffer_ids: list[str] = []
+    text_buffer_bbox_start = None
+
+    def flush_paragraph():
+        nonlocal text_buffer, text_buffer_ids, text_buffer_bbox_start
+        if text_buffer:
+            elements.append(Element(
+                element_id=f"{section_id}-el-{len(elements):04d}",
+                element_type="paragraph",
+                doc_id=doc_id,
+                section_id=section_id,
+                page_number=text_buffer_bbox_start["page"] if text_buffer_bbox_start else None,
+                bbox=text_buffer_bbox_start["bbox"] if text_buffer_bbox_start else None,
+                reading_order_index=text_buffer_bbox_start["reading_order_index"] if text_buffer_bbox_start else 0,
+                source_block_ids=list(text_buffer_ids),
+                text="\n".join(text_buffer),
+            ))
+        text_buffer = []
+        text_buffer_ids = []
+        text_buffer_bbox_start = None
+
+    for item in section_items:
+        block = block_index[item["block_id"]]
+        btype = item["block_type"]
+
+        if btype in LAYOUT_TEXT_TYPES or btype == "LAYOUT_SECTION_HEADER":
+            if text_buffer_bbox_start is None:
+                text_buffer_bbox_start = item
+            txt = layout_block_text(block, block_index)
+            if txt.strip():
+                text_buffer.append(txt)
+                text_buffer_ids.append(block["Id"])
+            continue
+
+        # non-paragraph block encountered — flush any accumulated paragraph text first
+        flush_paragraph()
+
+        if btype == "LAYOUT_TABLE":
+            table_block_ids = get_child_ids(block)
+            table_block = None
+            for cid in table_block_ids:
+                cand = block_index.get(cid)
+                if cand and cand["BlockType"] == "TABLE":
+                    table_block = cand
+                    break
+            if table_block is None:
+                continue
+            elements.append(build_table_element(table_block, block_index, section_id, doc_id, item))
+
+        elif btype == "LAYOUT_FIGURE":
+            elements.append(Element(
+                element_id=f"{section_id}-el-{len(elements):04d}",
+                element_type="figure",
+                doc_id=doc_id,
+                section_id=section_id,
+                page_number=item["page"],
+                bbox=item["bbox"],
+                reading_order_index=item["reading_order_index"],
+                source_block_ids=[block["Id"]],
+            ))
+
+    flush_paragraph()
+
+    # wire up sibling pointers within this section
+    for i, el in enumerate(elements):
+        el.prev_sibling_id = elements[i - 1].element_id if i > 0 else None
+        el.next_sibling_id = elements[i + 1].element_id if i < len(elements) - 1 else None
+
+    return elements
+
+
+def build_table_element(table_block: dict, block_index: dict[str, dict], section_id: str,
+                         doc_id: str, reading_item: dict) -> Element:
+    """Builds the row/column grid from CELL/MERGED_CELL blocks, plus Markdown + linearized text."""
+    cell_ids = get_child_ids(table_block)
+    cells = [block_index[cid] for cid in cell_ids if block_index.get(cid, {}).get("BlockType") in ("CELL", "MERGED_CELL")]
+
+    if not cells:
+        rows = [[""]]
+    else:
+        max_row = max(c["RowIndex"] + c.get("RowSpan", 1) - 1 for c in cells)
+        max_col = max(c["ColumnIndex"] + c.get("ColumnSpan", 1) - 1 for c in cells)
+        grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+        for c in cells:
+            text = block_text(c, block_index)
+            r0 = c["RowIndex"] - 1
+            c0 = c["ColumnIndex"] - 1
+            if 0 <= r0 < max_row and 0 <= c0 < max_col:
+                grid[r0][c0] = text
+        rows = grid
+
+    markdown_table = rows_to_markdown(rows)
+    linearized = rows_to_linearized_text(rows)
+
+    return Element(
+        element_id=f"{section_id}-el-tbl-{table_block['Id'][:8]}",
+        element_type="table",
+        doc_id=doc_id,
+        section_id=section_id,
+        page_number=reading_item["page"],
+        bbox=reading_item["bbox"],
+        reading_order_index=reading_item["reading_order_index"],
+        source_block_ids=[table_block["Id"]],
+        table_rows=rows,
+        row_page_map=[reading_item["page"]] * len(rows),
+        markdown_table=markdown_table,
+        linearized_table_text=linearized,
+    )
+
+
+def rows_to_markdown(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    header, *body = rows
+    lines = ["| " + " | ".join(header) + " |",
+             "| " + " | ".join(["---"] * len(header)) + " |"]
+    for r in body:
+        lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines)
+
+
+def rows_to_linearized_text(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    header, *body = rows
+    lines = []
+    for r in body:
+        pairs = [f"{h}: {v}" for h, v in zip(header, r) if v]
+        lines.append(" | ".join(pairs))
+    return "\n".join(lines)
+
+
+def build_form_elements(blocks: list[dict], block_index: dict[str, dict], doc_id: str,
+                         sections: list[Section], section_page_ranges: dict[str, tuple[int, int]]) -> dict[str, Element]:
+    """
+    Groups all KEY_VALUE_SET pairs into one form element per section
+    (design doc section 6: "a cluster of adjacent key-value pairs").
+    Returns {section_id: form_element}.
+    """
+    kv_pairs = []
+    for b in blocks:
+        if b["BlockType"] == "KEY_VALUE_SET" and "KEY" in b.get("EntityTypes", []):
+            key_text = block_text(b, block_index)
+            value_block = None
+            for rel in b.get("Relationships", []) or []:
+                if rel.get("Type") == "VALUE":
+                    for vid in rel.get("Ids", []):
+                        vb = block_index.get(vid)
+                        if vb:
+                            value_block = vb
+                            break
+            value_text = block_text(value_block, block_index) if value_block else ""
+            page = b.get("Page", 1)
+            kv_pairs.append({"key": key_text.strip(), "value": value_text.strip(), "page": page})
+
+    if not kv_pairs:
+        return {}
+
+    forms_by_section: dict[str, Element] = {}
+    for pair in kv_pairs:
+        section_id = section_id_for_page(pair["page"], section_page_ranges)
+        if section_id is None:
+            continue
+        if section_id not in forms_by_section:
+            forms_by_section[section_id] = Element(
+                element_id=f"{section_id}-el-form",
+                element_type="form",
+                doc_id=doc_id,
+                section_id=section_id,
+                page_number=pair["page"],
+                reading_order_index=-1,  # positioned at end of section elements by convention; see note below
+                key_values=[],
+            )
+        forms_by_section[section_id].key_values.append({"key": pair["key"], "value": pair["value"]})
+
+    return forms_by_section
+
+
+def section_id_for_page(page: int, section_page_ranges: dict[str, tuple[int, int]]) -> Optional[str]:
+    for section_id, (start, end) in section_page_ranges.items():
+        if start <= page <= end:
+            return section_id
+    return None
+
+
+def build_signature_flags(blocks: list[dict], section_page_ranges: dict[str, tuple[int, int]]) -> dict[str, bool]:
+    """Returns {section_id: True} for sections containing at least one SIGNATURE block."""
+    flags: dict[str, bool] = {}
+    for b in blocks:
+        if b["BlockType"] == "SIGNATURE":
+            page = b.get("Page", 1)
+            section_id = section_id_for_page(page, section_page_ranges)
+            if section_id:
+                flags[section_id] = True
+    return flags
+
+
+# ==========================================================================
+# Step 5 — multi-page table stitching (design doc section 12)
+# ==========================================================================
+
+def jaccard_similarity(a: list[str], b: list[str]) -> float:
+    sa, sb = set(x.lower().strip() for x in a if x), set(x.lower().strip() for x in b if x)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def is_continuation(prev_table: Element, next_table: Element) -> bool:
+    """Section 12.1: column count + header repetition + page-boundary proximity, all three."""
+    if not prev_table.table_rows or not next_table.table_rows:
+        return False
+
+    prev_cols = len(prev_table.table_rows[0]) if prev_table.table_rows else 0
+    next_cols = len(next_table.table_rows[0]) if next_table.table_rows else 0
+    if prev_cols == 0 or prev_cols != next_cols:
+        return False
+
+    prev_bottom = prev_table.bbox["Top"] + prev_table.bbox["Height"]
+    next_top = next_table.bbox["Top"]
+    if prev_bottom < BOTTOM_MARGIN_THRESHOLD or next_top > TOP_MARGIN_THRESHOLD:
+        return False
+
+    header_similarity = jaccard_similarity(prev_table.table_rows[0], next_table.table_rows[0])
+    return header_similarity >= HEADER_SIMILARITY_THRESHOLD
+
+
+def stitch_tables(table_elements: list[Element]) -> list[Element]:
+    """
+    Merges runs of continuation tables into single logical table elements
+    with a page_range, continuous rows, and repeated headers dropped.
+    Input should be table elements already in reading order.
+    """
+    if not table_elements:
+        return []
+
+    stitched: list[Element] = [table_elements[0]]
+    for tbl in table_elements[1:]:
+        prev = stitched[-1]
+        if is_continuation(prev, tbl):
+            # drop tbl's repeated header row, append the rest
+            continuation_rows = tbl.table_rows[1:] if len(tbl.table_rows) > 1 else []
+            prev.table_rows.extend(continuation_rows)
+            prev.row_page_map.extend([tbl.page_number] * len(continuation_rows))
+            start_page = prev.page_range["start"] if prev.page_range else prev.page_number
+            prev.page_range = {"start": start_page, "end": tbl.page_number}
+            prev.markdown_table = rows_to_markdown(prev.table_rows)
+            prev.linearized_table_text = rows_to_linearized_text(prev.table_rows)
+            prev.source_block_ids.extend(tbl.source_block_ids)
+        else:
+            stitched.append(tbl)
+
+    return stitched
+
+
+# ==========================================================================
+# Step 6 — figure rendering, cropping, and Nova captioning
+# ==========================================================================
+
+def render_pdf_pages(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> dict[int, "fitz.Pixmap"]:
+    """Renders every page of a PDF to a raster image. Works uniformly for
+    scanned and native PDFs (design doc section 10.2)."""
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required for figure rendering — pip install pymupdf")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+    pages = {}
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        pix = page.get_pixmap(matrix=matrix)
+        pages[page_index + 1] = pix  # Textract pages are 1-indexed
+    return pages
+
+
+def crop_bbox_from_page(pixmap, bbox: dict, pad_pct: float = CROP_PAD_PCT) -> bytes:
+    """
+    bbox is Textract's normalized {Left, Top, Width, Height} (0..1) — see design
+    doc section 10.3: this coordinate math is the whole reason a fixed, known
+    render DPI matters, since it's what makes bbox-fraction * pixel-dimensions
+    line up without any separate calibration step.
+    Returns PNG bytes of the padded crop.
+    """
+    from PIL import Image
+
+    img_w, img_h = pixmap.width, pixmap.height
+
+    left = max(0.0, bbox["Left"] - pad_pct)
+    top = max(0.0, bbox["Top"] - pad_pct)
+    right = min(1.0, bbox["Left"] + bbox["Width"] + pad_pct)
+    bottom = min(1.0, bbox["Top"] + bbox["Height"] + pad_pct)
+
+    px_left, px_top = int(left * img_w), int(top * img_h)
+    px_right, px_bottom = int(right * img_w), int(bottom * img_h)
+
+    mode = "RGB" if pixmap.n < 4 else "RGBA"
+    img = Image.frombytes(mode, (img_w, img_h), pixmap.samples)
+    cropped_img = img.crop((px_left, px_top, px_right, px_bottom))
+
+    buf = io.BytesIO()
+    cropped_img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def caption_figure_with_nova(bedrock_client, image_bytes: bytes, context_text: str) -> str:
+    """
+    Section 10.4: caption AFTER structure is known, passing surrounding
+    sibling text as context so the description is grounded, not generic.
+    """
+    prompt = (
+        "You are describing a figure/image/screenshot extracted from a legal/financial "
+        "bankruptcy document for use in a retrieval system. Write a concise (1-3 sentence), "
+        "factual description of what this image shows. If it is a screenshot of a system or "
+        "portal, describe what the screen shows. If it is a chart or diagram, describe what "
+        "it depicts and any key figures visible.\n\n"
+        f"Context — the text immediately surrounding this figure in the source document:\n"
+        f"{context_text or '(no surrounding text available)'}\n\n"
+        "Description:"
+    )
+
+    response = bedrock_client.converse(
+        modelId=NOVA_MODEL_ID,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"image": {"format": "png", "source": {"bytes": image_bytes}}},
+                {"text": prompt},
+            ],
+        }],
+        inferenceConfig={"maxTokens": 300, "temperature": 0.2},
+    )
+    return response["output"]["message"]["content"][0]["text"].strip()
+
+
+def summarize_table_with_nova(bedrock_client, table_markdown: str, context_text: str) -> str:
+    prompt = (
+        "Summarize what the following table contains in 1-2 sentences, for use as a search "
+        "index entry. Mention what kind of data it holds (e.g. what the columns represent), "
+        "not the individual values.\n\n"
+        f"Surrounding context:\n{context_text or '(none)'}\n\n"
+        f"Table:\n{table_markdown}\n\nSummary:"
+    )
+    response = bedrock_client.converse(
+        modelId=NOVA_MODEL_ID,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 200, "temperature": 0.2},
+    )
+    return response["output"]["message"]["content"][0]["text"].strip()
+
+
+# ==========================================================================
+# Step 7 — child chunking
+# ==========================================================================
+
+def estimate_tokens(text: str) -> int:
+    return int(len(text.split()) * TOKENS_PER_WORD)
+
+
+def chunk_paragraph(el: Element, doc_id: str) -> list[ChildChunk]:
+    words = (el.text or "").split()
+    if not words:
+        return []
+
+    max_words = int(PARAGRAPH_CHILD_MAX_TOKENS / TOKENS_PER_WORD)
+    chunks = []
+    for i in range(0, len(words), max_words):
+        slice_text = " ".join(words[i:i + max_words])
+        chunks.append(ChildChunk(
+            child_id=f"{el.element_id}-c{i // max_words:03d}",
+            parent_id=el.section_id,
+            element_id=el.element_id,
+            element_type="paragraph",
+            text=slice_text,
+            doc_id=doc_id,
+            page_number=el.page_number,
+            reading_order_index=el.reading_order_index,
+            prev_sibling_id=el.prev_sibling_id,
+            next_sibling_id=el.next_sibling_id,
+        ))
+    return chunks
+
+
+def chunk_table(el: Element, doc_id: str, bedrock_client, use_nova: bool,
+                context_text: str) -> list[ChildChunk]:
+    rows = el.table_rows or []
+    if not rows:
+        return []
+    header, body = rows[0], rows[1:]
+    n_rows = len(body)
+
+    if n_rows <= SINGLE_CHILD_ROW_THRESHOLD:
+        summary = (
+            summarize_table_with_nova(bedrock_client, el.markdown_table, context_text)
+            if use_nova else f"Table with columns: {', '.join(header)} ({n_rows} rows)."
+        )
+        return [ChildChunk(
+            child_id=f"{el.element_id}-c000",
+            parent_id=el.section_id,
+            element_id=el.element_id,
+            element_type="table",
+            text=summary,
+            doc_id=doc_id,
+            page_number=el.page_number,
+            reading_order_index=el.reading_order_index,
+            prev_sibling_id=el.prev_sibling_id,
+            next_sibling_id=el.next_sibling_id,
+            row_range={"start_row": 0, "end_row": n_rows},
+        )]
+
+    # Section 12.3 — large/multi-page table: row-group children, chained siblings,
+    # literal row text (not just a summary) so BM25 can match exact values.
+    chunks: list[ChildChunk] = []
+    group_ids: list[str] = []
+    for start in range(0, n_rows, TABLE_ROW_GROUP_SIZE):
+        group_rows = body[start:start + TABLE_ROW_GROUP_SIZE]
+        group_markdown = rows_to_markdown([header] + group_rows)
+        group_linear = rows_to_linearized_text([header] + group_rows)
+        group_id = f"{el.element_id}-c{start // TABLE_ROW_GROUP_SIZE:03d}"
+        group_ids.append(group_id)
+
+        if use_nova:
+            short_desc = summarize_table_with_nova(bedrock_client, group_markdown, context_text)
+            child_text = f"{short_desc}\n{group_linear}"
+        else:
+            child_text = group_linear
+
+        chunks.append(ChildChunk(
+            child_id=group_id,
+            parent_id=el.section_id,
+            element_id=el.element_id,
+            element_type="table",
+            text=child_text,
+            doc_id=doc_id,
+            page_number=el.row_page_map[start] if el.row_page_map and start < len(el.row_page_map) else el.page_number,
+            reading_order_index=el.reading_order_index,
+            row_range={"start_row": start, "end_row": start + len(group_rows)},
+        ))
+
+    for i, c in enumerate(chunks):
+        c.prev_sibling_id = group_ids[i - 1] if i > 0 else el.prev_sibling_id
+        c.next_sibling_id = group_ids[i + 1] if i < len(group_ids) - 1 else el.next_sibling_id
+
+    return chunks
+
+
+def chunk_form(el: Element, doc_id: str) -> list[ChildChunk]:
+    if not el.key_values:
+        return []
+    flattened = "\n".join(f"{kv['key']}: {kv['value']}" for kv in el.key_values)
+    return [ChildChunk(
+        child_id=f"{el.element_id}-c000",
+        parent_id=el.section_id,
+        element_id=el.element_id,
+        element_type="form",
+        text=flattened,
+        doc_id=doc_id,
+        page_number=el.page_number,
+        reading_order_index=el.reading_order_index,
+        prev_sibling_id=el.prev_sibling_id,
+        next_sibling_id=el.next_sibling_id,
+    )]
+
+
+def chunk_figure(el: Element, doc_id: str) -> list[ChildChunk]:
+    if not el.figure_caption:
+        return []
+    return [ChildChunk(
+        child_id=f"{el.element_id}-c000",
+        parent_id=el.section_id,
+        element_id=el.element_id,
+        element_type="figure",
+        text=el.figure_caption,
+        doc_id=doc_id,
+        page_number=el.page_number,
+        reading_order_index=el.reading_order_index,
+        prev_sibling_id=el.prev_sibling_id,
+        next_sibling_id=el.next_sibling_id,
+    )]
+
+
+# ==========================================================================
+# Step 8 — output artifact assembly
+# ==========================================================================
+
+def build_parent_chunks(sections: list[Section], elements_by_id: dict[str, Element]) -> list[dict]:
+    parents = []
+    for sec in sections:
+        el_payload = []
+        for eid in sec.element_ids:
+            el = elements_by_id[eid]
+            if el.element_type == "paragraph":
+                content = el.text
+            elif el.element_type == "table":
+                content = el.markdown_table
+            elif el.element_type == "form":
+                content = "\n".join(f"{kv['key']}: {kv['value']}" for kv in (el.key_values or []))
+            elif el.element_type == "figure":
+                content = el.figure_caption
+            else:
+                content = None
+            el_payload.append({
+                "element_id": el.element_id,
+                "element_type": el.element_type,
+                "page_number": el.page_number,
+                "page_range": el.page_range,
+                "reading_order_index": el.reading_order_index,
+                "content": content,
+                "has_signature": el.has_signature,
+            })
+        parents.append({
+            "section_id": sec.section_id,
+            "doc_id": sec.doc_id,
+            "page_start": sec.page_start,
+            "page_end": sec.page_end,
+            "elements": el_payload,
+        })
+    return parents
+
+
+def build_child_chunks_payload(children: list[ChildChunk]) -> list[dict]:
+    return [asdict(c) for c in children]
+
+
+def build_chunk_metadata(children: list[ChildChunk]) -> dict[str, dict]:
+    return {
+        c.child_id: {
+            "parent_id": c.parent_id,
+            "doc_id": c.doc_id,
+            "page_number": c.page_number,
+            "element_type": c.element_type,
+        }
+        for c in children
+    }
+
+
+def build_full_document_markdown(doc_id: str, sections: list[Section], elements_by_id: dict[str, Element]) -> str:
+    lines = [f"# {doc_id}\n"]
+    for sec in sections:
+        lines.append(f"## Section {sec.section_id} (pages {sec.page_start}-{sec.page_end})\n")
+        for eid in sec.element_ids:
+            el = elements_by_id[eid]
+            if el.element_type == "paragraph" and el.text:
+                lines.append(el.text + "\n")
+            elif el.element_type == "table" and el.markdown_table:
+                page_note = f"*(table, pages {el.page_range['start']}-{el.page_range['end']})*" if el.page_range else "*(table)*"
+                lines.append(page_note)
+                lines.append(el.markdown_table + "\n")
+            elif el.element_type == "form" and el.key_values:
+                lines.append("*(form fields)*")
+                for kv in el.key_values:
+                    lines.append(f"- **{kv['key']}**: {kv['value']}")
+                lines.append("")
+            elif el.element_type == "figure":
+                lines.append(f"*(figure)* {el.figure_caption or '[uncaptioned]'}\n")
+        # has_signature is metadata, surfaced in parent_chunks.json / chunk_metadata.json,
+        # not narrated inline in the human-readable markdown reconstruction.
+    return "\n".join(lines)
+
+
+def build_clean_text(sections: list[Section], elements_by_id: dict[str, Element]) -> str:
+    """BM25 source: literal content only — table linearized text, not Nova summaries (section 11.2, 13)."""
+    parts = []
+    for sec in sections:
+        for eid in sec.element_ids:
+            el = elements_by_id[eid]
+            if el.element_type == "paragraph" and el.text:
+                parts.append(el.text)
+            elif el.element_type == "table" and el.linearized_table_text:
+                parts.append(el.linearized_table_text)
+            elif el.element_type == "form" and el.key_values:
+                parts.append("\n".join(f"{kv['key']}: {kv['value']}" for kv in el.key_values))
+            elif el.element_type == "figure" and el.figure_caption:
+                parts.append(el.figure_caption)
+    return "\n\n".join(parts)
+
+
+# ==========================================================================
+# Orchestration
+# ==========================================================================
+
+def process_document(s3_client, bedrock_client, doc_id: str, use_nova: bool) -> None:
+    log.info("Processing %s", doc_id)
+
+    blocks, doc_meta = load_textract_output(s3_client, S3_BUCKET, doc_id)
+    block_index = index_blocks(blocks)
+
+    reading_order = build_reading_order(blocks, block_index)
+    section_groups = group_into_sections(reading_order, doc_id)
+
+    sections: list[Section] = []
+    elements_by_id: dict[str, Element] = {}
+    all_table_elements: list[Element] = []
+    section_page_ranges: dict[str, tuple[int, int]] = {}
+
+    for i, group in enumerate(section_groups):
+        section_id = f"{doc_id}-sec-{i:04d}"
+        page_start = min(item["page"] for item in group)
+        page_end = max(item["page"] for item in group)
+        section_page_ranges[section_id] = (page_start, page_end)
+
+        els = build_elements_for_section(group, section_id, doc_id, block_index)
+        section = Section(section_id=section_id, doc_id=doc_id, page_start=page_start, page_end=page_end,
+                           element_ids=[e.element_id for e in els])
+        sections.append(section)
+        for e in els:
+            elements_by_id[e.element_id] = e
+            if e.element_type == "table":
+                all_table_elements.append(e)
+
+    # multi-page table stitching (section 12) — run across the whole doc, in reading order
+    all_table_elements.sort(key=lambda e: e.reading_order_index)
+    stitched = stitch_tables(all_table_elements)
+    stitched_ids = {e.element_id for e in stitched}
+    for e in list(elements_by_id.values()):
+        if e.element_type == "table" and e.element_id not in stitched_ids:
+            del elements_by_id[e.element_id]
+    for e in stitched:
+        elements_by_id[e.element_id] = e
+    # drop absorbed table ids from their sections' element_id lists
+    for sec in sections:
+        sec.element_ids = [eid for eid in sec.element_ids if eid in elements_by_id]
+
+    # forms (section 6) — Textract's KEY_VALUE_SET isn't part of the LAYOUT tree, handled separately
+    form_elements = build_form_elements(blocks, block_index, doc_id, sections, section_page_ranges)
+    for section_id, form_el in form_elements.items():
+        elements_by_id[form_el.element_id] = form_el
+        for sec in sections:
+            if sec.section_id == section_id:
+                sec.element_ids.append(form_el.element_id)
+
+    # signatures (section 6) — metadata flag on the owning section/form, never chunked
+    sig_flags = build_signature_flags(blocks, section_page_ranges)
+    for sec in sections:
+        if sig_flags.get(sec.section_id):
+            for eid in sec.element_ids:
+                elements_by_id[eid].has_signature = True
+
+    # figures (section 10) — render source PDF, crop by bbox, caption with Nova using sibling context
+    figure_elements = [e for e in elements_by_id.values() if e.element_type == "figure"]
+    if figure_elements:
+        if fitz is None:
+            log.warning("  PyMuPDF not installed — skipping figure rendering/captioning for %s", doc_id)
+        else:
+            source_key = f"{SOURCE_PREFIX}/{doc_id}.pdf"
+            try:
+                pdf_bytes = s3_client.get_object(Bucket=S3_BUCKET, Key=source_key)["Body"].read()
+                page_pixmaps = render_pdf_pages(pdf_bytes)
+                for fig in figure_elements:
+                    pixmap = page_pixmaps.get(fig.page_number)
+                    if not pixmap:
+                        continue
+                    crop_bytes = crop_bbox_from_page(pixmap, fig.bbox)
+                    context_text = ""
+                    if fig.prev_sibling_id and elements_by_id.get(fig.prev_sibling_id):
+                        context_text += (elements_by_id[fig.prev_sibling_id].text or "") + "\n"
+                    if fig.next_sibling_id and elements_by_id.get(fig.next_sibling_id):
+                        context_text += (elements_by_id[fig.next_sibling_id].text or "")
+                    if use_nova:
+                        fig.figure_caption = caption_figure_with_nova(bedrock_client, crop_bytes, context_text)
+                    else:
+                        fig.figure_caption = "[Nova captioning skipped — dry run]"
+            except ClientError as e:
+                log.warning("  Could not load/render source PDF for %s: %s", doc_id, e)
+
+    # ---- child chunking (section 6, 11, 12) ----
+    children: list[ChildChunk] = []
+    for sec in sections:
+        for eid in sec.element_ids:
+            el = elements_by_id[eid]
+            context_text = ""
+            if el.prev_sibling_id and elements_by_id.get(el.prev_sibling_id):
+                context_text = elements_by_id[el.prev_sibling_id].text or ""
+
+            if el.element_type == "paragraph":
+                children.extend(chunk_paragraph(el, doc_id))
+            elif el.element_type == "table":
+                children.extend(chunk_table(el, doc_id, bedrock_client, use_nova, context_text))
+            elif el.element_type == "form":
+                children.extend(chunk_form(el, doc_id))
+            elif el.element_type == "figure":
+                children.extend(chunk_figure(el, doc_id))
+            # signature: intentionally produces no child chunk
+
+    # ---- assemble the six artifacts ----
+    reading_order_payload = reading_order
+    parent_chunks_payload = build_parent_chunks(sections, elements_by_id)
+    child_chunks_payload = build_child_chunks_payload(children)
+    chunk_metadata_payload = build_chunk_metadata(children)
+    full_document_md = build_full_document_markdown(doc_id, sections, elements_by_id)
+    clean_text = build_clean_text(sections, elements_by_id)
+
+    _put_json(s3_client, f"{PROCESSED_JSON_PREFIX}/{doc_id}/reading_order.json", reading_order_payload)
+    _put_json(s3_client, f"{PROCESSED_JSON_PREFIX}/{doc_id}/parent_chunks.json", parent_chunks_payload)
+    _put_json(s3_client, f"{PROCESSED_JSON_PREFIX}/{doc_id}/child_chunks.json", child_chunks_payload)
+    _put_json(s3_client, f"{PROCESSED_JSON_PREFIX}/{doc_id}/chunk_metadata.json", chunk_metadata_payload)
+    _put_text(s3_client, f"{PROCESSED_MD_PREFIX}/{doc_id}/full_document.md", full_document_md)
+    _put_text(s3_client, f"{PROCESSED_TEXT_PREFIX}/{doc_id}/clean_text.txt", clean_text)
+
+    log.info("  %s: %d sections, %d elements, %d child chunks", doc_id, len(sections),
+              len(elements_by_id), len(children))
+
+
+def _put_json(s3_client, key: str, payload) -> None:
+    s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(payload, indent=2).encode("utf-8"),
+                          ContentType="application/json")
+
+
+def _put_text(s3_client, key: str, text: str) -> None:
+    s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=text.encode("utf-8"), ContentType="text/plain")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Stage 2 — parent-child chunking pipeline")
+    parser.add_argument("--doc-id", help="Process a single doc_id instead of every available document")
+    parser.add_argument("--no-nova", action="store_true", help="Skip Bedrock Nova calls (structural dry run)")
+    args = parser.parse_args()
+
+    session = boto3.Session(region_name=AWS_REGION)
+    s3_client = session.client("s3")
+    bedrock_client = session.client("bedrock-runtime")
+
+    if args.doc_id:
+        doc_ids = [args.doc_id]
+    else:
+        doc_ids = list_available_doc_ids(s3_client, S3_BUCKET, TEXTRACT_OUTPUT_PREFIX)
+
+    if not doc_ids:
+        log.error("No Stage 1 output found under s3://%s/%s — run textract_ingestion_pipeline.py first.",
+                   S3_BUCKET, TEXTRACT_OUTPUT_PREFIX)
+        sys.exit(1)
+
+    log.info("Processing %d document(s): %s", len(doc_ids), doc_ids)
+    for doc_id in doc_ids:
+        try:
+            process_document(s3_client, bedrock_client, doc_id, use_nova=not args.no_nova)
+        except Exception as e:
+            log.exception("Failed to process %s: %s", doc_id, e)
+
+
+if __name__ == "__main__":
+    main()
+#######
 aws s3 rm s3://bankrupcy-data-bkt/ecmc_org/textract_output/ --recursive
 aws s3 rm s3://bankrupcy-data-bkt/ecmc_org/ECMC_RAG/textract_output/json/ --recursive
 aws s3 rm s3://bankrupcy-data-bkt/ecmc_org/ECMC_RAG/textract_output/markdown/ --recursive
