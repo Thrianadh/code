@@ -1,3 +1,143 @@
+############
+"""Parse Textract raw JSON into reading order and document metadata.
+
+Handles both:
+  - LAYOUT blocks (analyze_document with LAYOUT feature)
+  - LINE blocks (fallback when LAYOUT blocks are missing)
+
+Outputs:
+  - reading_order.json
+  - document_metadata.json
+"""
+
+from typing import Any, Dict, List, Tuple
+
+from config.settings import load_settings
+from utils.s3_utils import download_json, upload_json
+from utils.logging_config import get_logger
+
+logger = get_logger("layout_parser")
+
+
+class LayoutParser:
+    def __init__(self):
+        settings = load_settings()
+        self.bucket = settings.S3_BUCKET
+
+    def parse_document(self, doc_id: str) -> Tuple[str, str]:
+        """Parse Textract output into reading_order.json and document_metadata.json."""
+        textract_key = f"ecmc_org/textract_output/{doc_id}/layout.json"
+        raw_data = download_json(self.bucket, textract_key)
+
+        if not raw_data or "Blocks" not in raw_data:
+            raise ValueError(f"No Blocks in Textract data for {doc_id}")
+
+        blocks = raw_data["Blocks"]
+        doc_meta = raw_data.get("DocumentMetadata", {})
+
+        # Build lookup
+        blocks_by_id = {b["Id"]: b for b in blocks}
+
+        # Try LAYOUT blocks first
+        layout_blocks = [b for b in blocks if b.get("BlockType", "").startswith("LAYOUT_")]
+
+        # If no LAYOUT blocks, use LINE blocks as fallback
+        if not layout_blocks:
+            logger.warning(
+                "No LAYOUT blocks found, using LINE blocks",
+                extra={"doc_id": doc_id, "total_blocks": len(blocks)},
+            )
+            layout_blocks = self._lines_to_synthetic_layout(blocks)
+
+        # Sort by page → top → left
+        sorted_blocks = sorted(
+            layout_blocks,
+            key=lambda b: (b.get("Page", 1), b.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0), b.get("Geometry", {}).get("BoundingBox", {}).get("Left", 0)),
+        )
+
+        # Assign reading order
+        for i, block in enumerate(sorted_blocks, start=1):
+            block["reading_order"] = i
+
+        # Build simple output
+        reading_order = {
+            "doc_id": doc_id,
+            "total_pages": doc_meta.get("Pages", 0),
+            "total_blocks": len(sorted_blocks),
+            "blocks": [
+                {
+                    "block_id": b["Id"],
+                    "block_type": b.get("BlockType", "UNKNOWN"),
+                    "page_number": b.get("Page", 1),
+                    "text": self._get_text(b, blocks_by_id),
+                    "reading_order": b.get("reading_order", 0),
+                    "geometry": b.get("Geometry", {}).get("BoundingBox", {}),
+                }
+                for b in sorted_blocks
+            ],
+        }
+
+        metadata = {
+            "doc_id": doc_id,
+            "total_pages": doc_meta.get("Pages", 0),
+            "total_blocks": len(blocks),
+            "layout_blocks": len(layout_blocks),
+            "source_s3_key": textract_key,
+        }
+
+        reading_key = f"ecmc_org/ECMC_RAG/textract_output/json/{doc_id}/reading_order.json"
+        metadata_key = f"ecmc_org/ECMC_RAG/textract_output/json/{doc_id}/document_metadata.json"
+
+        upload_json(self.bucket, reading_key, reading_order)
+        upload_json(self.bucket, metadata_key, metadata)
+
+        logger.info(
+            "Layout parsed",
+            extra={
+                "doc_id": doc_id,
+                "blocks": len(sorted_blocks),
+                "pages": doc_meta.get("Pages", 0),
+            },
+        )
+
+        return reading_key, metadata_key
+
+    def _lines_to_synthetic_layout(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert LINE blocks to synthetic layout blocks when LAYOUT blocks are missing."""
+        line_blocks = [b for b in blocks if b.get("BlockType") == "LINE"]
+
+        # Mark as synthetic
+        for b in line_blocks:
+            b["_synthetic_layout"] = True
+            # Heuristic: short all-caps lines might be headers
+            text = b.get("Text", "")
+            if text and len(text) < 100 and text.isupper():
+                b["BlockType"] = "LAYOUT_SECTION_HEADER"
+            else:
+                b["BlockType"] = "LAYOUT_TEXT"
+
+        return line_blocks
+
+    def _get_text(self, block: Dict[str, Any], blocks_by_id: Dict[str, Dict[str, Any]]) -> str:
+        """Extract text from block."""
+        # Direct text
+        if "Text" in block:
+            return block["Text"]
+
+        # Child WORD blocks
+        parts = []
+        for rel in block.get("Relationships", []):
+            if rel.get("Type") == "CHILD":
+                for child_id in rel.get("Ids", []):
+                    child = blocks_by_id.get(child_id)
+                    if child and child.get("BlockType") == "WORD":
+                        parts.append(child.get("Text", ""))
+        return " ".join(parts).strip()
+
+
+def parse_layout(doc_id: str) -> Tuple[str, str]:
+    parser = LayoutParser()
+    return parser.parse_document(doc_id)
 #####################
 """Textract processor - async API only.
 
