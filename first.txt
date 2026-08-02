@@ -1,4 +1,222 @@
 """
+Step 7 -- hybrid retrieval over the chunks embedded in Step 6.
+
+Runs two independent searches over the same chunk set and returns both
+ranked lists, unfused:
+
+    - semantic search  -> FAISS over Titan embeddings (faiss.index)
+    - keyword search   -> BM25 (rank_bm25) over the same chunk text
+
+Fusing the two into a single ranked list is Step 8 (reranking, via
+Reciprocal Rank Fusion) -- kept as a separate step on purpose, so each
+method's own ranking is inspectable on its own before any fusion logic
+touches it.
+
+BM25 tokenization is plain lowercase + \\w+ splitting -- no stemming, no
+lemmatization, no ML -- consistent with keeping this pipeline free of
+heuristic/model-based judgement calls wherever a deterministic option
+exists.
+
+Loads the FAISS index + chunk_metadata.json once from S3 (both written by
+embedding_pipeline.py). Can be run standalone for testing, or imported as
+a module (HybridRetriever) by the reranking/generation stages that follow.
+
+Install:
+    pip install boto3 python-dotenv faiss-cpu numpy rank-bm25
+
+Usage:
+    python retrieval_pipeline.py --query "what is the deadline to respond to this notice?"
+"""
+
+import argparse
+import json
+import logging
+import re
+
+import boto3
+import numpy as np
+import faiss
+from rank_bm25 import BM25Okapi
+
+from config import (
+    AWS_REGION,
+    S3_BUCKET,
+    VECTOR_INDEX_PREFIX,
+    HYBRID_CANDIDATE_K,
+)
+from embedding_pipeline import embed_text  # reuse the exact call used to build the index
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger(__name__)
+
+TOKEN_PATTERN = re.compile(r"\w+")
+
+
+def tokenize(text):
+    """Plain lowercase word splitting -- deterministic, no stemming/ML."""
+    return TOKEN_PATTERN.findall(text.lower())
+
+
+def get_bytes(s3_client, bucket, key):
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    return obj["Body"].read()
+
+
+def get_json(s3_client, bucket, key):
+    return json.loads(get_bytes(s3_client, bucket, key).decode("utf-8"))
+
+
+class HybridRetriever:
+    """Loads the FAISS index + chunk metadata once, builds a matching BM25
+    index over the same chunks, and exposes independent semantic/keyword
+    search. Fusion happens one step later, not here."""
+
+    def __init__(self, s3_client):
+        self.s3_client = s3_client
+        self.metadata = get_json(s3_client, S3_BUCKET, f"{VECTOR_INDEX_PREFIX}/chunk_metadata.json")
+
+        index_bytes = get_bytes(s3_client, S3_BUCKET, f"{VECTOR_INDEX_PREFIX}/faiss.index")
+        self.index = faiss.deserialize_index(np.frombuffer(index_bytes, dtype="uint8"))
+
+        if self.index.ntotal != len(self.metadata):
+            raise ValueError(
+                f"faiss.index has {self.index.ntotal} vectors but "
+                f"chunk_metadata.json has {len(self.metadata)} entries -- "
+                "they must come from the same embedding_pipeline.py run."
+            )
+
+        tokenized_corpus = [tokenize(chunk["text"]) for chunk in self.metadata]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+
+        log.info("Loaded %d chunks into HybridRetriever", len(self.metadata))
+
+    def semantic_search(self, bedrock_client, query, top_k):
+        query_vector = np.array(embed_text(bedrock_client, query), dtype="float32").reshape(1, -1)
+        scores, indices = self.index.search(query_vector, top_k)
+
+        results = []
+        for rank, (idx, score) in enumerate(zip(indices[0], scores[0]), start=1):
+            if idx == -1:
+                continue
+            chunk = dict(self.metadata[idx])
+            chunk["semantic_rank"] = rank
+            chunk["semantic_score"] = float(score)
+            results.append(chunk)
+        return results
+
+    def keyword_search(self, query, top_k):
+        tokens = tokenize(query)
+        scores = self.bm25.get_scores(tokens)
+        ranked_indices = np.argsort(scores)[::-1][:top_k]
+
+        results = []
+        for rank, idx in enumerate(ranked_indices, start=1):
+            if scores[idx] <= 0:
+                continue
+            chunk = dict(self.metadata[idx])
+            chunk["bm25_rank"] = rank
+            chunk["bm25_score"] = float(scores[idx])
+            results.append(chunk)
+        return results
+
+    def search(self, bedrock_client, query, top_k=None):
+        top_k = top_k or HYBRID_CANDIDATE_K
+        return {
+            "semantic": self.semantic_search(bedrock_client, query, top_k),
+            "keyword": self.keyword_search(query, top_k),
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--query", required=True, help="Query text to retrieve chunks for")
+    parser.add_argument("--top-k", type=int, default=HYBRID_CANDIDATE_K)
+    args = parser.parse_args()
+
+    session = boto3.Session(region_name=AWS_REGION)
+    s3_client = session.client("s3")
+    bedrock_client = session.client("bedrock-runtime")
+
+    retriever = HybridRetriever(s3_client)
+    results = retriever.search(bedrock_client, args.query, args.top_k)
+
+    print(json.dumps(results, indent=2, default=str))
+    log.info("Query %r -> %d semantic candidates, %d keyword candidates",
+              args.query, len(results["semantic"]), len(results["keyword"]))
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+Config for the ECMC RAG Textract pipeline.
+Loads AWS_REGION / S3_BUCKET from .env, and defines the S3 prefixes and
+Textract feature-type settings used by textract_sequential_pipeline.py
+(and, later, the other pipeline stages).
+"""
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env in the current working directory
+
+# --- from .env ---------------------------------------------------------
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "bankrupcy-data-bkt")
+
+# --- S3 prefixes ---------------------------------------------------------
+# NOTE: fixed a bug from the original draft — these previously had
+# "ECMC_RAG" duplicated (.../ECMC_RAG/ECMC_RAG/...). Corrected to match
+# the confirmed real path: ecmc_org/ECMC_RAG/textract_output
+SOURCE_PREFIX = "ecmc_org/ECMC_RAG/source_files"
+
+OUTPUT_JSON_PREFIX = "ecmc_org/ECMC_RAG/textract_output/json"
+OUTPUT_MD_PREFIX = "ecmc_org/ECMC_RAG/textract_output/markdown"
+OUTPUT_TEXT_PREFIX = "ecmc_org/ECMC_RAG/textract_output/text"
+
+# --- Chunking pipeline (chunking_pipeline.py) ---------------------------
+# Reads the {doc_id}.json files written above; writes one
+# {doc_id}_chunks.json per document here.
+CHUNKS_PREFIX = "ecmc_org/ECMC_RAG/chunks"
+
+# Character-count based sizing (not token-based — Titan has no public
+# offline tokenizer to count against, so character count is used as a
+# plain, deterministic proxy: ~4 characters per token).
+CHUNK_CHAR_SIZE = 3200      # ~800 tokens
+CHUNK_CHAR_OVERLAP = 400    # ~100 tokens carried into the next chunk
+
+# --- Embedding pipeline (embedding_pipeline.py) -------------------------
+# Reads every {doc_id}_chunks.json under CHUNKS_PREFIX, embeds each chunk
+# with Bedrock Titan, and writes one combined FAISS index (all documents
+# in a single index, since retrieval searches across the whole ECMC
+# document set, not one file at a time) plus its metadata sidecar here.
+VECTOR_INDEX_PREFIX = "ecmc_org/ECMC_RAG/vector_index"
+
+EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+EMBEDDING_DIMENSIONS = 1024   # Titan v2 supports 256 / 512 / 1024
+
+# --- Retrieval pipeline (retrieval_pipeline.py) --------------------------
+# How many candidates each of semantic search and keyword search returns,
+# independently, before Step 8 fuses them into one ranked list.
+HYBRID_CANDIDATE_K = 20
+
+# --- Textract feature types ---------------------------------------------
+ENABLE_FORMS = True        # forms included — key-value pairs extracted as their own element
+ENABLE_SIGNATURES = False  # still deferred
+
+FEATURE_TYPES = ["LAYOUT", "TABLES"]
+if ENABLE_FORMS:
+    FEATURE_TYPES.append("FORMS")
+if ENABLE_SIGNATURES:
+    FEATURE_TYPES.append("SIGNATURES")
+
+# --- Job polling ---------------------------------------------------------
+POLL_INTERVAL_SECONDS = 5
+POLL_TIMEOUT_SECONDS = 1200  # raise further if large/scanned PDFs still time out
+##############
+############
+"""
 Embeds chunks (written by chunking_pipeline.py) with Bedrock Titan Text
 Embeddings V2, and builds a single FAISS index across all documents.
 
