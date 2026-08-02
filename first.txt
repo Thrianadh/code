@@ -1,4 +1,594 @@
 ############
+#simple_ingest.py
+
+#!/usr/bin/env python3
+"""Simple Textract ingestion - outputs JSON + Markdown + Text.
+
+Outputs:
+  1. JSON:  ecmc_org/ECMC_RAG/textract_output/json/{doc_id}/reading_order.json
+  2. Markdown: ecmc_org/ECMC_RAG/textract_output/markdown/{doc_id}/full_document.md
+  3. Text: ecmc_org/ECMC_RAG/textract_output/text/{doc_id}/clean_text.txt
+
+Uses Textract async API. Parses LINE blocks when LAYOUT blocks missing.
+"""
+
+import json
+import os
+import re
+import time
+from typing import Any, Dict, List
+
+import boto3
+from botocore.exceptions import ClientError
+
+# ── Config ─────────────────────────────────────────────────────────────────
+BUCKET = "bankrupcy-data-bkt"
+SOURCE_PREFIX = "ecmc_org/ECMC_RAG/source_files/"
+TEXTRACT_OUTPUT = "ecmc_org/textract_output/"
+JSON_DIR = "ecmc_org/ECMC_RAG/textract_output/json/"
+MD_DIR = "ecmc_org/ECMC_RAG/textract_output/markdown/"
+TXT_DIR = "ecmc_org/ECMC_RAG/textract_output/text/"
+REGION = "us-east-1"
+
+s3 = boto3.client("s3", region_name=REGION)
+textract = boto3.client("textract", region_name=REGION)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def list_pdfs() -> List[str]:
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=SOURCE_PREFIX):
+        for obj in page.get("Contents", []):
+            if obj["Key"].lower().endswith(".pdf"):
+                keys.append(obj["Key"])
+    return sorted(keys)
+
+
+def filename_to_id(s3_key: str) -> str:
+    name = os.path.splitext(os.path.basename(s3_key))[0]
+    clean = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    clean = re.sub(r"_+", "_", clean).strip("_")
+    return clean[:80]
+
+
+def check_has_blocks(doc_id: str) -> bool:
+    key = f"{TEXTRACT_OUTPUT}{doc_id}/layout.json"
+    try:
+        resp = s3.get_object(Bucket=BUCKET, Key=key)
+        data = json.loads(resp["Body"].read().decode("utf-8"))
+        return len(data.get("Blocks", [])) > 0
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "NoSuchKey":
+            return False
+        raise
+
+
+def delete_if_empty(doc_id: str) -> None:
+    key = f"{TEXTRACT_OUTPUT}{doc_id}/layout.json"
+    try:
+        resp = s3.get_object(Bucket=BUCKET, Key=key)
+        data = json.loads(resp["Body"].read().decode("utf-8"))
+        if not data.get("Blocks"):
+            s3.delete_object(Bucket=BUCKET, Key=key)
+    except ClientError:
+        pass
+
+
+def run_textract(s3_input_key: str) -> Dict[str, Any]:
+    start_resp = textract.start_document_analysis(
+        DocumentLocation={
+            "S3Object": {"Bucket": BUCKET, "Name": s3_input_key}
+        },
+        FeatureTypes=["TABLES", "LAYOUT", "FORMS"],
+    )
+    job_id = start_resp["JobId"]
+    print(f"  Job ID: {job_id}")
+
+    for attempt in range(1, 61):
+        status_resp = textract.get_document_analysis(JobId=job_id)
+        status = status_resp["JobStatus"]
+
+        if status == "SUCCEEDED":
+            print(f"  Job succeeded after {attempt} polls")
+            break
+        if status == "FAILED":
+            msg = status_resp.get("StatusMessage", "Unknown")
+            raise RuntimeError(f"Textract failed: {msg}")
+        print(f"  Polling... {status} (attempt {attempt})")
+        time.sleep(5)
+    else:
+        raise RuntimeError("Textract timed out")
+
+    all_blocks = []
+    next_token = None
+    while True:
+        kwargs = {"JobId": job_id}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        page = textract.get_document_analysis(**kwargs)
+        all_blocks.extend(page.get("Blocks", []))
+        next_token = page.get("NextToken")
+        if not next_token:
+            break
+
+    return {
+        "DocumentMetadata": page.get("DocumentMetadata", {}),
+        "Blocks": all_blocks,
+    }
+
+
+def parse_blocks(raw_data: Dict[str, Any], doc_id: str) -> Dict[str, Any]:
+    blocks = raw_data.get("Blocks", [])
+    doc_meta = raw_data.get("DocumentMetadata", {})
+    blocks_by_id = {b["Id"]: b for b in blocks}
+
+    # Try LAYOUT blocks first
+    layout_blocks = [b for b in blocks if b.get("BlockType", "").startswith("LAYOUT_")]
+
+    if layout_blocks:
+        print(f"  Found {len(layout_blocks)} LAYOUT blocks")
+        source_blocks = layout_blocks
+        uses_fallback = False
+    else:
+        line_blocks = [b for b in blocks if b.get("BlockType") == "LINE"]
+        print(f"  No LAYOUT blocks, using {len(line_blocks)} LINE blocks")
+        source_blocks = line_blocks
+        uses_fallback = True
+
+    # Sort by page → top → left
+    def sort_key(b):
+        geo = b.get("Geometry", {}).get("BoundingBox", {})
+        return (b.get("Page", 1), geo.get("Top", 0), geo.get("Left", 0))
+
+    sorted_blocks = sorted(source_blocks, key=sort_key)
+
+    # Build output blocks
+    output_blocks = []
+    for i, block in enumerate(sorted_blocks, start=1):
+        block_type = block.get("BlockType", "UNKNOWN")
+
+        # Extract text
+        text = block.get("Text", "")
+        if not text:
+            parts = []
+            for rel in block.get("Relationships", []):
+                if rel.get("Type") == "CHILD":
+                    for child_id in rel.get("Ids", []):
+                        child = blocks_by_id.get(child_id)
+                        if child and child.get("BlockType") == "WORD":
+                            parts.append(child.get("Text", ""))
+            text = " ".join(parts).strip()
+
+        # Detect heading
+        is_heading = block_type in ("LAYOUT_TITLE", "LAYOUT_SECTION_HEADER")
+        if uses_fallback and text and len(text) < 100 and text.isupper():
+            is_heading = True
+
+        output_blocks.append({
+            "block_id": block["Id"],
+            "block_type": "heading" if is_heading else "text",
+            "page_number": block.get("Page", 1),
+            "text": text,
+            "reading_order": i,
+            "geometry": block.get("Geometry", {}).get("BoundingBox", {}),
+        })
+
+    # Build sections
+    sections = []
+    current_section = None
+    for block in output_blocks:
+        if block["block_type"] == "heading":
+            if current_section:
+                sections.append(current_section)
+            current_section = {
+                "section_id": f"section_{len(sections) + 1:03d}",
+                "heading": block["text"],
+                "page_start": block["page_number"],
+                "page_end": block["page_number"],
+            }
+        elif current_section:
+            current_section["page_end"] = max(current_section["page_end"], block["page_number"])
+
+    if current_section:
+        sections.append(current_section)
+
+    if not sections and output_blocks:
+        sections.append({
+            "section_id": "section_001",
+            "heading": "Document Content",
+            "page_start": output_blocks[0]["page_number"],
+            "page_end": output_blocks[-1]["page_number"],
+        })
+
+    return {
+        "doc_id": doc_id,
+        "total_pages": doc_meta.get("Pages", 0),
+        "total_blocks": len(output_blocks),
+        "uses_fallback": uses_fallback,
+        "blocks": output_blocks,
+        "sections": sections,
+    }
+
+
+def build_markdown(parsed: Dict[str, Any]) -> str:
+    """Build markdown from parsed blocks."""
+    lines = []
+    for block in parsed["blocks"]:
+        text = block["text"].strip()
+        if not text:
+            continue
+        if block["block_type"] == "heading":
+            lines.append(f"## {text}")
+        else:
+            lines.append(text)
+            lines.append("")  # blank line between paragraphs
+    return "\n".join(lines)
+
+
+def build_text(parsed: Dict[str, Any]) -> str:
+    """Build plain text from parsed blocks."""
+    lines = []
+    for block in parsed["blocks"]:
+        text = block["text"].strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def upload_string(key: str, content: str, content_type: str = "text/plain") -> None:
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=content.encode("utf-8"),
+        ContentType=content_type,
+    )
+
+
+def upload_json(key: str, data: Dict[str, Any]) -> None:
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType="application/json")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("ECMC Textract Ingestion (JSON + Markdown + Text)")
+    print("=" * 60)
+
+    pdf_keys = list_pdfs()
+    print(f"Found {len(pdf_keys)} PDFs\n")
+
+    for i, pdf_key in enumerate(pdf_keys, 1):
+        doc_id = filename_to_id(pdf_key)
+        print(f"[{i}/{len(pdf_keys)}] {doc_id}")
+
+        if check_has_blocks(doc_id):
+            print(f"  Already processed, skipping\n")
+            continue
+
+        delete_if_empty(doc_id)
+
+        print(f"  Running Textract async...")
+        raw_data = run_textract(pdf_key)
+        block_count = len(raw_data.get("Blocks", []))
+        print(f"  Textract returned {block_count} blocks")
+
+        if block_count == 0:
+            print(f"  WARNING: 0 blocks, skipping\n")
+            continue
+
+        # Save raw
+        layout_key = f"{TEXTRACT_OUTPUT}{doc_id}/layout.json"
+        upload_json(layout_key, raw_data)
+
+        # Parse
+        print(f"  Parsing...")
+        parsed = parse_blocks(raw_data, doc_id)
+        print(f"  Parsed: {parsed['total_blocks']} blocks, {len(parsed['sections'])} sections")
+
+        # 1. Save JSON
+        json_key = f"{JSON_DIR}{doc_id}/reading_order.json"
+        upload_json(json_key, parsed)
+        print(f"  JSON: s3://{BUCKET}/{json_key}")
+
+        # 2. Save Markdown
+        md_content = build_markdown(parsed)
+        md_key = f"{MD_DIR}{doc_id}/full_document.md"
+        upload_string(md_key, md_content, "text/markdown")
+        print(f"  Markdown: s3://{BUCKET}/{md_key}")
+
+        # 3. Save Text
+        txt_content = build_text(parsed)
+        txt_key = f"{TXT_DIR}{doc_id}/clean_text.txt"
+        upload_string(txt_key, txt_content, "text/plain")
+        print(f"  Text: s3://{BUCKET}/{txt_key}")
+        print()
+
+    print("=" * 60)
+    print("Done")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+########
+######simple_chunking.py
+
+#!/usr/bin/env python3
+"""Structure-aware chunking pipeline.
+
+Reads reading_order.json from Textract output.
+Produces:
+  1. Parent chunks (by section/heading) - JSON
+  2. Child chunks (by paragraph within section) - JSON + Text
+  3. Chunk metadata mapping (child_id → parent_id) - JSON
+
+Structure-aware rules:
+  - Parent = one section (from heading to next heading)
+  - Child = one paragraph or table (~300 tokens max)
+  - Tables stay intact in parent, child gets table summary
+  - Images get captions in parent, child gets caption text
+"""
+
+import json
+import os
+import re
+from typing import Any, Dict, List, Tuple
+
+import boto3
+
+# ── Config ─────────────────────────────────────────────────────────────────
+BUCKET = "bankrupcy-data-bkt"
+JSON_INPUT = "ecmc_org/ECMC_RAG/textract_output/json/"
+JSON_OUTPUT = "ecmc_org/ECMC_RAG/textract_output/json/"
+MD_OUTPUT = "ecmc_org/ECMC_RAG/textract_output/markdown/"
+TXT_OUTPUT = "ecmc_org/ECMC_RAG/textract_output/text/"
+REGION = "us-east-1"
+
+s3 = boto3.client("s3", region_name=REGION)
+
+# Chunking params
+CHILD_MAX_TOKENS = 300
+CHILD_OVERLAP = 50
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: 1 token ≈ 0.75 words."""
+    return max(1, int(len(text.split()) * 0.75))
+
+
+def list_doc_ids() -> List[str]:
+    """List all doc_ids from JSON input folder."""
+    ids = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=JSON_INPUT, Delimiter="/"):
+        for prefix in page.get("CommonPrefixes", []):
+            key = prefix["Prefix"]
+            doc_id = key.rstrip("/").split("/")[-1]
+            ids.append(doc_id)
+    return sorted(ids)
+
+
+def download_json(key: str) -> Dict[str, Any]:
+    resp = s3.get_object(Bucket=BUCKET, Key=key)
+    return json.loads(resp["Body"].read().decode("utf-8"))
+
+
+def upload_json(key: str, data: Dict[str, Any]) -> None:
+    body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType="application/json")
+
+
+def upload_text(key: str, text: str) -> None:
+    s3.put_object(Bucket=BUCKET, Key=key, Body=text.encode("utf-8"), ContentType="text/plain")
+
+
+# ── Chunking Logic ─────────────────────────────────────────────────────────
+
+def build_parents(reading_order: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build parent chunks from sections.
+
+    A parent = one section (from heading to next heading).
+    Contains all text, tables, images within that section.
+    """
+    blocks = reading_order.get("blocks", [])
+    parents = []
+    current_parent = None
+
+    for block in blocks:
+        if block["block_type"] == "heading":
+            # Save previous parent
+            if current_parent:
+                parents.append(current_parent)
+
+            # Start new parent
+            current_parent = {
+                "parent_id": f"{reading_order['doc_id']}_parent_{len(parents) + 1:03d}",
+                "doc_id": reading_order["doc_id"],
+                "section_heading": block["text"],
+                "page_start": block["page_number"],
+                "page_end": block["page_number"],
+                "content_blocks": [],
+                "full_text": "",
+            }
+        elif current_parent:
+            # Add to current parent
+            current_parent["content_blocks"].append(block)
+            current_parent["page_end"] = max(current_parent["page_end"], block["page_number"])
+            if block["text"]:
+                current_parent["full_text"] += block["text"] + "\n\n"
+
+    # Save last parent
+    if current_parent:
+        parents.append(current_parent)
+
+    # If no headings found, create one parent with all content
+    if not parents and blocks:
+        parents.append({
+            "parent_id": f"{reading_order['doc_id']}_parent_001",
+            "doc_id": reading_order["doc_id"],
+            "section_heading": "Document Content",
+            "page_start": blocks[0]["page_number"],
+            "page_end": blocks[-1]["page_number"],
+            "content_blocks": blocks,
+            "full_text": "\n\n".join(b["text"] for b in blocks if b["text"]),
+        })
+
+    return parents
+
+
+def build_children(parent: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build child chunks from a parent.
+
+    Rules:
+      - Each child = one paragraph or ~300 tokens
+      - Overlap: 50 tokens between consecutive children
+      - Child stores parent_id for retrieval
+    """
+    children = []
+    blocks = parent["content_blocks"]
+    current_text = ""
+    current_blocks = []
+
+    for block in blocks:
+        text = block.get("text", "").strip()
+        if not text:
+            continue
+
+        # If adding this block exceeds limit, save current child and start new
+        combined = current_text + "\n" + text if current_text else text
+        if estimate_tokens(combined) > CHILD_MAX_TOKENS and current_text:
+            # Save current child
+            children.append({
+                "child_id": f"{parent['parent_id']}_child_{len(children) + 1:03d}",
+                "parent_id": parent["parent_id"],
+                "doc_id": parent["doc_id"],
+                "text": current_text.strip(),
+                "page_number": current_blocks[0]["page_number"] if current_blocks else parent["page_start"],
+                "section_heading": parent["section_heading"],
+            })
+
+            # Start new with overlap (last 50 tokens of previous)
+            words = current_text.split()
+            overlap_words = words[-int(CHILD_OVERLAP / 0.75):] if len(words) > int(CHILD_OVERLAP / 0.75) else words
+            overlap_text = " ".join(overlap_words)
+            current_text = overlap_text + "\n" + text if overlap_text else text
+            current_blocks = [block]
+        else:
+            current_text = combined
+            current_blocks.append(block)
+
+    # Save last child
+    if current_text:
+        children.append({
+            "child_id": f"{parent['parent_id']}_child_{len(children) + 1:03d}",
+            "parent_id": parent["parent_id"],
+            "doc_id": parent["doc_id"],
+            "text": current_text.strip(),
+            "page_number": current_blocks[0]["page_number"] if current_blocks else parent["page_start"],
+            "section_heading": parent["section_heading"],
+        })
+
+    return children
+
+
+def build_parent_markdown(parent: Dict[str, Any]) -> str:
+    """Build markdown for a parent chunk."""
+    lines = [f"# {parent['section_heading']}"]
+    lines.append("")
+    for block in parent["content_blocks"]:
+        text = block.get("text", "").strip()
+        if text:
+            lines.append(text)
+            lines.append("")
+    return "\n".join(lines)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("Structure-Aware Chunking")
+    print("=" * 60)
+
+    doc_ids = list_doc_ids()
+    print(f"Found {len(doc_ids)} documents\n")
+
+    for doc_id in doc_ids:
+        print(f"Processing: {doc_id}")
+
+        # Load reading_order.json
+        reading_key = f"{JSON_INPUT}{doc_id}/reading_order.json"
+        try:
+            reading_order = download_json(reading_key)
+        except Exception as exc:
+            print(f"  ERROR loading reading_order: {exc}")
+            continue
+
+        # Build parents
+        parents = build_parents(reading_order)
+        print(f"  Parents: {len(parents)}")
+
+        # Build children
+        all_children = []
+        for parent in parents:
+            children = build_children(parent)
+            all_children.extend(children)
+            parent["child_ids"] = [c["child_id"] for c in children]
+
+        print(f"  Children: {len(all_children)}")
+
+        # Save parents JSON
+        parents_key = f"{JSON_OUTPUT}{doc_id}/parent_chunks.json"
+        upload_json(parents_key, {"doc_id": doc_id, "parents": parents})
+
+        # Save children JSON
+        children_key = f"{JSON_OUTPUT}{doc_id}/child_chunks.json"
+        upload_json(children_key, {"doc_id": doc_id, "children": all_children})
+
+        # Save children text (for BM25)
+        text_lines = []
+        for child in all_children:
+            text_lines.append(f"{child['child_id']}\t{child['text']}")
+        text_key = f"{TXT_OUTPUT}{doc_id}/child_text.txt"
+        upload_text(text_key, "\n".join(text_lines))
+
+        # Save parent markdowns
+        for parent in parents:
+            md = build_parent_markdown(parent)
+            md_key = f"{MD_OUTPUT}{doc_id}/parents/{parent['parent_id']}.md"
+            s3.put_object(
+                Bucket=BUCKET,
+                Key=md_key,
+                Body=md.encode("utf-8"),
+                ContentType="text/markdown",
+            )
+
+        # Save chunk metadata
+        metadata = {
+            "doc_id": doc_id,
+            "parent_count": len(parents),
+            "child_count": len(all_children),
+            "mapping": {c["child_id"]: c["parent_id"] for c in all_children},
+        }
+        meta_key = f"{JSON_OUTPUT}{doc_id}/chunk_metadata.json"
+        upload_json(meta_key, metadata)
+
+        print(f"  Saved: {len(parents)} parents, {len(all_children)} children\n")
+
+    print("=" * 60)
+    print("Done")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+############
 """Parse Textract raw JSON into reading order and document metadata.
 
 Handles both:
