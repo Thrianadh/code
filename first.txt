@@ -1,79 +1,159 @@
 """
-Step 8 -- reranking via Reciprocal Rank Fusion (RRF).
+Step 9 -- answer generation with Nova Lite via the Bedrock Converse API,
+using chain-of-thought reasoning, grounded in Step 8's fused chunks.
 
-Takes the two independent ranked lists produced by Step 7
-(HybridRetriever.search -> "semantic" and "keyword") and combines them into
-one fused ranking:
+Nova is asked for exactly two things: an answer, and which single chunk_id
+it drew that answer from. It is NOT asked to write the citation's "source"
+or "excerpt" -- those are looked up and sliced directly from the actual
+chunk text in code, after the model responds. This keeps the citation
+grounded to what the source document literally says: the model can only
+choose *which* chunk to point at, it cannot phrase what the chunk contains
+into the citation itself.
 
-    rrf_score(chunk) = sum, over each list the chunk appears in, of
-                        1 / (RRF_K + rank_in_that_list)
+Chain-of-thought: Nova is asked to reason step by step in a REASONING
+section first (checking which chunk(s), if any, actually support an
+answer) before committing to a FINAL_JSON line. The reasoning is logged
+for auditing but is not part of the returned answer -- only FINAL_JSON is
+parsed and returned to the caller.
 
-RRF instead of a separate reranker model: there is no AWS-native
-cross-encoder reranker (unlike, say, Cohere Rerank), so combining the two
-rank lists with a fixed formula is the deterministic substitute -- no
-extra model call, no extra latency, no extra AWS service to provision.
+If no chunk supports an answer, Nova is instructed to say so explicitly
+rather than guess, and the citation is left as null (this is the main
+hallucination-control lever going into Step 10; the rest of Step 10 is
+still open).
 
-A chunk that only appears in one of the two lists (matched semantically
-but not by keyword, or vice versa) still gets a score from whichever list
-it's in -- it isn't penalized to zero for missing from the other.
+Final return shape (this is the contract the whole chunking/retrieval
+design was built backwards from):
+    {
+      "answer": "...",
+      "citation": {"chunk_id": "...", "source": "...", "excerpt": "..."} | null
+    }
 
 Usage (standalone, for testing):
-    python reranking_pipeline.py --query "what is the deadline to respond to this notice?"
-
-Used as a module by the answer-generation stage (Step 9), which needs the
-final fused top-k chunks as the context to answer from.
+    python generation_pipeline.py --query "what is the deadline to respond to this notice?"
 """
 
 import argparse
 import json
 import logging
+import re
 
 import boto3
 
-from config import AWS_REGION, RRF_K, FINAL_TOP_K, HYBRID_CANDIDATE_K
+from config import (
+    AWS_REGION,
+    NOVA_MODEL_ID,
+    GENERATION_TEMPERATURE,
+    GENERATION_MAX_TOKENS,
+    EXCERPT_CHAR_LENGTH,
+)
 from retrieval_pipeline import HybridRetriever
+from reranking_pipeline import rerank
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
+SYSTEM_PROMPT = """You are ECMC's document assistant. Answer questions using ONLY the \
+CONTEXT chunks provided in the user message. Do not use any outside knowledge, \
+and do not guess.
 
-def reciprocal_rank_fusion(semantic_results, keyword_results, k=RRF_K, top_k=FINAL_TOP_K):
-    """Merges two ranked chunk lists into one, by chunk_id, using RRF.
-    Returns the fused list sorted by rrf_score descending, truncated to
-    top_k."""
-    fused = {}
+Respond in exactly this format, with these two labeled sections and nothing \
+else before, between, or after them:
 
-    for chunk in semantic_results:
-        chunk_id = chunk["chunk_id"]
-        entry = fused.setdefault(chunk_id, dict(chunk))
-        entry["rrf_score"] = entry.get("rrf_score", 0.0) + 1.0 / (k + chunk["semantic_rank"])
+REASONING:
+Think step by step. Identify which context chunk(s), if any, are relevant to \
+the question. Check whether a relevant chunk actually answers the question, \
+or only partially. If no chunk answers the question, say so here.
 
-    for chunk in keyword_results:
-        chunk_id = chunk["chunk_id"]
-        if chunk_id in fused:
-            fused[chunk_id]["bm25_rank"] = chunk["bm25_rank"]
-            fused[chunk_id]["bm25_score"] = chunk["bm25_score"]
-        else:
-            fused[chunk_id] = dict(chunk)
-        fused[chunk_id]["rrf_score"] = fused[chunk_id].get("rrf_score", 0.0) + 1.0 / (k + chunk["bm25_rank"])
+FINAL_JSON:
+A single-line JSON object, exactly this shape:
+{"answer": "<your answer in plain language, or a statement that the documents do not contain this information>", "chunk_id": "<the chunk_id of the ONE chunk that most directly supports your answer, or null if none do>"}
+"""
 
-    ranked = sorted(fused.values(), key=lambda c: c["rrf_score"], reverse=True)
-    return ranked[:top_k]
+FINAL_JSON_MARKER = "FINAL_JSON:"
 
 
-def rerank(bedrock_client, retriever, query, candidate_k=None, top_k=None):
-    """Runs Step 7's hybrid search, then fuses the two lists with RRF."""
-    candidate_k = candidate_k or HYBRID_CANDIDATE_K
-    top_k = top_k or FINAL_TOP_K
+def build_context_block(chunks):
+    parts = []
+    for chunk in chunks:
+        parts.append(
+            f"[chunk_id: {chunk['chunk_id']} | source: {chunk['source']} | "
+            f"page: {chunk.get('page')} | type: {chunk.get('element_type')}]\n"
+            f"{chunk['text']}"
+        )
+    return "\n\n".join(parts)
 
-    results = retriever.search(bedrock_client, query, top_k=candidate_k)
-    return reciprocal_rank_fusion(results["semantic"], results["keyword"], k=RRF_K, top_k=top_k)
+
+def parse_model_response(raw_text):
+    """Splits the REASONING / FINAL_JSON response, logs the reasoning, and
+    parses the JSON object out of the FINAL_JSON section."""
+    if FINAL_JSON_MARKER in raw_text:
+        reasoning_part, _, json_part = raw_text.partition(FINAL_JSON_MARKER)
+    else:
+        # Model didn't follow the format -- fall back to scanning the whole
+        # response for a JSON object rather than failing outright.
+        reasoning_part, json_part = "", raw_text
+
+    log.info("Model reasoning: %s", reasoning_part.strip().replace("REASONING:", "").strip())
+
+    match = re.search(r"\{.*\}", json_part, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object found in model response: {raw_text!r}")
+
+    return json.loads(match.group(0))
+
+
+def build_citation(chunk_id, chunks):
+    if not chunk_id:
+        return None
+    for chunk in chunks:
+        if chunk["chunk_id"] == chunk_id:
+            text = chunk["text"]
+            excerpt = text[:EXCERPT_CHAR_LENGTH] + ("..." if len(text) > EXCERPT_CHAR_LENGTH else "")
+            return {
+                "chunk_id": chunk["chunk_id"],
+                "source": chunk["source"],
+                "excerpt": excerpt,
+            }
+    # Model named a chunk_id that wasn't actually in the context we gave it --
+    # treat that as no citation rather than fabricating one.
+    log.error("Model returned chunk_id %r not present in the provided chunks", chunk_id)
+    return None
+
+
+def generate_answer(bedrock_client, retriever, query):
+    fused_chunks = rerank(bedrock_client, retriever, query)
+
+    if not fused_chunks:
+        return {
+            "answer": "The provided documents do not contain information to answer this question.",
+            "citation": None,
+        }
+
+    context_block = build_context_block(fused_chunks)
+    user_message = f"CONTEXT:\n{context_block}\n\nQUESTION:\n{query}"
+
+    response = bedrock_client.converse(
+        modelId=NOVA_MODEL_ID,
+        system=[{"text": SYSTEM_PROMPT}],
+        messages=[{"role": "user", "content": [{"text": user_message}]}],
+        inferenceConfig={
+            "temperature": GENERATION_TEMPERATURE,
+            "maxTokens": GENERATION_MAX_TOKENS,
+        },
+    )
+
+    raw_text = response["output"]["message"]["content"][0]["text"]
+    parsed = parse_model_response(raw_text)
+
+    answer = parsed.get("answer", "").strip()
+    citation = build_citation(parsed.get("chunk_id"), fused_chunks)
+
+    return {"answer": answer, "citation": citation}
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--query", required=True, help="Query text to retrieve and rerank chunks for")
-    parser.add_argument("--top-k", type=int, default=FINAL_TOP_K)
+    parser.add_argument("--query", required=True, help="Question to answer")
     args = parser.parse_args()
 
     session = boto3.Session(region_name=AWS_REGION)
@@ -81,16 +161,14 @@ def main():
     bedrock_client = session.client("bedrock-runtime")
 
     retriever = HybridRetriever(s3_client)
-    final_chunks = rerank(bedrock_client, retriever, args.query, top_k=args.top_k)
+    result = generate_answer(bedrock_client, retriever, args.query)
 
-    print(json.dumps(final_chunks, indent=2, default=str))
-    log.info("Query %r -> %d fused chunks after RRF", args.query, len(final_chunks))
+    print(json.dumps(result, indent=2, default=str))
 
 
 if __name__ == "__main__":
     main()
 
-###########
 """
 Config for the ECMC RAG Textract pipeline.
 Loads AWS_REGION / S3_BUCKET from .env, and defines the S3 prefixes and
@@ -150,6 +228,15 @@ HYBRID_CANDIDATE_K = 20
 RRF_K = 60
 # How many fused chunks get passed on to answer generation (Step 9).
 FINAL_TOP_K = 5
+
+# --- Generation pipeline (generation_pipeline.py) ------------------------
+NOVA_MODEL_ID = "amazon.nova-lite-v1:0"
+GENERATION_TEMPERATURE = 0     # deterministic/grounded, not creative
+GENERATION_MAX_TOKENS = 1024
+# How many characters of a chunk's own text become the citation "excerpt".
+# Always sliced from the chunk itself in code -- never written by the model
+# -- so the excerpt can't drift from what the source document actually says.
+EXCERPT_CHAR_LENGTH = 200
 
 # --- Textract feature types ---------------------------------------------
 ENABLE_FORMS = True        # forms included — key-value pairs extracted as their own element
