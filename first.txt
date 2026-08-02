@@ -17,9 +17,10 @@ for auditing but is not part of the returned answer -- only FINAL_JSON is
 parsed and returned to the caller.
 
 If no chunk supports an answer, Nova is instructed to say so explicitly
-rather than guess, and the citation is left as null (this is the main
-hallucination-control lever going into Step 10; the rest of Step 10 is
-still open).
+rather than guess, the citation is left as null, AND the answer text
+itself is overridden with a fixed refusal message -- Step 10's hallucination
+control doesn't just leave a missing citation sitting next to whatever
+Nova wrote; a claim with no supporting chunk is replaced outright.
 
 Final return shape (this is the contract the whole chunking/retrieval
 design was built backwards from):
@@ -148,6 +149,15 @@ def generate_answer(bedrock_client, retriever, query):
     answer = parsed.get("answer", "").strip()
     citation = build_citation(parsed.get("chunk_id"), fused_chunks)
 
+    # Step 10, hallucination control: if no chunk actually backs the answer,
+    # the answer text itself is replaced -- not just left to accompany a
+    # missing citation. Nova can still have written a speculative answer
+    # even after saying chunk_id: null; an uncited claim in a bankruptcy/
+    # financial context is exactly the failure mode this pipeline exists to
+    # avoid, so it isn't passed through as-is.
+    if citation is None:
+        answer = "The provided documents do not contain information to answer this question."
+
     return {"answer": answer, "citation": citation}
 
 
@@ -169,85 +179,168 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+###############
 """
-Config for the ECMC RAG Textract pipeline.
-Loads AWS_REGION / S3_BUCKET from .env, and defines the S3 prefixes and
-Textract feature-type settings used by textract_sequential_pipeline.py
-(and, later, the other pipeline stages).
+Runs a fixed list of test questions through the full RAG pipeline
+(retrieval -> RRF fusion -> Nova generation, Steps 7-9) and records each
+result and its latency into an .xlsx file. This is a manual test harness
+for exactly this kind of question -- "does the pipeline answer correctly
+and cite the right chunk, and how long does it take" -- run across a
+batch, rather than one at a time via generation_pipeline.py's CLI.
+
+Input: a plain text file, one question per line (default: questions.txt
+next to this script). Pass --questions-file to point at a different file.
+
+Output: an .xlsx file with two sheets:
+    - Results  -> one row per question: question, answer, chunk_id,
+                  source, excerpt, has_citation, latency_seconds
+    - Summary  -> total questions, how many got a citation vs. were
+                  refused (Step 10's hallucination control), and
+                  average/min/max latency -- all as formulas over the
+                  Results sheet, so they recalculate if a row is edited.
+
+Install:
+    pip install boto3 python-dotenv openpyxl
+
+Usage:
+    python eval_pipeline.py --questions-file questions.txt --output eval_results.xlsx
 """
 
-import os
+import argparse
+import logging
+import time
 
-from dotenv import load_dotenv
+import boto3
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
 
-load_dotenv()  # reads .env in the current working directory
+from config import AWS_REGION
+from retrieval_pipeline import HybridRetriever
+from generation_pipeline import generate_answer
 
-# --- from .env ---------------------------------------------------------
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_BUCKET = os.getenv("S3_BUCKET", "bankrupcy-data-bkt")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger(__name__)
 
-# --- S3 prefixes ---------------------------------------------------------
-# NOTE: fixed a bug from the original draft — these previously had
-# "ECMC_RAG" duplicated (.../ECMC_RAG/ECMC_RAG/...). Corrected to match
-# the confirmed real path: ecmc_org/ECMC_RAG/textract_output
-SOURCE_PREFIX = "ecmc_org/ECMC_RAG/source_files"
+FONT_NAME = "Arial"
+HEADER_FONT = Font(name=FONT_NAME, bold=True)
+BODY_FONT = Font(name=FONT_NAME)
 
-OUTPUT_JSON_PREFIX = "ecmc_org/ECMC_RAG/textract_output/json"
-OUTPUT_MD_PREFIX = "ecmc_org/ECMC_RAG/textract_output/markdown"
-OUTPUT_TEXT_PREFIX = "ecmc_org/ECMC_RAG/textract_output/text"
 
-# --- Chunking pipeline (chunking_pipeline.py) ---------------------------
-# Reads the {doc_id}.json files written above; writes one
-# {doc_id}_chunks.json per document here.
-CHUNKS_PREFIX = "ecmc_org/ECMC_RAG/chunks"
+def load_questions(path):
+    questions = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                questions.append(line)
+    return questions
 
-# Character-count based sizing (not token-based — Titan has no public
-# offline tokenizer to count against, so character count is used as a
-# plain, deterministic proxy: ~4 characters per token).
-CHUNK_CHAR_SIZE = 3200      # ~800 tokens
-CHUNK_CHAR_OVERLAP = 400    # ~100 tokens carried into the next chunk
 
-# --- Embedding pipeline (embedding_pipeline.py) -------------------------
-# Reads every {doc_id}_chunks.json under CHUNKS_PREFIX, embeds each chunk
-# with Bedrock Titan, and writes one combined FAISS index (all documents
-# in a single index, since retrieval searches across the whole ECMC
-# document set, not one file at a time) plus its metadata sidecar here.
-VECTOR_INDEX_PREFIX = "ecmc_org/ECMC_RAG/vector_index"
+def run_questions(bedrock_client, retriever, questions):
+    """Calls Step 9's generate_answer() once per question, timing each call
+    individually. A failure on one question is recorded as an error row
+    and does not stop the rest of the batch."""
+    rows = []
+    for i, question in enumerate(questions, start=1):
+        log.info("[%d/%d] %s", i, len(questions), question)
+        start = time.perf_counter()
+        error = None
+        try:
+            result = generate_answer(bedrock_client, retriever, question)
+        except Exception as e:
+            log.error("Question %d failed: %s", i, e)
+            result = {"answer": None, "citation": None}
+            error = str(e)
+        elapsed = time.perf_counter() - start
 
-EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
-EMBEDDING_DIMENSIONS = 1024   # Titan v2 supports 256 / 512 / 1024
+        citation = result.get("citation")
+        rows.append({
+            "question": question,
+            "answer": f"ERROR: {error}" if error else result.get("answer"),
+            "chunk_id": citation["chunk_id"] if citation else "",
+            "source": citation["source"] if citation else "",
+            "excerpt": citation["excerpt"] if citation else "",
+            "has_citation": "Yes" if citation else "No",
+            "latency_seconds": round(elapsed, 3),
+        })
+    return rows
 
-# --- Retrieval pipeline (retrieval_pipeline.py) --------------------------
-# How many candidates each of semantic search and keyword search returns,
-# independently, before Step 8 fuses them into one ranked list.
-HYBRID_CANDIDATE_K = 20
 
-# --- Reranking pipeline (reranking_pipeline.py) --------------------------
-# Reciprocal Rank Fusion constant (60 is the standard/default value used
-# in the original RRF paper and most hybrid-search implementations).
-RRF_K = 60
-# How many fused chunks get passed on to answer generation (Step 9).
-FINAL_TOP_K = 5
+def write_xlsx(rows, output_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Results"
 
-# --- Generation pipeline (generation_pipeline.py) ------------------------
-NOVA_MODEL_ID = "amazon.nova-lite-v1:0"
-GENERATION_TEMPERATURE = 0     # deterministic/grounded, not creative
-GENERATION_MAX_TOKENS = 1024
-# How many characters of a chunk's own text become the citation "excerpt".
-# Always sliced from the chunk itself in code -- never written by the model
-# -- so the excerpt can't drift from what the source document actually says.
-EXCERPT_CHAR_LENGTH = 200
+    headers = ["#", "Question", "Answer", "Chunk ID", "Source", "Excerpt", "Has Citation", "Latency (s)"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = HEADER_FONT
 
-# --- Textract feature types ---------------------------------------------
-ENABLE_FORMS = True        # forms included — key-value pairs extracted as their own element
-ENABLE_SIGNATURES = False  # still deferred
+    for i, row in enumerate(rows, start=1):
+        ws.append([
+            i, row["question"], row["answer"], row["chunk_id"],
+            row["source"], row["excerpt"], row["has_citation"], row["latency_seconds"],
+        ])
 
-FEATURE_TYPES = ["LAYOUT", "TABLES"]
-if ENABLE_FORMS:
-    FEATURE_TYPES.append("FORMS")
-if ENABLE_SIGNATURES:
-    FEATURE_TYPES.append("SIGNATURES")
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = BODY_FONT
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
 
-# --- Job polling ---------------------------------------------------------
-POLL_INTERVAL_SECONDS = 5
-POLL_TIMEOUT_SECONDS = 1200  # raise further if large/scanned PDFs still time out
+    widths = {"A": 4, "B": 40, "C": 45, "D": 22, "E": 20, "F": 45, "G": 12, "H": 12}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    last_row = 1 + len(rows)
+
+    summary = wb.create_sheet("Summary")
+    summary_rows = [
+        ("Metric", "Value"),
+        ("Total questions", f"=COUNTA(Results!B2:B{last_row})"),
+        ("Answered with citation", f'=COUNTIF(Results!G2:G{last_row},"Yes")'),
+        ("Refused (no citation)", f'=COUNTIF(Results!G2:G{last_row},"No")'),
+        ("Average latency (s)", f"=AVERAGE(Results!H2:H{last_row})"),
+        ("Min latency (s)", f"=MIN(Results!H2:H{last_row})"),
+        ("Max latency (s)", f"=MAX(Results!H2:H{last_row})"),
+    ]
+    for r in summary_rows:
+        summary.append(r)
+    for cell in summary[1]:
+        cell.font = HEADER_FONT
+    for row in summary.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = BODY_FONT
+    summary.column_dimensions["A"].width = 24
+    summary.column_dimensions["B"].width = 16
+
+    wb.save(output_path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--questions-file", default="questions.txt")
+    parser.add_argument("--output", default="eval_results.xlsx")
+    args = parser.parse_args()
+
+    questions = load_questions(args.questions_file)
+    if not questions:
+        log.error("No questions found in %s", args.questions_file)
+        return
+
+    log.info("Loaded %d questions", len(questions))
+
+    session = boto3.Session(region_name=AWS_REGION)
+    s3_client = session.client("s3")
+    bedrock_client = session.client("bedrock-runtime")
+
+    retriever = HybridRetriever(s3_client)
+    rows = run_questions(bedrock_client, retriever, questions)
+
+    write_xlsx(rows, args.output)
+    log.info("Wrote %s (%d rows)", args.output, len(rows))
+
+
+if __name__ == "__main__":
+    main()
+
