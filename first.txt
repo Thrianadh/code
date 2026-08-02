@@ -1,3 +1,8 @@
+aws s3 rm s3://bankrupcy-data-bkt/ecmc_org/textract_output/ --recursive
+aws s3 rm s3://bankrupcy-data-bkt/ecmc_org/ECMC_RAG/textract_output/json/ --recursive
+aws s3 rm s3://bankrupcy-data-bkt/ecmc_org/ECMC_RAG/textract_output/markdown/ --recursive
+aws s3 rm s3://bankrupcy-data-bkt/ecmc_org/ECMC_RAG/textract_output/text/ --recursive
+aws s3 rm s3://bankrupcy-data-bkt/ecmc_org/ECMC_RAG/manifest.json
 ############
 #simple_ingest.py
 
