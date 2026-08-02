@@ -201,6 +201,600 @@ def build_table_grid(table_block: dict, block_index: dict[str, dict]) -> list[li
     return grid
 
 
+# --- FORMS quality filter ------------------------------------------------
+# Textract's FORMS feature is a geometric heuristic (label-shaped text next
+# to an adjacent blank/answer region = a key-value pair) — it works well on
+# clean, single-purpose forms (validated against the borrower authorization
+# samples) but misfires on mixed documents: prose, checklists, and exported
+# note-style pages (timestamps, headers) get sliced into fake "key: value"
+# pairs. Real-world example that surfaced this: a QA/call-handling guide
+# produced pairs like {"Guideline.": "<entire following paragraph>"} and
+# {"Wednesday,": "July 31, 2024"} (an exported note's date header, not a
+# form field). These two checks reject the vast majority of that noise:
+#   - low Textract Confidence on the KEY block itself
+#   - key text that's too long / too sentence-like to be a real label
+#     (real labels are short: "Full name", "SSN", "Date of birth" —
+#     not "Confirm that the demographics were")
+MIN_KV_CONFIDENCE = 50.0
+MAX_KEY_WORDS = 8
+MAX_VALUE_WORDS = 15  # a real answer field is short (a name/date/number) — a
+                       # multi-sentence paragraph as a "value" means Textract
+                       # attached a whole paragraph to a heading it mistook for a key
+
+
+def is_plausible_form_key(key_text: str, confidence: float) -> bool:
+    if confidence < MIN_KV_CONFIDENCE:
+        return False
+    words = key_text.split()
+    if not words or len(words) > MAX_KEY_WORDS:
+        return False
+    # A real field label doesn't usually end mid-sentence on a comma or a
+    # dangling preposition/article — cheap signal that this was actually a
+    # sentence Textract split, not a label.
+    if key_text.rstrip().endswith((",", "the", "a", "an", "of", "for", "to", "was", "were")):
+        return False
+    return True
+
+
+def is_plausible_form_value(value_text: str) -> bool:
+    if not value_text:
+        return True  # an empty/unfilled field (e.g. a blank line label) is normal, keep it
+    return len(value_text.split()) <= MAX_VALUE_WORDS
+
+
+def extract_key_value_pairs(blocks: list[dict], block_index: dict[str, dict]) -> list[dict]:
+    """
+    Pulls every KEY_VALUE_SET KEY block, resolves its linked VALUE block via
+    Textract's own "VALUE" relationship, and records the page + vertical
+    position (Top) so the pairs can be grouped and ordered sensibly.
+    Only present when ENABLE_FORMS / the FORMS feature type is on.
+    Pairs that don't pass is_plausible_form_key() are dropped rather than
+    surfaced as garbage form fields — see the quality filter note above.
+    """
+    pairs = []
+    dropped = 0
+    for b in blocks:
+        if b["BlockType"] != "KEY_VALUE_SET" or "KEY" not in b.get("EntityTypes", []):
+            continue
+        key_text = block_text(b, block_index).strip()
+        confidence = b.get("Confidence", 100.0)
+        if not key_text or not is_plausible_form_key(key_text, confidence):
+            dropped += 1
+            continue
+
+        value_block = None
+        for rel in b.get("Relationships", []) or []:
+            if rel.get("Type") == "VALUE":
+                for vid in rel.get("Ids", []):
+                    vb = block_index.get(vid)
+                    if vb:
+                        value_block = vb
+                        break
+        value_text = block_text(value_block, block_index).strip() if value_block else ""
+
+        if not is_plausible_form_value(value_text):
+            dropped += 1
+            continue
+
+        page = b.get("Page", 1)
+        top = b.get("Geometry", {}).get("BoundingBox", {}).get("Top", 0.0)
+        pairs.append({"key": key_text, "value": value_text, "page": page, "top": top})
+
+    if dropped:
+        log.info("  Dropped %d low-confidence/implausible form key-value pair(s)", dropped)
+    return pairs
+
+
+def group_forms_by_page(kv_pairs: list[dict]) -> dict[int, dict]:
+    """One form element per page that has key-value pairs, pairs sorted top-to-bottom."""
+    by_page: dict[int, list[dict]] = {}
+    for pair in kv_pairs:
+        by_page.setdefault(pair["page"], []).append(pair)
+
+    forms = {}
+    for page, pairs in by_page.items():
+        pairs_sorted = sorted(pairs, key=lambda x: x["top"])
+        forms[page] = {
+            "page": page,
+            "key_values": [{"key": p["key"], "value": p["value"]} for p in pairs_sorted],
+        }
+    return forms
+
+
+def build_elements(blocks: list[dict], doc_id: str) -> list[dict]:
+    """
+    Walks the reading order and produces one flat, sequential list of
+    typed elements: {index, type, page, ...type-specific content}.
+    Contiguous paragraph blocks are merged; each table becomes its own
+    element with three representations (markdown / linearized / raw rows).
+
+    Forms: Textract's KEY_VALUE_SET blocks aren't part of the LAYOUT
+    relationship tree Textract returns, so they can't be interleaved into
+    the reading order by the same walk. Approximation used here (fast,
+    deliberately not pixel-exact): one form element per page, placed
+    immediately after that page's other elements, right before the next
+    page's content begins. Good enough for these single-form-per-page
+    documents; a precise position-in-page merge is a fast-follow if a
+    document ever mixes forms and paragraphs within the same page in a way
+    that matters.
+    """
+    block_index = index_blocks(blocks)
+    reading_order = build_reading_order(blocks)
+
+    forms_by_page: dict[int, dict] = {}
+    if ENABLE_FORMS:
+        kv_pairs = extract_key_value_pairs(blocks, block_index)
+        forms_by_page = group_forms_by_page(kv_pairs)
+
+    elements: list[dict] = []
+    text_buffer: list[str] = []
+    text_buffer_page: Optional[int] = None
+    current_page: Optional[int] = None
+    forms_appended: set[int] = set()
+
+    def flush_paragraph():
+        nonlocal text_buffer, text_buffer_page
+        if text_buffer:
+            elements.append({
+                "index": len(elements),
+                "type": "paragraph",
+                "page": text_buffer_page,
+                "text": "\n".join(text_buffer),
+            })
+        text_buffer = []
+        text_buffer_page = None
+
+    def append_form_for_page(page: int):
+        if page in forms_by_page and page not in forms_appended:
+            elements.append({
+                "index": len(elements),
+                "type": "form",
+                "page": page,
+                "key_values": forms_by_page[page]["key_values"],
+            })
+            forms_appended.add(page)
+
+    for block in reading_order:
+        btype = block["BlockType"]
+        page = block.get("Page", 1)
+
+        if current_page is not None and page != current_page:
+            flush_paragraph()
+            append_form_for_page(current_page)
+        current_page = page
+
+        if btype in LAYOUT_TEXT_TYPES:
+            txt = layout_block_text(block, block_index)
+            if txt.strip():
+                if text_buffer_page is None:
+                    text_buffer_page = page
+                text_buffer.append(txt)
+            continue
+
+        flush_paragraph()
+
+        if btype == "LAYOUT_TABLE":
+            table_block = None
+            for cid in get_child_ids(block):
+                cand = block_index.get(cid)
+                if cand and cand["BlockType"] == "TABLE":
+                    table_block = cand
+                    break
+            if table_block is None:
+                continue
+            rows = build_table_grid(table_block, block_index)
+            elements.append({
+                "index": len(elements),
+                "type": "table",
+                "page": page,
+                "table_rows": rows,
+                "table_markdown": rows_to_markdown(rows),
+                "table_linearized_text": rows_to_linearized_text(rows),
+            })
+
+    flush_paragraph()
+    if current_page is not None:
+        append_form_for_page(current_page)
+
+    # Safety net: any page whose form wasn't reached by the loop above (e.g. a
+    # page with KEY_VALUE_SET blocks but no LAYOUT blocks at all) still gets included.
+    for page in forms_by_page:
+        if page not in forms_appended:
+            elements.append({
+                "index": len(elements),
+                "type": "form",
+                "page": page,
+                "key_values": forms_by_page[page]["key_values"],
+            })
+            forms_appended.add(page)
+
+    return elements
+
+
+# ==========================================================================
+# Output builders
+# ==========================================================================
+
+def build_json_output(doc_id: str, elements: list[dict], document_metadata: dict) -> dict:
+    return {
+        "doc_id": doc_id,
+        "document_metadata": document_metadata,
+        "element_count": len(elements),
+        "elements": elements,
+    }
+
+
+def build_markdown_output(doc_id: str, elements: list[dict]) -> str:
+    lines = [f"# {doc_id}\n"]
+    for el in elements:
+        if el["type"] == "paragraph":
+            lines.append(el["text"] + "\n")
+        elif el["type"] == "table":
+            lines.append(f"*(table, page {el['page']})*")
+            lines.append(el["table_markdown"] + "\n")
+        elif el["type"] == "form":
+            lines.append(f"*(form fields, page {el['page']})*")
+            for kv in el["key_values"]:
+                lines.append(f"- **{kv['key']}**: {kv['value']}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def build_text_output(elements: list[dict]) -> str:
+    parts = []
+    for el in elements:
+        if el["type"] == "paragraph":
+            parts.append(el["text"])
+        elif el["type"] == "table":
+            parts.append(el["table_linearized_text"])
+        elif el["type"] == "form":
+            parts.append("\n".join(f"{kv['key']}: {kv['value']}" for kv in el["key_values"]))
+    return "\n\n".join(parts)
+
+
+# ==========================================================================
+# Textract job handling (same as Stage 1)
+# ==========================================================================
+
+def list_source_documents(s3_client, bucket: str, prefix: str) -> list[str]:
+    keys = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].lower().endswith(".pdf"):
+                keys.append(obj["Key"])
+    return keys
+
+
+def doc_id_from_key(key: str) -> str:
+    filename = key.rsplit("/", 1)[-1]
+    if filename.lower().endswith(".pdf"):
+        filename = filename[:-len(".pdf")]
+    safe = "".join(c if c.isalnum() or c in ("-", "_") else "-" for c in filename)
+    return safe.strip("-") or "unnamed-doc"
+
+
+def run_textract(textract_client, bucket: str, key: str) -> tuple[list[dict], dict]:
+    response = textract_client.start_document_analysis(
+        DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
+        FeatureTypes=FEATURE_TYPES,
+    )
+    job_id = response["JobId"]
+    log.info("  Textract job started: %s", job_id)
+
+    elapsed = 0
+    status = "IN_PROGRESS"
+    while elapsed < POLL_TIMEOUT_SECONDS:
+        resp = textract_client.get_document_analysis(JobId=job_id)
+        status = resp["JobStatus"]
+        if status in ("SUCCEEDED", "FAILED", "PARTIAL_SUCCESS"):
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
+        elapsed += POLL_INTERVAL_SECONDS
+
+    if status not in ("SUCCEEDED", "PARTIAL_SUCCESS"):
+        raise RuntimeError(f"Textract job {job_id} ended with status={status} (elapsed={elapsed}s)")
+
+    blocks: list[dict] = []
+    document_metadata: dict = {}
+    next_token = None
+    while True:
+        kwargs = {"JobId": job_id}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        resp = textract_client.get_document_analysis(**kwargs)
+        if not document_metadata:
+            document_metadata = resp.get("DocumentMetadata", {})
+        blocks.extend(resp.get("Blocks", []))
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+
+    return blocks, document_metadata
+
+
+# ==========================================================================
+# Orchestration
+# ==========================================================================
+
+def _put_json(s3_client, key: str, payload) -> None:
+    s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(payload, indent=2).encode("utf-8"),
+                          ContentType="application/json")
+
+
+def _put_text(s3_client, key: str, text: str) -> None:
+    s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=text.encode("utf-8"), ContentType="text/plain")
+
+
+def process_document(s3_client, textract_client, key: str) -> None:
+    doc_id = doc_id_from_key(key)
+    log.info("Processing %s (doc_id=%s)", key, doc_id)
+
+    blocks, doc_meta = run_textract(textract_client, S3_BUCKET, key)
+    log.info("  Textract returned %d blocks across %s pages", len(blocks), doc_meta.get("Pages", "?"))
+
+    elements = build_elements(blocks, doc_id)
+    n_paragraphs = sum(1 for e in elements if e["type"] == "paragraph")
+    n_tables = sum(1 for e in elements if e["type"] == "table")
+    n_forms = sum(1 for e in elements if e["type"] == "form")
+    log.info("  Built %d elements (%d paragraphs, %d tables, %d forms) in sequential order",
+              len(elements), n_paragraphs, n_tables, n_forms)
+
+    json_payload = build_json_output(doc_id, elements, doc_meta)
+    md_payload = build_markdown_output(doc_id, elements)
+    txt_payload = build_text_output(elements)
+
+    _put_json(s3_client, f"{OUTPUT_JSON_PREFIX}/{doc_id}/{doc_id}.json", json_payload)
+    _put_text(s3_client, f"{OUTPUT_MD_PREFIX}/{doc_id}/{doc_id}.md", md_payload)
+    _put_text(s3_client, f"{OUTPUT_TEXT_PREFIX}/{doc_id}/{doc_id}.txt", txt_payload)
+
+    log.info("  Saved -> json/%s.json, markdown/%s.md, text/%s.txt", doc_id, doc_id, doc_id)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--doc-id", help="Only process the source PDF matching this doc_id")
+    args = parser.parse_args()
+
+    session = boto3.Session(region_name=AWS_REGION)
+    s3_client = session.client("s3")
+    textract_client = session.client("textract")
+
+    log.info("Feature types enabled: %s", FEATURE_TYPES)
+    keys = list_source_documents(s3_client, S3_BUCKET, SOURCE_PREFIX)
+    if args.doc_id:
+        keys = [k for k in keys if doc_id_from_key(k) == args.doc_id]
+
+    if not keys:
+        log.error("No matching source PDFs found under s3://%s/%s", S3_BUCKET, SOURCE_PREFIX)
+        sys.exit(1)
+
+    log.info("Found %d document(s) to process.", len(keys))
+
+    failures = []
+    for key in keys:
+        try:
+            process_document(s3_client, textract_client, key)
+        except ClientError as e:
+            log.error("AWS error on %s: %s", key, e)
+            traceback.print_exc()
+            failures.append(key)
+        except Exception as e:
+            log.error("Unexpected error on %s: %s", key, e)
+            traceback.print_exc()
+            failures.append(key)
+
+    log.info("Done. %d succeeded, %d failed.", len(keys) - len(failures), len(failures))
+    if failures:
+        log.info("Failed documents: %s", failures)
+
+
+if __name__ == "__main__":
+    main()
+###############
+"""
+Textract -> sequential-order JSON / Markdown / TXT pipeline
+ECMC RAG Pipeline — fast-path deliverable
+
+SCOPE (deliberately trimmed for the deadline — see "deferred" list below):
+  - Runs Textract against every PDF in the source_files prefix.
+  - Builds the document's true reading order from Textract's LAYOUT blocks
+    (column-aware where a page has two clear columns).
+  - Extracts PARAGRAPHS and TABLES, in that reading order, as one flat
+    element list per document — this ordering IS the parent-child signal
+    at this stage: a table's position between two paragraphs is what ties
+    it to the surrounding narrative, without needing a separate section
+    schema yet.
+  - Writes exactly three files per document: one JSON, one Markdown, one
+    plain-text file, all in the same sequential order.
+
+DEFERRED to the follow-up pass (per your "wrap up later" instruction) —
+  intentionally left out here to reduce failure surface before the deadline:
+  - Nova/Bedrock calls of any kind (table summaries, figure captions)
+  - Figure/image extraction (needs PyMuPDF page rendering — extra dependency,
+    extra failure surface)
+  - FORMS key-value pairs and SIGNATURES (kept OFF the Textract FeatureTypes
+    list for this pass — flip ENABLE_FORMS/ENABLE_SIGNATURES below once this
+    baseline is confirmed working)
+  - Multi-page table stitching (a table split across pages will show up as
+    separate table elements in sequence for now — still readable, not fatal)
+  - Separate parent_chunks/child_chunks/chunk_metadata split — this pass
+    produces one combined ordered element list per document instead
+
+This script is defensive on purpose: each document is wrapped in its own
+try/except so one bad document doesn't stop the batch, and the FULL
+traceback is printed to stdout for any failure — in a locked-down
+environment where you can't copy/paste, that means you can read the error
+directly off the terminal and just look at the class name + message
+without needing to export the whole thing.
+
+Config
+------
+All settings now live in config.py (which loads AWS_REGION / S3_BUCKET
+from .env) — see config.py and .env.example alongside this script.
+
+Usage
+-----
+    cp .env.example .env          # fill in / confirm AWS_REGION and S3_BUCKET
+    pip install boto3 python-dotenv
+    python textract_sequential_pipeline.py
+    python textract_sequential_pipeline.py --doc-id website_nod   # single document
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import time
+import traceback
+from typing import Any, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+from config import (
+    AWS_REGION,
+    S3_BUCKET,
+    SOURCE_PREFIX,
+    OUTPUT_JSON_PREFIX,
+    OUTPUT_MD_PREFIX,
+    OUTPUT_TEXT_PREFIX,
+    ENABLE_FORMS,
+    FEATURE_TYPES,
+    POLL_INTERVAL_SECONDS,
+    POLL_TIMEOUT_SECONDS,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("sequential_pipeline")
+
+
+# ==========================================================================
+# Textract block helpers (reading order + paragraph/table extraction) —
+# same logic already validated in the Stage 2 script's smoke test.
+# ==========================================================================
+
+def index_blocks(blocks: list[dict]) -> dict[str, dict]:
+    return {b["Id"]: b for b in blocks}
+
+
+def get_child_ids(block: dict, rel_type: str = "CHILD") -> list[str]:
+    ids = []
+    for rel in block.get("Relationships", []) or []:
+        if rel.get("Type") == rel_type:
+            ids.extend(rel.get("Ids", []))
+    return ids
+
+
+def block_text(block: dict, block_index: dict[str, dict]) -> str:
+    words = []
+    for child_id in get_child_ids(block):
+        child = block_index.get(child_id)
+        if not child:
+            continue
+        if child["BlockType"] == "WORD":
+            words.append(child.get("Text", ""))
+        elif child["BlockType"] == "SELECTION_ELEMENT":
+            words.append("[X]" if child.get("SelectionStatus") == "SELECTED" else "[ ]")
+    return " ".join(words)
+
+
+def layout_block_text(layout_block: dict, block_index: dict[str, dict]) -> str:
+    lines = []
+    for child_id in get_child_ids(layout_block):
+        child = block_index.get(child_id)
+        if child and child["BlockType"] == "LINE":
+            lines.append(child.get("Text", ""))
+    return "\n".join(lines)
+
+
+LAYOUT_TEXT_TYPES = {"LAYOUT_TEXT", "LAYOUT_TITLE", "LAYOUT_HEADER", "LAYOUT_SECTION_HEADER",
+                     "LAYOUT_LIST", "LAYOUT_FOOTER"}
+LAYOUT_ORDERABLE_TYPES = LAYOUT_TEXT_TYPES | {"LAYOUT_TABLE"}
+
+
+def order_page_blocks(page_blocks: list[dict]) -> list[dict]:
+    """Two-column-aware sort; falls back to simple top-to-bottom otherwise."""
+    if not page_blocks:
+        return []
+
+    def top(b):
+        return b["Geometry"]["BoundingBox"]["Top"]
+
+    def left(b):
+        return b["Geometry"]["BoundingBox"]["Left"]
+
+    lefts = [left(b) for b in page_blocks]
+    left_cluster = [l for l in lefts if l < 0.5]
+    right_cluster = [l for l in lefts if l >= 0.5]
+    is_two_column = len(page_blocks) >= 4 and len(left_cluster) >= 2 and len(right_cluster) >= 2
+
+    if is_two_column:
+        col1 = sorted([b for b in page_blocks if left(b) < 0.5], key=top)
+        col2 = sorted([b for b in page_blocks if left(b) >= 0.5], key=top)
+        return col1 + col2
+
+    return sorted(page_blocks, key=lambda b: (round(top(b), 2), left(b)))
+
+
+def build_reading_order(blocks: list[dict]) -> list[dict]:
+    layout_blocks = [b for b in blocks if b["BlockType"] in LAYOUT_ORDERABLE_TYPES]
+    by_page: dict[int, list[dict]] = {}
+    for b in layout_blocks:
+        by_page.setdefault(b.get("Page", 1), []).append(b)
+
+    ordered = []
+    for page in sorted(by_page.keys()):
+        ordered.extend(order_page_blocks(by_page[page]))
+    return ordered
+
+
+def rows_to_markdown(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    header, *body = rows
+    lines = ["| " + " | ".join(header) + " |",
+             "| " + " | ".join(["---"] * len(header)) + " |"]
+    for r in body:
+        lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines)
+
+
+def rows_to_linearized_text(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    header, *body = rows
+    lines = []
+    for r in body:
+        pairs = [f"{h}: {v}" for h, v in zip(header, r) if v]
+        lines.append(" | ".join(pairs))
+    return "\n".join(lines)
+
+
+def build_table_grid(table_block: dict, block_index: dict[str, dict]) -> list[list[str]]:
+    cell_ids = get_child_ids(table_block)
+    cells = [block_index[cid] for cid in cell_ids
+             if block_index.get(cid, {}).get("BlockType") in ("CELL", "MERGED_CELL")]
+    if not cells:
+        return [[""]]
+
+    max_row = max(c["RowIndex"] + c.get("RowSpan", 1) - 1 for c in cells)
+    max_col = max(c["ColumnIndex"] + c.get("ColumnSpan", 1) - 1 for c in cells)
+    grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+    for c in cells:
+        text = block_text(c, block_index)
+        r0, c0 = c["RowIndex"] - 1, c["ColumnIndex"] - 1
+        if 0 <= r0 < max_row and 0 <= c0 < max_col:
+            grid[r0][c0] = text
+    return grid
+
+
 def extract_key_value_pairs(blocks: list[dict], block_index: dict[str, dict]) -> list[dict]:
     """
     Pulls every KEY_VALUE_SET KEY block, resolves its linked VALUE block via
