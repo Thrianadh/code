@@ -1,54 +1,34 @@
 """
-Chunks the Textract JSON output (written by textract_sequential_pipeline.py)
-into retrieval-ready chunks for embedding.
+Embeds chunks (written by chunking_pipeline.py) with Bedrock Titan Text
+Embeddings V2, and builds a single FAISS index across all documents.
 
-Separate pipeline, by design: it does not call Textract or Bedrock at all.
-It reads {doc_id}.json from S3 and writes {doc_id}_chunks.json back to S3.
-Run it any time after textract_sequential_pipeline.py, independently.
+Separate pipeline, by design: it doesn't call Textract and doesn't do any
+chunking. It reads every {doc_id}_chunks.json under CHUNKS_PREFIX, embeds
+each chunk's "text" field one at a time via Bedrock's invoke_model (Titan
+embeddings has no batch endpoint), and writes two files to S3:
 
-Chunker: a custom, deterministic, character-count-based splitter. No
-embedding-based ("semantic") splitting, no third-party chunking library —
-plain rule-based logic, on purpose, consistent with the earlier decision
-to keep this pipeline free of heuristic/model-based judgement calls:
+    - faiss.index          -> the FAISS vector index (IndexFlatIP). Titan
+                               is asked to return a pre-normalized vector
+                               (normalize=True in the request), so plain
+                               inner product on the raw output is already
+                               cosine similarity -- no extra normalization
+                               step written here.
+    - chunk_metadata.json  -> ordered list of {chunk_id, doc_id, source,
+                               page, element_type, text}, positionally
+                               aligned with the FAISS index. FAISS's
+                               IndexFlatIP only stores vectors, not
+                               metadata, so row i of this list is the
+                               chunk for vector i in the index.
 
-    - Each table       -> exactly one chunk, never split, regardless of size.
-    - Key-value pairs   -> one chunk per page (if the page has any),
-                           combined, since forms are supplementary here.
-    - Body text (lines) -> per page, if the page's text already fits under
-                           CHUNK_CHAR_SIZE it becomes a single chunk (this
-                           is "whole page as parent," matching the earlier
-                           call that these documents are too short to need
-                           section-level splitting). If it's longer, it's
-                           split on blank-line paragraph boundaries and
-                           packed greedily up to CHUNK_CHAR_SIZE, carrying
-                           CHUNK_CHAR_OVERLAP characters into the next chunk.
-
-Sizing is by character count, not token count: Titan has no public offline
-tokenizer to count against, so character count is used as a plain,
-deterministic proxy (~4 characters per token) rather than pulling in a
-tokenizer built for a different model family.
-
-Every chunk this script emits is built to satisfy one fixed shape, worked
-out backwards from the target generation-time citation:
-
-    {
-      "answer": "...",
-      "citation": {"chunk_id": "...", "source": "...", "excerpt": "..."}
-    }
-
-  chunk_id -> f"{doc_id}_chunk_{i:03d}"   assigned here, sequential per doc
-  source   -> f"{doc_id}.pdf"             assigned here
-  excerpt  -> chunk["text"][:200]         NOT stored here — derived at
-                                           generation time from the chunk's
-                                           own text, so it isn't duplicated
-                                           in storage
+One combined index across all documents, not one per document: retrieval
+needs to search the whole ECMC document set at once.
 
 Install:
-    pip install boto3 python-dotenv
+    pip install boto3 python-dotenv faiss-cpu numpy
 
 Usage:
-    python chunking_pipeline.py
-    python chunking_pipeline.py --doc-id website_nod
+    python embedding_pipeline.py
+    python embedding_pipeline.py --doc-id website_nod   # index only this doc's chunks (for quick testing -- the resulting index will only cover that one doc)
 """
 
 import argparse
@@ -57,34 +37,37 @@ import logging
 import sys
 
 import boto3
+import numpy as np
+import faiss
 
 from config import (
     AWS_REGION,
     S3_BUCKET,
-    OUTPUT_JSON_PREFIX,
     CHUNKS_PREFIX,
-    CHUNK_CHAR_SIZE,
-    CHUNK_CHAR_OVERLAP,
+    VECTOR_INDEX_PREFIX,
+    EMBEDDING_MODEL_ID,
+    EMBEDDING_DIMENSIONS,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
 
-def list_source_json_keys(s3_client, bucket, prefix):
+def list_chunk_keys(s3_client, bucket, prefix):
     keys = []
     paginator = s3_client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
-            if obj["Key"].lower().endswith(".json"):
+            if obj["Key"].lower().endswith("_chunks.json"):
                 keys.append(obj["Key"])
     return keys
 
 
-def doc_id_from_json_key(key):
+def doc_id_from_chunk_key(key):
     filename = key.rsplit("/", 1)[-1]
-    if filename.lower().endswith(".json"):
-        filename = filename[:-5]
+    suffix = "_chunks.json"
+    if filename.lower().endswith(suffix):
+        filename = filename[: -len(suffix)]
     return filename
 
 
@@ -93,363 +76,116 @@ def get_json(s3_client, bucket, key):
     return json.loads(obj["Body"].read().decode("utf-8"))
 
 
+def put_bytes(s3_client, bucket, key, data):
+    s3_client.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/octet-stream")
+
+
 def put_json(s3_client, bucket, key, payload):
     s3_client.put_object(Bucket=bucket, Key=key,
                           Body=json.dumps(payload, indent=2, default=str).encode("utf-8"),
                           ContentType="application/json")
 
 
-def split_into_chunks(text, size, overlap):
-    """Greedy paragraph-packing splitter: deterministic, character-count
-    based, no tokenizer dependency, no model calls.
+def embed_text(bedrock_client, text):
+    """One chunk at a time -- Titan Text Embeddings V2 via invoke_model has
+    no batch endpoint. normalize=True asks Titan itself to return a
+    unit-length vector, so cosine similarity reduces to plain inner
+    product later -- no normalization math written in this script."""
+    body = json.dumps({
+        "inputText": text,
+        "dimensions": EMBEDDING_DIMENSIONS,
+        "normalize": True,
+    })
+    response = bedrock_client.invoke_model(
+        modelId=EMBEDDING_MODEL_ID,
+        body=body,
+        contentType="application/json",
+        accept="application/json",
+    )
+    payload = json.loads(response["body"].read())
+    return payload["embedding"]
 
-    If text already fits, returns it as a single chunk. Otherwise splits on
-    blank-line paragraph boundaries and packs paragraphs into chunks up to
-    `size` characters, carrying the last `overlap` characters of a chunk
-    into the start of the next one. A single paragraph longer than `size`
-    (rare in these short documents) is hard-split as a last resort.
-    """
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= size:
-        return [text]
 
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+def load_all_chunks(s3_client, keys):
     chunks = []
-    current = ""
+    for key in keys:
+        chunks.extend(get_json(s3_client, S3_BUCKET, key))
+    return chunks
 
-    for para in paragraphs:
-        candidate = f"{current}\n\n{para}".strip() if current else para
 
-        if len(candidate) <= size:
-            current = candidate
+def build_index(bedrock_client, chunks):
+    vectors = []
+    metadata = []
+
+    for i, chunk in enumerate(chunks):
+        text = (chunk.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            vector = embed_text(bedrock_client, text)
+        except Exception as e:
+            log.error("Embedding failed for %s: %s", chunk.get("chunk_id"), e)
             continue
 
-        if current:
-            chunks.append(current)
-            carry = current[-overlap:] if overlap else ""
-            current = f"{carry}\n\n{para}".strip() if carry else para
-            if len(current) <= size:
-                continue
-
-        # Either `current` was empty, or carry+para is still too long on
-        # its own — hard-split this paragraph by character count.
-        remainder = current if current else para
-        current = ""
-        step = max(size - overlap, 1)
-        for i in range(0, len(remainder), step):
-            piece = remainder[i:i + size]
-            if len(piece) <= size:
-                chunks.append(piece)
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
-def build_chunks(doc_id, source, doc_json):
-    """Walks the page-grouped Textract JSON and emits chunk records.
-    Chunk numbering is sequential across the whole document, in the
-    document's own page order — not per-page-restarted — so chunk_id stays
-    unique and stable.
-    """
-    chunks = []
-    seq = 0
-
-    def next_chunk_id():
-        nonlocal seq
-        chunk_id = f"{doc_id}_chunk_{seq:03d}"
-        seq += 1
-        return chunk_id
-
-    for page_entry in doc_json.get("content", []):
-        page_num = page_entry.get("page")
-
-        # Body text for this page, in reading order.
-        page_text = "\n\n".join(page_entry.get("lines", []))
-        for piece in split_into_chunks(page_text, CHUNK_CHAR_SIZE, CHUNK_CHAR_OVERLAP):
-            chunks.append({
-                "chunk_id": next_chunk_id(),
-                "doc_id": doc_id,
-                "source": source,
-                "page": page_num,
-                "element_type": "text",
-                "text": piece,
-            })
-
-        # Tables: always one chunk each, never split.
-        for table_text in page_entry.get("tables", []):
-            table_text = table_text.strip()
-            if not table_text:
-                continue
-            chunks.append({
-                "chunk_id": next_chunk_id(),
-                "doc_id": doc_id,
-                "source": source,
-                "page": page_num,
-                "element_type": "table",
-                "text": table_text,
-            })
-
-        # Form key-values: combined into one supplementary chunk per page.
-        key_values = page_entry.get("key_values", [])
-        if key_values:
-            kv_text = "\n".join(
-                f"{kv.get('key', '').strip()}: {kv.get('value', '').strip()}"
-                for kv in key_values
-                if kv.get("key") or kv.get("value")
-            )
-            if kv_text.strip():
-                chunks.append({
-                    "chunk_id": next_chunk_id(),
-                    "doc_id": doc_id,
-                    "source": source,
-                    "page": page_num,
-                    "element_type": "form_fields",
-                    "text": kv_text,
-                })
-
-    return chunks
-
-
-def process_document(s3_client, json_key):
-    doc_id = doc_id_from_json_key(json_key)
-    log.info("Chunking %s (%s)", json_key, doc_id)
-
-    doc_json = get_json(s3_client, S3_BUCKET, json_key)
-    source = f"{doc_id}.pdf"
-
-    chunks = build_chunks(doc_id, source, doc_json)
-    log.info("%s -> %d chunks", doc_id, len(chunks))
-
-    out_key = f"{CHUNKS_PREFIX}/{doc_id}/{doc_id}_chunks.json"
-    put_json(s3_client, S3_BUCKET, out_key, chunks)
-    log.info("Saved %s", out_key)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--doc-id", help="Chunk only the JSON matching this doc_id")
-    args = parser.parse_args()
-
-    session = boto3.Session(region_name=AWS_REGION)
-    s3_client = session.client("s3")
-
-    keys = list_source_json_keys(s3_client, S3_BUCKET, OUTPUT_JSON_PREFIX)
-    if args.doc_id:
-        keys = [k for k in keys if doc_id_from_json_key(k) == args.doc_id]
-
-    if not keys:
-        log.error("No Textract JSON found under s3://%s/%s", S3_BUCKET, OUTPUT_JSON_PREFIX)
-        sys.exit(1)
-
-    log.info("Found %d document(s) to chunk", len(keys))
-
-    failed = []
-    for key in keys:
-        try:
-            process_document(s3_client, key)
-        except Exception as e:
-            log.error("Failed on %s: %s", key, e)
-            failed.append(key)
-
-    log.info("Done: %d succeeded, %d failed", len(keys) - len(failed), len(failed))
-    if failed:
-        log.info("Failed documents: %s", failed)
-
-
-if __name__ == "__main__":
-    main()
-
-##############
-"""
-Extracts text, tables, and form fields from PDFs stored in S3 using AWS
-Textract, via the official amazon-textract-textractor library
-(https://github.com/aws-samples/amazon-textract-textractor). Reading order,
-table structure, and form key-value pairing are all handled by that library
-directly — this script only calls it and writes the results out.
-
-Writes, per document:
-    - {doc_id}.json  -> text-only extraction: lines, tables, and key-value
-                        pairs as plain strings, grouped by page under
-                        "content" (no bounding boxes / geometry). Page
-                        grouping exists so chunking_pipeline.py can attach
-                        a page number to every chunk.
-    - {doc_id}.md    -> document.to_markdown() — real markdown, tables as
-                        proper pipe tables, headers as # / ##
-    - {doc_id}.txt   -> document.text — plain linearized text, tables shown
-                        as plaintext columns, no markdown syntax
-
-.md and .txt come from two different Textractor linearizers, so they are
-genuinely different renderings of the same document, not the same text
-with a different extension.
-
-Install:
-    pip install amazon-textract-textractor boto3 python-dotenv
-
-Usage:
-    python textract_sequential_pipeline.py
-    python textract_sequential_pipeline.py --doc-id website_nod
-"""
-
-import argparse
-import json
-import logging
-import sys
-
-import boto3
-from textractor import Textractor
-from textractor.data.constants import TextractFeatures
-
-from config import (
-    AWS_REGION,
-    S3_BUCKET,
-    SOURCE_PREFIX,
-    OUTPUT_JSON_PREFIX,
-    OUTPUT_MD_PREFIX,
-    OUTPUT_TEXT_PREFIX,
-    FEATURE_TYPES,
-)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-FEATURE_MAP = {
-    "LAYOUT": TextractFeatures.LAYOUT,
-    "TABLES": TextractFeatures.TABLES,
-    "FORMS": TextractFeatures.FORMS,
-    "SIGNATURES": TextractFeatures.SIGNATURES,
-}
-TEXTRACT_FEATURES = [FEATURE_MAP[f] for f in FEATURE_TYPES if f in FEATURE_MAP]
-
-
-def list_source_documents(s3_client, bucket, prefix):
-    keys = []
-    paginator = s3_client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].lower().endswith(".pdf"):
-                keys.append(obj["Key"])
-    return keys
-
-
-def doc_id_from_key(key):
-    filename = key.rsplit("/", 1)[-1]
-    if filename.lower().endswith(".pdf"):
-        filename = filename[:-4]
-    safe = "".join(c if c.isalnum() or c in ("-", "_") else "-" for c in filename)
-    return safe.strip("-") or "unnamed-doc"
-
-
-def put_json(s3_client, key, payload):
-    s3_client.put_object(Bucket=S3_BUCKET, Key=key,
-                          Body=json.dumps(payload, indent=2, default=str).encode("utf-8"),
-                          ContentType="application/json")
-
-
-def put_text(s3_client, key, text):
-    s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=text.encode("utf-8"), ContentType="text/plain")
-
-
-def build_json(doc_id, document, pages):
-    """Text-only extraction — lines, tables, and key-value pairs as plain
-    strings, grouped by page. No Geometry/BoundingBox data, which is what
-    document.response (the raw Textract response) would otherwise be full of.
-
-    Grouped by page (rather than one flat list across the whole document)
-    so that downstream chunking can attach a page number to every chunk —
-    needed for citations later. Page number comes from enumerate() over
-    document.pages, not from a Page attribute, since that's guaranteed
-    correct regardless of what the library calls it internally.
-    """
-    pages_out = []
-    for page_num, page in enumerate(document.pages, start=1):
-        key_values = []
-        for kv in page.key_values:
-            key_text = " ".join(w.text for w in kv.key) if kv.key else ""
-            value_text = kv.value.text if kv.value else ""
-            key_values.append({"key": key_text, "value": value_text})
-
-        pages_out.append({
-            "page": page_num,
-            "lines": [line.text for line in page.lines],
-            "tables": [table.text for table in page.tables],
-            "key_values": key_values,
+        vectors.append(vector)
+        metadata.append({
+            "chunk_id": chunk.get("chunk_id"),
+            "doc_id": chunk.get("doc_id"),
+            "source": chunk.get("source"),
+            "page": chunk.get("page"),
+            "element_type": chunk.get("element_type"),
+            "text": text,
         })
 
-    return {
-        "doc_id": doc_id,
-        "pages": pages,
-        "content": pages_out,
-    }
+        if (i + 1) % 25 == 0:
+            log.info("Embedded %d/%d chunks", i + 1, len(chunks))
 
+    if not vectors:
+        return None, []
 
-def process_document(s3_client, extractor, key):
-    doc_id = doc_id_from_key(key)
-    log.info("Processing %s (%s)", key, doc_id)
-
-    document = extractor.start_document_analysis(
-        file_source=f"s3://{S3_BUCKET}/{key}",
-        features=TEXTRACT_FEATURES,
-        save_image=False,
-    )
-
-    # start_document_analysis returns a LazyDocument. Accessing any property
-    # below triggers Textractor to poll the async Textract job and block
-    # until it completes — no manual polling loop needed.
-    log.info("Waiting on Textract job for %s...", doc_id)
-    text = document.text
-    markdown = document.to_markdown()
-    n_tables = len(document.tables)
-    n_key_values = len(document.key_values)
-    pages = len(document.pages)
-    log.info("Textract done for %s: %s pages, %d tables, %d key-value pairs",
-             doc_id, pages, n_tables, n_key_values)
-
-    put_json(s3_client, f"{OUTPUT_JSON_PREFIX}/{doc_id}/{doc_id}.json", build_json(doc_id, document, pages))
-    put_text(s3_client, f"{OUTPUT_MD_PREFIX}/{doc_id}/{doc_id}.md", markdown)
-    put_text(s3_client, f"{OUTPUT_TEXT_PREFIX}/{doc_id}/{doc_id}.txt", text)
-
-    log.info("Saved json/md/txt for %s", doc_id)
+    matrix = np.array(vectors, dtype="float32")
+    index = faiss.IndexFlatIP(matrix.shape[1])
+    index.add(matrix)
+    return index, metadata
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--doc-id", help="Process only the source PDF matching this doc_id")
+    parser.add_argument("--doc-id", help="Only embed chunks for this doc_id")
     args = parser.parse_args()
 
     session = boto3.Session(region_name=AWS_REGION)
     s3_client = session.client("s3")
-    extractor = Textractor(region_name=AWS_REGION)
+    bedrock_client = session.client("bedrock-runtime")
 
-    keys = list_source_documents(s3_client, S3_BUCKET, SOURCE_PREFIX)
+    keys = list_chunk_keys(s3_client, S3_BUCKET, CHUNKS_PREFIX)
     if args.doc_id:
-        keys = [k for k in keys if doc_id_from_key(k) == args.doc_id]
+        keys = [k for k in keys if doc_id_from_chunk_key(k) == args.doc_id]
 
     if not keys:
-        log.error("No matching documents found under s3://%s/%s", S3_BUCKET, SOURCE_PREFIX)
+        log.error("No chunk files found under s3://%s/%s", S3_BUCKET, CHUNKS_PREFIX)
         sys.exit(1)
 
-    log.info("Found %d document(s) to process", len(keys))
+    log.info("Found %d chunk file(s)", len(keys))
+    chunks = load_all_chunks(s3_client, keys)
+    log.info("Loaded %d total chunks", len(chunks))
 
-    failed = []
-    for key in keys:
-        try:
-            process_document(s3_client, extractor, key)
-        except Exception as e:
-            log.error("Failed on %s: %s", key, e)
-            failed.append(key)
+    index, metadata = build_index(bedrock_client, chunks)
+    if index is None:
+        log.error("No chunks were successfully embedded")
+        sys.exit(1)
 
-    log.info("Done: %d succeeded, %d failed", len(keys) - len(failed), len(failed))
-    if failed:
-        log.info("Failed documents: %s", failed)
+    index_bytes = faiss.serialize_index(index).tobytes()
+    put_bytes(s3_client, S3_BUCKET, f"{VECTOR_INDEX_PREFIX}/faiss.index", index_bytes)
+    put_json(s3_client, S3_BUCKET, f"{VECTOR_INDEX_PREFIX}/chunk_metadata.json", metadata)
+
+    log.info("Done: %d chunks embedded and indexed", len(metadata))
+    log.info("Wrote %s/faiss.index and %s/chunk_metadata.json", VECTOR_INDEX_PREFIX, VECTOR_INDEX_PREFIX)
 
 
 if __name__ == "__main__":
     main()
-##############
+##################
 """
 Config for the ECMC RAG Textract pipeline.
 Loads AWS_REGION / S3_BUCKET from .env, and defines the S3 prefixes and
@@ -480,13 +216,23 @@ OUTPUT_TEXT_PREFIX = "ecmc_org/ECMC_RAG/textract_output/text"
 # --- Chunking pipeline (chunking_pipeline.py) ---------------------------
 # Reads the {doc_id}.json files written above; writes one
 # {doc_id}_chunks.json per document here.
-CHUNKS_PREFIX = "ecmc_org/ECMC_RAG/textract_output/chunks"
+CHUNKS_PREFIX = "ecmc_org/ECMC_RAG/chunks"
 
 # Character-count based sizing (not token-based — Titan has no public
 # offline tokenizer to count against, so character count is used as a
 # plain, deterministic proxy: ~4 characters per token).
 CHUNK_CHAR_SIZE = 3200      # ~800 tokens
 CHUNK_CHAR_OVERLAP = 400    # ~100 tokens carried into the next chunk
+
+# --- Embedding pipeline (embedding_pipeline.py) -------------------------
+# Reads every {doc_id}_chunks.json under CHUNKS_PREFIX, embeds each chunk
+# with Bedrock Titan, and writes one combined FAISS index (all documents
+# in a single index, since retrieval searches across the whole ECMC
+# document set, not one file at a time) plus its metadata sidecar here.
+VECTOR_INDEX_PREFIX = "ecmc_org/ECMC_RAG/vector_index"
+
+EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+EMBEDDING_DIMENSIONS = 1024   # Titan v2 supports 256 / 512 / 1024
 
 # --- Textract feature types ---------------------------------------------
 ENABLE_FORMS = True        # forms included — key-value pairs extracted as their own element
