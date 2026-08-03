@@ -1,4 +1,101 @@
 """
+Config for the ECMC RAG Textract pipeline.
+Loads AWS_REGION / S3_BUCKET from .env, and defines the S3 prefixes and
+Textract feature-type settings used by textract_sequential_pipeline.py
+(and, later, the other pipeline stages).
+"""
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env in the current working directory
+
+# --- from .env ---------------------------------------------------------
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "bankrupcy-data-bkt")
+
+# --- S3 prefixes ---------------------------------------------------------
+# NOTE: fixed a bug from the original draft — these previously had
+# "ECMC_RAG" duplicated (.../ECMC_RAG/ECMC_RAG/...). Corrected to match
+# the confirmed real path: ecmc_org/ECMC_RAG/textract_output
+SOURCE_PREFIX = "ecmc_org/ECMC_RAG/source_files"
+
+# Used by ecmc_scraper.py (a separate program, not part of the Textract/
+# chunking/embedding/retrieval/generation pipeline) for the scrape run's
+# audit-trail metadata (pdf_catalog.json per run). Kept out of
+# SOURCE_PREFIX on purpose -- SOURCE_PREFIX should contain only the .pdf
+# files textract_sequential_pipeline.py picks up, nothing else.
+SCRAPE_METADATA_PREFIX = "ecmc_org/ECMC_RAG/scrape_metadata"
+
+OUTPUT_JSON_PREFIX = "ecmc_org/ECMC_RAG/textract_output/json"
+OUTPUT_MD_PREFIX = "ecmc_org/ECMC_RAG/textract_output/markdown"
+OUTPUT_TEXT_PREFIX = "ecmc_org/ECMC_RAG/textract_output/text"
+
+# --- Chunking pipeline (chunking_pipeline.py) ---------------------------
+# Reads the {doc_id}.json files written above; writes one
+# {doc_id}_chunks.json per document here.
+CHUNKS_PREFIX = "ecmc_org/ECMC_RAG/chunks"
+
+# Character-count based sizing (not token-based — Titan has no public
+# offline tokenizer to count against, so character count is used as a
+# plain, deterministic proxy: ~4 characters per token).
+CHUNK_CHAR_SIZE = 3200      # ~800 tokens
+CHUNK_CHAR_OVERLAP = 400    # ~100 tokens carried into the next chunk
+
+# --- Embedding pipeline (embedding_pipeline.py) -------------------------
+# Reads every {doc_id}_chunks.json under CHUNKS_PREFIX, embeds each chunk
+# with Bedrock Titan, and writes one combined FAISS index (all documents
+# in a single index, since retrieval searches across the whole ECMC
+# document set, not one file at a time) plus its metadata sidecar here.
+VECTOR_INDEX_PREFIX = "ecmc_org/ECMC_RAG/vector_index"
+
+EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+EMBEDDING_DIMENSIONS = 1024   # Titan v2 supports 256 / 512 / 1024
+
+# --- Retrieval pipeline (retrieval_pipeline.py) --------------------------
+# How many candidates each of semantic search and keyword search returns,
+# independently, before Step 8 fuses them into one ranked list.
+HYBRID_CANDIDATE_K = 20
+
+# --- Reranking pipeline (reranking_pipeline.py) --------------------------
+# Reciprocal Rank Fusion constant (60 is the standard/default value used
+# in the original RRF paper and most hybrid-search implementations).
+RRF_K = 60
+# How many fused chunks get passed on to answer generation (Step 9).
+FINAL_TOP_K = 5
+
+# --- Generation pipeline (generation_pipeline.py) ------------------------
+NOVA_MODEL_ID = "amazon.nova-lite-v1:0"
+GENERATION_TEMPERATURE = 0     # deterministic/grounded, not creative
+GENERATION_MAX_TOKENS = 1024
+# How many characters of a chunk's own text become the citation "excerpt".
+# Always sliced from the chunk itself in code -- never written by the model
+# -- so the excerpt can't drift from what the source document actually says.
+EXCERPT_CHAR_LENGTH = 200
+
+# --- Eval pipeline (eval_pipeline.py) ------------------------------------
+# Where lambda_handler uploads its .xlsx output (a Lambda's local disk is
+# ephemeral /tmp, not somewhere a user can retrieve a file from -- the CLI
+# entrypoint just writes to the local filesystem instead, so this prefix is
+# only used by the Lambda path).
+EVAL_OUTPUT_PREFIX = "ecmc_org/ECMC_RAG/eval_results"
+
+# --- Textract feature types ---------------------------------------------
+ENABLE_FORMS = True        # forms included — key-value pairs extracted as their own element
+ENABLE_SIGNATURES = False  # still deferred
+
+FEATURE_TYPES = ["LAYOUT", "TABLES"]
+if ENABLE_FORMS:
+    FEATURE_TYPES.append("FORMS")
+if ENABLE_SIGNATURES:
+    FEATURE_TYPES.append("SIGNATURES")
+
+# --- Job polling ---------------------------------------------------------
+POLL_INTERVAL_SECONDS = 5
+POLL_TIMEOUT_SECONDS = 1200  # raise further if large/scanned PDFs still time out
+######
+"""
 ECMC unified scraper — v7.
 
 Changes from v6:
