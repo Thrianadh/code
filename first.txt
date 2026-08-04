@@ -14,6 +14,143 @@ Order matters: chunking reads what textract just wrote, embedding reads
 what chunking just wrote. Running out of order just means the later stage
 finds nothing to process (or works on stale files from a previous run).
 
+After ingestion, this drops into an interactive question loop: type a
+question, it's sent through generation_pipeline.lambda_handler (Steps 7-9
+-- retrieval, RRF rerank, Nova generation) exactly the way a real caller
+would invoke that Lambda, and the answer + citation are printed. Type
+"exit" or "quit" to stop.
+
+If you've already run ingestion once (embedding is done, index already
+built in S3) and only want to ask questions, comment out the three
+run_..._for_all()/run_embedding() calls in main() below so you're not
+re-running Textract/chunking/embedding every time -- they don't skip
+already-processed files on their own.
+
+eval_pipeline.py (golden-dataset accuracy grading against client-provided
+answers) is intentionally not wired into this file -- that's a separate
+step for later. Use run_all.py --run-eval when you're ready for that.
+
+Usage:
+    python main.py
+"""
+
+from aws_utils import get_s3_client, list_s3_keys
+from config import S3_BUCKET, SOURCE_PREFIX, OUTPUT_JSON_PREFIX
+
+import textract_sequential_pipeline
+import chunking_pipeline
+import embedding_pipeline
+import generation_pipeline
+
+
+def run_textract_for_all():
+    s3_client = get_s3_client()
+    keys = list_s3_keys(s3_client, S3_BUCKET, SOURCE_PREFIX, suffix=textract_sequential_pipeline.DOC_ID_SUFFIX)
+    print(f"[1/3] Textract: {len(keys)} source PDF(s) found under {SOURCE_PREFIX}")
+
+    results = []
+    for key in keys:
+        event = {"key": key}
+        try:
+            result = textract_sequential_pipeline.lambda_handler(event)
+            print(f"  OK      {key} -> {result}")
+            results.append(result)
+        except Exception as e:
+            print(f"  FAILED  {key}: {e}")
+    return results
+
+
+def run_chunking_for_all():
+    s3_client = get_s3_client()
+    keys = list_s3_keys(s3_client, S3_BUCKET, OUTPUT_JSON_PREFIX, suffix=chunking_pipeline.DOC_ID_SUFFIX)
+    print(f"[2/3] Chunking: {len(keys)} Textract JSON file(s) found under {OUTPUT_JSON_PREFIX}")
+
+    results = []
+    for json_key in keys:
+        event = {"json_key": json_key}
+        try:
+            result = chunking_pipeline.lambda_handler(event)
+            print(f"  OK      {json_key} -> {result}")
+            results.append(result)
+        except Exception as e:
+            print(f"  FAILED  {json_key}: {e}")
+    return results
+
+
+def run_embedding():
+    print("[3/3] Embedding: building the combined index over every chunk in S3")
+    event = {}
+    try:
+        result = embedding_pipeline.lambda_handler(event)
+        print(f"  OK      {result}")
+        return result
+    except Exception as e:
+        print(f"  FAILED  {e}")
+        return None
+
+
+def ask_question(question):
+    """Sends one question through generation_pipeline.lambda_handler --
+    the same event shape ({"query": ...}) a real Lambda invocation would
+    receive -- and prints the answer plus its citation. If Step 10's
+    hallucination control kicked in (no chunk supported an answer), there
+    will be no citation and the answer itself is the fixed refusal
+    message."""
+    event = {"query": question}
+    try:
+        result = generation_pipeline.lambda_handler(event)
+    except Exception as e:
+        print(f"  FAILED  {e}")
+        return None
+
+    print(f"\nAnswer: {result.get('answer')}")
+    citation = result.get("citation")
+    if citation:
+        print(f"Source: {citation['source']}")
+        print(f"Excerpt: {citation['excerpt']}")
+    else:
+        print("(no supporting chunk found)")
+    return result
+
+
+def ask_questions_loop():
+    print("\nAsk a question about the documents (type 'exit' or 'quit' to stop).")
+    while True:
+        question = input("\nQuestion: ").strip()
+        if not question:
+            continue
+        if question.lower() in ("exit", "quit"):
+            break
+        ask_question(question)
+
+
+def main():
+    run_textract_for_all()
+    run_chunking_for_all()
+    run_embedding()
+
+    ask_questions_loop()
+
+
+if __name__ == "__main__":
+    main()
+############
+"""
+Local test driver. Calls each stage's lambda_handler(event) directly, in
+order, across every document currently in S3 -- this is the "simulate
+Step Functions locally" version: each stage is invoked exactly the way
+Lambda would call it (one event dict per call), rather than reaching into
+each stage's internal functions the way run_all.py does.
+
+Needs config.py and aws_utils.py in the same folder (see the imports
+below), a .env file (same folder) with AWS_REGION and S3_BUCKET, and AWS
+credentials available through the normal boto3 chain (aws configure,
+AWS_PROFILE, or whatever profile VS Code's AWS Toolkit has set up).
+
+Order matters: chunking reads what textract just wrote, embedding reads
+what chunking just wrote. Running out of order just means the later stage
+finds nothing to process (or works on stale files from a previous run).
+
 Usage:
     python main.py
 """
