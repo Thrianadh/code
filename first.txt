@@ -1,3 +1,33 @@
+def build_chunks_from_text(doc_id, source, text):
+    """Used when CHUNK_SOURCE_FORMAT is "md" or "txt" -- both are a single
+    flat string with no page/table/form structure to walk, so this just
+    splits the whole document and tags every chunk generically. Compare to
+    build_chunks_from_json() below, which gets a page number per chunk and
+    isolates tables/form fields -- that structure genuinely isn't
+    recoverable from a flat string, so "page" is always None here and
+    "element_type" is always "text" (even chunks that happen to contain a
+    markdown table, if CHUNK_SOURCE_FORMAT == "md")."""
+    chunks = []
+    seq = 0
+
+    def next_chunk_id():
+        nonlocal seq
+        chunk_id = f"{doc_id}_chunk_{seq:03d}"
+        seq += 1
+        return chunk_id
+
+    for piece in split_into_chunks(text, CHUNK_CHAR_SIZE, CHUNK_CHAR_OVERLAP):
+        chunks.append({
+            "chunk_id": next_chunk_id(),
+            "doc_id": doc_id,
+            "source": source,
+            "page": None,
+            "element_type": "text",
+            "text": piece,
+        })
+
+    return chunks
+####################
 def process_document(s3_client, source_key):
     """source_key is an S3 key under whichever prefix CHUNK_SOURCE_FORMAT
     currently points at (OUTPUT_JSON_PREFIX / OUTPUT_MD_PREFIX /
