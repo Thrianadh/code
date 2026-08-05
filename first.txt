@@ -1,3 +1,37 @@
+def process_document(s3_client, source_key):
+    """source_key is an S3 key under whichever prefix CHUNK_SOURCE_FORMAT
+    currently points at (OUTPUT_JSON_PREFIX / OUTPUT_MD_PREFIX /
+    OUTPUT_TEXT_PREFIX) -- e.g. a {"key": ...} from
+    aws_utils.list_s3_keys(s3_client, S3_BUCKET, SOURCE_PREFIX_FOR_CHUNKING,
+    suffix=DOC_ID_SUFFIX)."""
+    doc_id = id_from_key(source_key, DOC_ID_SUFFIX)
+    log.info("Chunking %s (%s) [source format: %s]", source_key, doc_id, CHUNK_SOURCE_FORMAT)
+
+    source = f"{doc_id}.pdf"
+
+    if CHUNK_SOURCE_FORMAT == "json":
+        doc_json = read_json_from_s3(s3_client, S3_BUCKET, source_key)
+        chunks = build_chunks_from_json(doc_id, source, doc_json)
+
+    elif CHUNK_SOURCE_FORMAT == "md":
+        text = read_text_from_s3(s3_client, S3_BUCKET, source_key)
+        chunks = build_chunks_from_text(doc_id, source, text)
+
+    elif CHUNK_SOURCE_FORMAT == "txt":
+        text = read_text_from_s3(s3_client, S3_BUCKET, source_key)
+        chunks = build_chunks_from_text(doc_id, source, text)
+
+    else:
+        raise ValueError(f"Unhandled CHUNK_SOURCE_FORMAT: {CHUNK_SOURCE_FORMAT!r}")
+
+    log.info("%s -> %d chunks", doc_id, len(chunks))
+
+    out_key = f"{CHUNKS_PREFIX}/{doc_id}/{doc_id}_chunks.json"
+    write_json_to_s3(s3_client, S3_BUCKET, out_key, chunks)
+    log.info("Saved %s", out_key)
+    return {"doc_id": doc_id, "chunk_count": len(chunks), "chunks_key": out_key}
+
+#######
 SOURCE_FORMAT_SETTINGS = {
     "json": {"prefix": OUTPUT_JSON_PREFIX, "suffix": ".json"},
     "md":   {"prefix": OUTPUT_MD_PREFIX,   "suffix": ".md"},
