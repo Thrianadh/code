@@ -1,3 +1,13 @@
+SOURCE_FORMAT_SETTINGS = {
+    "json": {"prefix": OUTPUT_JSON_PREFIX, "suffix": ".json"},
+    "md":   {"prefix": OUTPUT_MD_PREFIX,   "suffix": ".md"},
+    "txt":  {"prefix": OUTPUT_TEXT_PREFIX, "suffix": ".txt"},
+}
+SOURCE_PREFIX_FOR_CHUNKING = SOURCE_FORMAT_SETTINGS[CHUNK_SOURCE_FORMAT]["prefix"]
+DOC_ID_SUFFIX = SOURCE_FORMAT_SETTINGS[CHUNK_SOURCE_FORMAT]["suffix"]
+
+
+###########
 """
 Runs the batch ingestion pipeline end to end, in one process, instead of
 invoking textract_sequential_pipeline.py, chunking_pipeline.py, and
