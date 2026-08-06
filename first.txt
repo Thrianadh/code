@@ -1,629 +1,50 @@
-def build_chunks_from_text(doc_id, source, text):
-    """Used when CHUNK_SOURCE_FORMAT is "md" or "txt" -- both are a single
-    flat string with no page/table/form structure to walk, so this just
-    splits the whole document and tags every chunk generically. Compare to
-    build_chunks_from_json() below, which gets a page number per chunk and
-    isolates tables/form fields -- that structure genuinely isn't
-    recoverable from a flat string, so "page" is always None here and
-    "element_type" is always "text" (even chunks that happen to contain a
-    markdown table, if CHUNK_SOURCE_FORMAT == "md")."""
-    chunks = []
-    seq = 0
-
-    def next_chunk_id():
-        nonlocal seq
-        chunk_id = f"{doc_id}_chunk_{seq:03d}"
-        seq += 1
-        return chunk_id
-
-    for piece in split_into_chunks(text, CHUNK_CHAR_SIZE, CHUNK_CHAR_OVERLAP):
-        chunks.append({
-            "chunk_id": next_chunk_id(),
-            "doc_id": doc_id,
-            "source": source,
-            "page": None,
-            "element_type": "text",
-            "text": piece,
-        })
-
-    return chunks
-####################
-def process_document(s3_client, source_key):
-    """source_key is an S3 key under whichever prefix CHUNK_SOURCE_FORMAT
-    currently points at (OUTPUT_JSON_PREFIX / OUTPUT_MD_PREFIX /
-    OUTPUT_TEXT_PREFIX) -- e.g. a {"key": ...} from
-    aws_utils.list_s3_keys(s3_client, S3_BUCKET, SOURCE_PREFIX_FOR_CHUNKING,
-    suffix=DOC_ID_SUFFIX)."""
-    doc_id = id_from_key(source_key, DOC_ID_SUFFIX)
-    log.info("Chunking %s (%s) [source format: %s]", source_key, doc_id, CHUNK_SOURCE_FORMAT)
-
-    source = f"{doc_id}.pdf"
-
-    if CHUNK_SOURCE_FORMAT == "json":
-        doc_json = read_json_from_s3(s3_client, S3_BUCKET, source_key)
-        chunks = build_chunks_from_json(doc_id, source, doc_json)
-
-    elif CHUNK_SOURCE_FORMAT == "md":
-        text = read_text_from_s3(s3_client, S3_BUCKET, source_key)
-        chunks = build_chunks_from_text(doc_id, source, text)
-
-    elif CHUNK_SOURCE_FORMAT == "txt":
-        text = read_text_from_s3(s3_client, S3_BUCKET, source_key)
-        chunks = build_chunks_from_text(doc_id, source, text)
-
-    else:
-        raise ValueError(f"Unhandled CHUNK_SOURCE_FORMAT: {CHUNK_SOURCE_FORMAT!r}")
-
-    log.info("%s -> %d chunks", doc_id, len(chunks))
-
-    out_key = f"{CHUNKS_PREFIX}/{doc_id}/{doc_id}_chunks.json"
-    write_json_to_s3(s3_client, S3_BUCKET, out_key, chunks)
-    log.info("Saved %s", out_key)
-    return {"doc_id": doc_id, "chunk_count": len(chunks), "chunks_key": out_key}
-
-#######
-SOURCE_FORMAT_SETTINGS = {
-    "json": {"prefix": OUTPUT_JSON_PREFIX, "suffix": ".json"},
-    "md":   {"prefix": OUTPUT_MD_PREFIX,   "suffix": ".md"},
-    "txt":  {"prefix": OUTPUT_TEXT_PREFIX, "suffix": ".txt"},
-}
-SOURCE_PREFIX_FOR_CHUNKING = SOURCE_FORMAT_SETTINGS[CHUNK_SOURCE_FORMAT]["prefix"]
-DOC_ID_SUFFIX = SOURCE_FORMAT_SETTINGS[CHUNK_SOURCE_FORMAT]["suffix"]
-
-
-###########
 """
-Runs the batch ingestion pipeline end to end, in one process, instead of
-invoking textract_sequential_pipeline.py, chunking_pipeline.py, and
-embedding_pipeline.py separately by hand:
-
-    1. Textract   -- every source PDF under SOURCE_PREFIX
-    2. Chunking   -- every Textract JSON that step 1 just produced
-    3. Embedding  -- one combined FAISS index over every chunk file that
-                     step 2 just produced
-
-Each of those three files still has its own
-    if __name__ == "__main__":
-        main()
-and can still be run on its own -- this script does not replace them, it
-just chains the same underlying functions those main()s call, in order,
-in a single process.
-
-Why not just call each file's main() one after another? Every main() is
-built on argparse, and argparse reads sys.argv -- three of them fighting
-over the same argv in one process is exactly the kind of thing that goes
-wrong quietly. So this script imports each stage's core function directly
-(process_document, run_embedding -- the same functions each stage's own
-lambda_handler calls) rather than going through main()/argparse at all.
-
-retrieval_pipeline.py, reranking_pipeline.py, and generation_pipeline.py
-are intentionally NOT part of this chain. Those three take a --query at
-call time -- there's nothing to batch-run without one, they're meant to be
-called on demand (or through eval_pipeline.py for a batch of *questions*,
-which is what --run-eval below is for).
-
-A failure on one document in Textract or chunking is logged and skipped;
-the run continues to the next document rather than stopping (matches each
-stage's own main() behavior). Embedding always runs once, over whatever
-chunks exist in S3 at that point -- it is not per-document.
-
-Usage:
-    python run_all.py                      # textract + chunking + embedding
-    python run_all.py --doc-id website_nod  # only this one document through textract + chunking (embedding still covers everything currently in S3)
-    python run_all.py --skip-textract       # e.g. Textract already ran earlier; just re-chunk + re-embed
-    python run_all.py --skip-chunking --skip-embedding   # Textract only
-    python run_all.py --run-eval            # also run eval_pipeline.py's GOLDEN_DATASET at the end and write the .xlsx
-"""
-
-import argparse
-import logging
-
-from aws_utils import get_s3_client, get_bedrock_client, get_textractor, list_s3_keys, id_from_key
-from config import S3_BUCKET, SOURCE_PREFIX, OUTPUT_JSON_PREFIX
-
-import textract_sequential_pipeline as textract_stage
-import chunking_pipeline as chunking_stage
-import embedding_pipeline as embedding_stage
-import eval_pipeline as eval_stage
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-
-def run_textract_stage(s3_client, doc_id_filter=None):
-    extractor = get_textractor()
-    keys = list_s3_keys(s3_client, S3_BUCKET, SOURCE_PREFIX, suffix=textract_stage.DOC_ID_SUFFIX)
-    if doc_id_filter:
-        keys = [k for k in keys if id_from_key(k, textract_stage.DOC_ID_SUFFIX) == doc_id_filter]
-
-    log.info("[1/3] Textract: %d document(s)", len(keys))
-    failed = []
-    for key in keys:
-        try:
-            textract_stage.process_document(s3_client, extractor, key)
-        except Exception as e:
-            log.error("Textract failed on %s: %s", key, e)
-            failed.append(key)
-    log.info("[1/3] Textract done: %d succeeded, %d failed", len(keys) - len(failed), len(failed))
-    return failed
-
-
-def run_chunking_stage(s3_client, doc_id_filter=None):
-    keys = list_s3_keys(s3_client, S3_BUCKET, OUTPUT_JSON_PREFIX, suffix=chunking_stage.DOC_ID_SUFFIX)
-    if doc_id_filter:
-        keys = [k for k in keys if id_from_key(k, chunking_stage.DOC_ID_SUFFIX) == doc_id_filter]
-
-    log.info("[2/3] Chunking: %d document(s)", len(keys))
-    failed = []
-    for key in keys:
-        try:
-            chunking_stage.process_document(s3_client, key)
-        except Exception as e:
-            log.error("Chunking failed on %s: %s", key, e)
-            failed.append(key)
-    log.info("[2/3] Chunking done: %d succeeded, %d failed", len(keys) - len(failed), len(failed))
-    return failed
-
-
-def run_embedding_stage(s3_client, bedrock_client):
-    log.info("[3/3] Embedding: building combined index")
-    try:
-        result = embedding_stage.run_embedding(s3_client, bedrock_client)
-        log.info("[3/3] Embedding done: %s", result)
-        return True
-    except RuntimeError as e:
-        log.error("Embedding failed: %s", e)
-        return False
-
-
-def run_eval_stage(bedrock_client):
-    from retrieval_pipeline import get_retriever
-
-    golden_dataset = [item for item in eval_stage.GOLDEN_DATASET if item.get("question", "").strip()]
-    if not golden_dataset:
-        log.info("[eval] Skipped: GOLDEN_DATASET list in eval_pipeline.py is empty")
-        return
-
-    log.info("[eval] Running %d question(s)", len(golden_dataset))
-    retriever = get_retriever()
-    rows = eval_stage.run_golden_eval(bedrock_client, retriever, golden_dataset)
-    eval_stage.write_xlsx(rows, "eval_results.xlsx")
-    log.info("[eval] Wrote eval_results.xlsx (%d rows)", len(rows))
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--doc-id", help="Only process this one document through Textract + chunking")
-    parser.add_argument("--skip-textract", action="store_true", help="Skip Textract (assume {doc_id}.json already exists)")
-    parser.add_argument("--skip-chunking", action="store_true", help="Skip chunking (assume chunk files already exist)")
-    parser.add_argument("--skip-embedding", action="store_true", help="Skip building the FAISS index")
-    parser.add_argument("--run-eval", action="store_true", help="Also run eval_pipeline.py's GOLDEN_DATASET at the end")
-    args = parser.parse_args()
-
-    s3_client = get_s3_client()
-    bedrock_client = get_bedrock_client()
-
-    if not args.skip_textract:
-        run_textract_stage(s3_client, doc_id_filter=args.doc_id)
-    else:
-        log.info("[1/3] Textract: skipped")
-
-    if not args.skip_chunking:
-        run_chunking_stage(s3_client, doc_id_filter=args.doc_id)
-    else:
-        log.info("[2/3] Chunking: skipped")
-
-    if not args.skip_embedding:
-        run_embedding_stage(s3_client, bedrock_client)
-    else:
-        log.info("[3/3] Embedding: skipped")
-
-    if args.run_eval:
-        run_eval_stage(bedrock_client)
-
-    log.info("run_all.py finished")
-
-
-if __name__ == "__main__":
-    main()
-
-##########
-"""
-Local test driver. Calls each stage's lambda_handler(event) directly, in
-order, across every document currently in S3 -- this is the "simulate
-Step Functions locally" version: each stage is invoked exactly the way
-Lambda would call it (one event dict per call), rather than reaching into
-each stage's internal functions the way run_all.py does.
-
-Needs config.py and aws_utils.py in the same folder (see the imports
-below), a .env file (same folder) with AWS_REGION and S3_BUCKET, and AWS
-credentials available through the normal boto3 chain (aws configure,
-AWS_PROFILE, or whatever profile VS Code's AWS Toolkit has set up).
-
-Order matters: chunking reads what textract just wrote, embedding reads
-what chunking just wrote. Running out of order just means the later stage
-finds nothing to process (or works on stale files from a previous run).
-
-After ingestion, this drops into an interactive question loop: type a
-question, it's sent through generation_pipeline.lambda_handler (Steps 7-9
--- retrieval, RRF rerank, Nova generation) exactly the way a real caller
-would invoke that Lambda, and the answer + citation are printed. Type
-"exit" or "quit" to stop.
-
-If you've already run ingestion once (embedding is done, index already
-built in S3) and only want to ask questions, comment out the three
-run_..._for_all()/run_embedding() calls in main() below so you're not
-re-running Textract/chunking/embedding every time -- they don't skip
-already-processed files on their own.
-
-eval_pipeline.py (golden-dataset accuracy grading against client-provided
-answers) is intentionally not wired into this file -- that's a separate
-step for later. Use run_all.py --run-eval when you're ready for that.
-
-Usage:
-    python main.py
-"""
-
-from aws_utils import get_s3_client, list_s3_keys
-from config import S3_BUCKET, SOURCE_PREFIX, OUTPUT_JSON_PREFIX
-
-import textract_sequential_pipeline
-import chunking_pipeline
-import embedding_pipeline
-import generation_pipeline
-
-
-def run_textract_for_all():
-    s3_client = get_s3_client()
-    keys = list_s3_keys(s3_client, S3_BUCKET, SOURCE_PREFIX, suffix=textract_sequential_pipeline.DOC_ID_SUFFIX)
-    print(f"[1/3] Textract: {len(keys)} source PDF(s) found under {SOURCE_PREFIX}")
-
-    results = []
-    for key in keys:
-        event = {"key": key}
-        try:
-            result = textract_sequential_pipeline.lambda_handler(event)
-            print(f"  OK      {key} -> {result}")
-            results.append(result)
-        except Exception as e:
-            print(f"  FAILED  {key}: {e}")
-    return results
-
-
-def run_chunking_for_all():
-    s3_client = get_s3_client()
-    keys = list_s3_keys(s3_client, S3_BUCKET, OUTPUT_JSON_PREFIX, suffix=chunking_pipeline.DOC_ID_SUFFIX)
-    print(f"[2/3] Chunking: {len(keys)} Textract JSON file(s) found under {OUTPUT_JSON_PREFIX}")
-
-    results = []
-    for json_key in keys:
-        event = {"json_key": json_key}
-        try:
-            result = chunking_pipeline.lambda_handler(event)
-            print(f"  OK      {json_key} -> {result}")
-            results.append(result)
-        except Exception as e:
-            print(f"  FAILED  {json_key}: {e}")
-    return results
-
-
-def run_embedding():
-    print("[3/3] Embedding: building the combined index over every chunk in S3")
-    event = {}
-    try:
-        result = embedding_pipeline.lambda_handler(event)
-        print(f"  OK      {result}")
-        return result
-    except Exception as e:
-        print(f"  FAILED  {e}")
-        return None
-
-
-def ask_question(question):
-    """Sends one question through generation_pipeline.lambda_handler --
-    the same event shape ({"query": ...}) a real Lambda invocation would
-    receive -- and prints the answer plus its citation. If Step 10's
-    hallucination control kicked in (no chunk supported an answer), there
-    will be no citation and the answer itself is the fixed refusal
-    message."""
-    event = {"query": question}
-    try:
-        result = generation_pipeline.lambda_handler(event)
-    except Exception as e:
-        print(f"  FAILED  {e}")
-        return None
-
-    print(f"\nAnswer: {result.get('answer')}")
-    citation = result.get("citation")
-    if citation:
-        print(f"Source: {citation['source']}")
-        print(f"Excerpt: {citation['excerpt']}")
-    else:
-        print("(no supporting chunk found)")
-    return result
-
-
-def ask_questions_loop():
-    print("\nAsk a question about the documents (type 'exit' or 'quit' to stop).")
-    while True:
-        question = input("\nQuestion: ").strip()
-        if not question:
-            continue
-        if question.lower() in ("exit", "quit"):
-            break
-        ask_question(question)
-
-
-def main():
-    run_textract_for_all()
-    run_chunking_for_all()
-    run_embedding()
-
-    ask_questions_loop()
-
-
-if __name__ == "__main__":
-    main()
-############
-"""
-Local test driver. Calls each stage's lambda_handler(event) directly, in
-order, across every document currently in S3 -- this is the "simulate
-Step Functions locally" version: each stage is invoked exactly the way
-Lambda would call it (one event dict per call), rather than reaching into
-each stage's internal functions the way run_all.py does.
-
-Needs config.py and aws_utils.py in the same folder (see the imports
-below), a .env file (same folder) with AWS_REGION and S3_BUCKET, and AWS
-credentials available through the normal boto3 chain (aws configure,
-AWS_PROFILE, or whatever profile VS Code's AWS Toolkit has set up).
-
-Order matters: chunking reads what textract just wrote, embedding reads
-what chunking just wrote. Running out of order just means the later stage
-finds nothing to process (or works on stale files from a previous run).
-
-Usage:
-    python main.py
-"""
-
-from aws_utils import get_s3_client, list_s3_keys
-from config import S3_BUCKET, SOURCE_PREFIX, OUTPUT_JSON_PREFIX
-
-import textract_sequential_pipeline
-import chunking_pipeline
-import embedding_pipeline
-import eval_pipeline
-
-
-def run_textract_for_all():
-    s3_client = get_s3_client()
-    keys = list_s3_keys(s3_client, S3_BUCKET, SOURCE_PREFIX, suffix=textract_sequential_pipeline.DOC_ID_SUFFIX)
-    print(f"[1/3] Textract: {len(keys)} source PDF(s) found under {SOURCE_PREFIX}")
-
-    results = []
-    for key in keys:
-        event = {"key": key}
-        try:
-            result = textract_sequential_pipeline.lambda_handler(event)
-            print(f"  OK      {key} -> {result}")
-            results.append(result)
-        except Exception as e:
-            print(f"  FAILED  {key}: {e}")
-    return results
-
-
-def run_chunking_for_all():
-    s3_client = get_s3_client()
-    keys = list_s3_keys(s3_client, S3_BUCKET, OUTPUT_JSON_PREFIX, suffix=chunking_pipeline.DOC_ID_SUFFIX)
-    print(f"[2/3] Chunking: {len(keys)} Textract JSON file(s) found under {OUTPUT_JSON_PREFIX}")
-
-    results = []
-    for json_key in keys:
-        event = {"json_key": json_key}
-        try:
-            result = chunking_pipeline.lambda_handler(event)
-            print(f"  OK      {json_key} -> {result}")
-            results.append(result)
-        except Exception as e:
-            print(f"  FAILED  {json_key}: {e}")
-    return results
-
-
-def run_embedding():
-    print("[3/3] Embedding: building the combined index over every chunk in S3")
-    event = {}
-    try:
-        result = embedding_pipeline.lambda_handler(event)
-        print(f"  OK      {result}")
-        return result
-    except Exception as e:
-        print(f"  FAILED  {e}")
-        return None
-
-
-def run_eval():
-    """Not called by default -- see main() below. Uses the GOLDEN_DATASET
-    list already in eval_pipeline.py, so paste your question/expected-answer
-    pairs in there first."""
-    print("[eval] Running the GOLDEN_DATASET from eval_pipeline.py")
-    event = {}
-    try:
-        result = eval_pipeline.lambda_handler(event)
-        print(f"  OK      {result}")
-        return result
-    except Exception as e:
-        print(f"  FAILED  {e}")
-        return None
-
-
-def main():
-    run_textract_for_all()
-    run_chunking_for_all()
-    run_embedding()
-
-    # Uncomment once you've pasted your question/expected-answer pairs into
-    # eval_pipeline.py's GOLDEN_DATASET list -- left off by default since
-    # lambda_handler({}) raises if that list is still empty:
-    # run_eval()
-
-
-if __name__ == "__main__":
-    main()
-############
-"""
-Microsoft Teams front door for the chatbot -- extracts the user's question
-from an incoming Teams message, calls generation_pipeline.lambda_handler
-for the actual answer (embed -> retrieve -> rerank -> Nova -> answer +
-citation, Steps 7-9), and formats a reply.
-
-IMPORTANT -- what this does and does NOT cover:
-
-This handles extracting the question and formatting a reply activity. It
-does NOT implement Bot Framework authentication or the Connector API call
-needed to actually deliver an asynchronous reply into a Teams
-conversation -- that requires the bot's Azure AD app ID/secret and a
-signed POST to the activity's serviceUrl, which depends on how your
-existing teams_bot_bky Lambda is actually wired (Azure Bot Service webhook
-configuration, whether replies are synchronous or async, etc.). That's
-infrastructure your team already has some of (the teams_bot_bky lambda in
-the GitLab repo) -- worth confirming with whoever set that up rather than
-guessing it here.
-
-What's implemented, and is correct regardless of that wiring: given one
-incoming message, produce the right reply text. That's the reusable part.
-
-Assumed input shape: a Bot Framework Activity (the standard JSON Teams/
-Azure Bot Service sends for an incoming message), either as the event
-directly, or API-Gateway-proxy-wrapped (event["body"] is that Activity as
-a JSON string) -- matching the {"statusCode", "headers", "body"} shape
-your teammate's existing teams_bot_bky/src/lambda_function.py already
-returns.
-
-Mentions: when a user @-mentions the bot in a Teams channel, the incoming
-text often includes the mention as literal <at>BotName</at> markup.
-That's stripped before the question is extracted -- otherwise "BotName"
-would get embedded/searched as if it were part of the question.
-
-Single entrypoint: lambda_handler(event, context). No CLI/argparse here on
-purpose -- for local testing, build a synthetic Activity dict and call
-lambda_handler(...) directly (see the module docstring examples in
-run_query.py / run_stage.py for the same pattern).
-
-Install:
-    pip install boto3 python-dotenv
-"""
-
-import json
-import logging
-import re
-
-from generation_pipeline import lambda_handler as generate_answer_handler
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-MENTION_PATTERN = re.compile(r"<at>.*?</at>")
-
-
-def extract_question(activity):
-    """Pulls the user's question text out of a Bot Framework Activity,
-    stripping any <at>BotName</at> mention markup Teams adds when the bot
-    is @-mentioned in a channel."""
-    text = activity.get("text", "") or ""
-    text = MENTION_PATTERN.sub("", text)
-    return text.strip()
-
-
-def format_reply_text(result):
-    """result is generation_pipeline's {"answer": ..., "citation": ...}.
-    Appends a short source line when there's a citation to point to --
-    omitted when there isn't one (Step 10's hallucination-control path),
-    since there's nothing real to cite in that case."""
-    answer = result.get("answer", "")
-    citation = result.get("citation")
-    if citation:
-        return f"{answer}\n\nSource: {citation['source']}"
-    return answer
-
-
-def build_reply_activity(incoming_activity, reply_text):
-    """Builds a minimal Bot Framework reply Activity. Bot Framework reply
-    activities are conventionally addressed back to the same conversation
-    the incoming one came from -- conversation/recipient/from are carried
-    over (swapped) from the incoming activity so a downstream adapter that
-    does handle delivery has what it needs."""
-    return {
-        "type": "message",
-        "text": reply_text,
-        "conversation": incoming_activity.get("conversation"),
-        "recipient": incoming_activity.get("from"),
-        "from": incoming_activity.get("recipient"),
-        "replyToId": incoming_activity.get("id"),
-    }
-
-
-def lambda_handler(event, context=None):
-    """event is a Bot Framework Activity, or an API-Gateway-proxy event
-    whose "body" is that Activity as a JSON string. Returns
-    {"statusCode": 200, "headers": {...}, "body": json.dumps(reply_activity)},
-    matching the existing teams_bot_bky lambda's response shape."""
-    if isinstance(event, dict) and "body" in event and isinstance(event["body"], str):
-        incoming_activity = json.loads(event["body"])
-    else:
-        incoming_activity = event
-
-    question = extract_question(incoming_activity)
-    log.info("Incoming Teams question: %r", question)
-
-    if not question:
-        reply_text = "I didn't catch a question in that message -- could you rephrase it?"
-    else:
-        result = generate_answer_handler({"query": question})
-        reply_text = format_reply_text(result)
-
-    reply_activity = build_reply_activity(incoming_activity, reply_text)
-
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({"service": "teams_bot_bky", "activity": reply_activity}),
-    }
-##############
-"""
-Extracts text, tables, and form fields from PDFs stored in S3 using AWS
-Textract, via the official amazon-textract-textractor library
-(https://github.com/aws-samples/amazon-textract-textractor). Reading order,
-table structure, and form key-value pairing are all handled by that library
-directly — this script only calls it and writes the results out.
-
-Writes, per document:
-    - {doc_id}.json  -> text-only extraction: lines, tables, and key-value
-                        pairs as plain strings, grouped by page under
-                        "content" (no bounding boxes / geometry). Page
-                        grouping exists so chunking_pipeline.py can attach
-                        a page number to every chunk.
-    - {doc_id}.md    -> document.to_markdown() — real markdown, tables as
-                        proper pipe tables, headers as # / ##
-    - {doc_id}.txt   -> document.text — plain linearized text, tables shown
-                        as plaintext columns, no markdown syntax
-
-.md and .txt come from two different Textractor linearizers, so they are
-genuinely different renderings of the same document, not the same text
-with a different extension.
+v2 -- Extracts text, tables, form fields, AND layout structure (title /
+section header context) from PDFs stored in S3 using AWS Textract, via the
+amazon-textract-textractor library.
+
+This is the v1 file (textract_sequential_pipeline.py) with exactly one
+change: build_json() now also walks each page's LAYOUT_TITLE /
+LAYOUT_SECTION_HEADER / LAYOUT_TEXT blocks, in true reading order, so every
+paragraph of body text is tagged with the title/section header it actually
+falls under. v1 was already requesting TextractFeatures.LAYOUT (see
+FEATURE_TYPES in config.py) -- Textract was already detecting this
+structure, v1's build_json() just never captured it. Everything else
+(process_document, lambda_handler, table/key-value extraction) is
+unchanged from v1.
+
+Why this matters: per AWS's own benchmark of the LAYOUT feature
+(https://aws.amazon.com/blogs/machine-learning/amazon-textracts-new-layout-feature-introduces-efficiencies-in-general-purpose-and-generative-ai-document-processing-tasks/),
+giving an LLM layout-aware, heading-tagged text instead of plain
+page-linearized text improved their in-context Q&A precision by ~50% on
+average (ROUGE) and produced measurable accuracy gains on entity
+extraction (ANLS) across two academic datasets. This file is step one of
+applying that: capturing the heading structure. chunking_pipeline.py (v2)
+is step two: actually prepending that heading to each chunk.
+
+Verified against the installed amazon-textract-textractor==1.9.2 source
+(not just the AWS blog's example) -- textractor.entities.page.Page.layouts
+returns an EntityList[Layout] of every LAYOUT_* block on the page;
+textractor.entities.layout.Layout exposes .reading_order (int) and .text;
+textractor.entities.page_layout.PageLayout is the alternative
+type-filtered accessor (page.page_layout.titles, .section_headers, etc.)
+used in AWS's own sample notebook, but page.layouts + manual sorting by
+reading_order is used here instead so title/section-header blocks can be
+correlated with the LAYOUT_TEXT blocks that follow them in one single pass
+-- PageLayout's per-type lists don't preserve that ordering relationship
+across types.
+
+Writes, per document (same three files as v1, JSON content section has
+one new field per page -- see build_json() below):
+    - {doc_id}.json  -> text-only extraction: lines, tables, key-value
+                        pairs, AND (new) text_blocks -- grouped by page.
+    - {doc_id}.md    -> document.to_markdown() -- unchanged from v1.
+    - {doc_id}.txt   -> document.text -- unchanged from v1.
 
 Single entrypoint: lambda_handler(event, context). Expects event =
 {"key": "<s3 key of one source pdf>"} -- one invocation processes one
-document. A Step Functions Map state can iterate the list from
-aws_utils.list_s3_keys(...) and invoke this once per key. (If triggered
-directly off an S3 upload event instead, adapt the raw S3 event's
-Records[0].s3.object.key into this same {"key": ...} shape before calling
-process_document -- not done here since the actual trigger wiring depends
-on how you set up the Lambda.)
-
-No CLI/argparse here on purpose -- this is a Lambda function, invoked with
-an event dict, not a script invoked with flags. For local/manual testing,
-call process_document(...) directly (see run_all.py, which does exactly
-that for a local batch run across every source PDF), or invoke
-lambda_handler({"key": "..."}) from a REPL/test.
+document. See v1's module docstring for the Step Functions Map / S3
+trigger notes -- unchanged here.
 
 Install:
     pip install amazon-textract-textractor boto3 python-dotenv
@@ -655,17 +76,68 @@ TEXTRACT_FEATURES = [FEATURE_MAP[f] for f in FEATURE_TYPES if f in FEATURE_MAP]
 
 DOC_ID_SUFFIX = ".pdf"
 
+# LAYOUT block types that update the "current heading" state as we walk a
+# page in reading order, rather than becoming a chunk-worthy text_block
+# themselves.
+TITLE_LAYOUT_TYPE = "LAYOUT_TITLE"
+SECTION_HEADER_LAYOUT_TYPE = "LAYOUT_SECTION_HEADER"
+TEXT_LAYOUT_TYPE = "LAYOUT_TEXT"
+
+
+def extract_text_blocks(page):
+    """Walks every LAYOUT_* block on this page in true reading order
+    (page.layouts, sorted by .reading_order -- NOT pre-sorted by the
+    library, confirmed against the installed textractor source) and
+    returns a list of {"title", "section_header", "text"} dicts, one per
+    LAYOUT_TEXT block, carrying whichever title/section header most
+    recently preceded it on the page.
+
+    Tables, key-values, and lists are intentionally NOT handled here --
+    they keep using the dedicated Table/KeyValue extraction in build_json()
+    below, which is more reliable than a LAYOUT_TABLE/LAYOUT_KEY_VALUE
+    block's own generic text linearization. LAYOUT_HEADER / LAYOUT_FOOTER /
+    LAYOUT_PAGE_NUMBER / LAYOUT_FIGURE are page furniture, not content --
+    skipped entirely, matching v1's behavior of never chunking these.
+    """
+    current_title = None
+    current_section_header = None
+    text_blocks = []
+
+    for layout_block in sorted(page.layouts, key=lambda b: b.reading_order):
+        block_text = (layout_block.text or "").strip()
+        if not block_text:
+            continue
+
+        if layout_block.layout_type == TITLE_LAYOUT_TYPE:
+            current_title = block_text
+        elif layout_block.layout_type == SECTION_HEADER_LAYOUT_TYPE:
+            current_section_header = block_text
+        elif layout_block.layout_type == TEXT_LAYOUT_TYPE:
+            text_blocks.append({
+                "title": current_title,
+                "section_header": current_section_header,
+                "text": block_text,
+            })
+
+    return text_blocks
+
 
 def build_json(doc_id, document, pages):
-    """Text-only extraction — lines, tables, and key-value pairs as plain
-    strings, grouped by page. No Geometry/BoundingBox data, which is what
-    document.response (the raw Textract response) would otherwise be full of.
+    """Text-only extraction — lines, tables, key-value pairs, and (new)
+    title/section-header-tagged text_blocks, grouped by page. No Geometry/
+    BoundingBox data, which is what document.response (the raw Textract
+    response) would otherwise be full of.
 
     Grouped by page (rather than one flat list across the whole document)
     so that downstream chunking can attach a page number to every chunk —
     needed for citations later. Page number comes from enumerate() over
     document.pages, not from a Page attribute, since that's guaranteed
     correct regardless of what the library calls it internally.
+
+    "lines"/"tables"/"key_values" are unchanged from v1, kept for backward
+    compatibility with v1's chunker if ever needed for comparison.
+    "text_blocks" is new -- this is what chunking_pipeline.py (v2) reads
+    from to prepend heading context to each chunk.
     """
     pages_out = []
     for page_num, page in enumerate(document.pages, start=1):
@@ -680,6 +152,7 @@ def build_json(doc_id, document, pages):
             "lines": [line.text for line in page.lines],
             "tables": [table.text for table in page.tables],
             "key_values": key_values,
+            "text_blocks": extract_text_blocks(page),
         })
 
     return {
@@ -729,1004 +202,149 @@ def lambda_handler(event, context=None):
     extractor = get_textractor()
     result = process_document(s3_client, extractor, key)
     return {"status": "ok", **result}
-##################
-#chunking
+#####################
 """
-Chunks the Textract JSON output (written by textract_sequential_pipeline.py)
-into retrieval-ready chunks for embedding.
+Config for the ECMC RAG pipeline -- v2 (layout-aware chunking rebuild).
 
-Separate pipeline, by design: it does not call Textract or Bedrock at all.
-It reads {doc_id}.json from S3 and writes {doc_id}_chunks.json back to S3.
-Run it any time after textract_sequential_pipeline.py, independently.
+This is a starting point for your isolated v2 project folder. Copy this
+file in as `config.py` there (alongside your own aws_utils.py, .env, and
+venv) -- every other pipeline file imports `from config import ...`, so as
+long as this file is named config.py in that folder, nothing else needs
+to change to pick it up.
 
-Chunker: a custom, deterministic, character-count-based splitter. No
-embedding-based ("semantic") splitting, no third-party chunking library —
-plain rule-based logic, on purpose, consistent with the earlier decision
-to keep this pipeline free of heuristic/model-based judgement calls:
+Isolation from v1: every S3 prefix below is rooted under
+"ecmc_org/ECMC_RAG_v2/" instead of "ecmc_org/ECMC_RAG/" -- same bucket,
+completely separate keys, so nothing v2 does (including a bad Textract/
+chunking run) can touch or overwrite v1's data. v1's config.py, S3 data,
+and results stay exactly as the client already saw them.
 
-    - Each table       -> exactly one chunk, never split, regardless of size.
-    - Key-value pairs   -> one chunk per page (if the page has any),
-                           combined, since forms are supplementary here.
-    - Body text (lines) -> per page, if the page's text already fits under
-                           CHUNK_CHAR_SIZE it becomes a single chunk (this
-                           is "whole page as parent," matching the earlier
-                           call that these documents are too short to need
-                           section-level splitting). If it's longer, it's
-                           split on blank-line paragraph boundaries and
-                           packed greedily up to CHUNK_CHAR_SIZE, carrying
-                           CHUNK_CHAR_OVERLAP characters into the next chunk.
-
-Sizing is by character count, not token count: Titan has no public offline
-tokenizer to count against, so character count is used as a plain,
-deterministic proxy (~4 characters per token) rather than pulling in a
-tokenizer built for a different model family.
-
-Every chunk this script emits is built to satisfy one fixed shape, worked
-out backwards from the target generation-time citation:
-
-    {
-      "answer": "...",
-      "citation": {"chunk_id": "...", "source": "...", "excerpt": "..."}
-    }
-
-  chunk_id -> f"{doc_id}_chunk_{i:03d}"   assigned here, sequential per doc
-  source   -> f"{doc_id}.pdf"             assigned here
-  excerpt  -> chunk["text"][:200]         NOT stored here — derived at
-                                           generation time from the chunk's
-                                           own text, so it isn't duplicated
-                                           in storage
-
-Single entrypoint: lambda_handler(event, context). Expects event =
-{"json_key": "<s3 key of one {doc_id}.json>"} -- one invocation chunks one
-document. Naturally chains after textract_sequential_pipeline.py's
-lambda_handler in a Step Functions state machine: that step's returned
-doc_id can be used to build this step's json_key.
-
-No CLI/argparse here on purpose -- see run_all.py for local/manual batch
-runs across every Textract JSON file, or call process_document(...) /
-lambda_handler({"json_key": "..."}) directly for a single one.
-
-Install:
-    pip install boto3 python-dotenv
+Everything below is copied from v1's config.py as a working starting
+point (same chunk size, same RRF/retrieval settings, same feature types)
+-- these are exactly the values worth revisiting once the new
+layout-aware chunker is in place, not settings to treat as final.
 """
 
-import logging
-
-from aws_utils import get_s3_client, id_from_key, read_json_from_s3, write_json_to_s3
-from config import (
-    S3_BUCKET,
-    CHUNKS_PREFIX,
-    CHUNK_CHAR_SIZE,
-    CHUNK_CHAR_OVERLAP,
-)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-DOC_ID_SUFFIX = ".json"
-
-
-def split_into_chunks(text, size, overlap):
-    """Greedy paragraph-packing splitter: deterministic, character-count
-    based, no tokenizer dependency, no model calls.
-
-    If text already fits, returns it as a single chunk. Otherwise splits on
-    blank-line paragraph boundaries and packs paragraphs into chunks up to
-    `size` characters, carrying the last `overlap` characters of a chunk
-    into the start of the next one. A single paragraph longer than `size`
-    (rare in these short documents) is hard-split as a last resort.
-    """
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= size:
-        return [text]
-
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks = []
-    current = ""
-
-    for para in paragraphs:
-        candidate = f"{current}\n\n{para}".strip() if current else para
-
-        if len(candidate) <= size:
-            current = candidate
-            continue
-
-        if current:
-            chunks.append(current)
-            carry = current[-overlap:] if overlap else ""
-            current = f"{carry}\n\n{para}".strip() if carry else para
-            if len(current) <= size:
-                continue
-
-        # Either `current` was empty, or carry+para is still too long on
-        # its own — hard-split this paragraph by character count.
-        remainder = current if current else para
-        current = ""
-        step = max(size - overlap, 1)
-        for i in range(0, len(remainder), step):
-            piece = remainder[i:i + size]
-            if len(piece) <= size:
-                chunks.append(piece)
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
-def build_chunks(doc_id, source, doc_json):
-    """Walks the page-grouped Textract JSON and emits chunk records.
-    Chunk numbering is sequential across the whole document, in the
-    document's own page order — not per-page-restarted — so chunk_id stays
-    unique and stable.
-    """
-    chunks = []
-    seq = 0
-
-    def next_chunk_id():
-        nonlocal seq
-        chunk_id = f"{doc_id}_chunk_{seq:03d}"
-        seq += 1
-        return chunk_id
-
-    for page_entry in doc_json.get("content", []):
-        page_num = page_entry.get("page")
-
-        # Body text for this page, in reading order.
-        page_text = "\n\n".join(page_entry.get("lines", []))
-        for piece in split_into_chunks(page_text, CHUNK_CHAR_SIZE, CHUNK_CHAR_OVERLAP):
-            chunks.append({
-                "chunk_id": next_chunk_id(),
-                "doc_id": doc_id,
-                "source": source,
-                "page": page_num,
-                "element_type": "text",
-                "text": piece,
-            })
-
-        # Tables: always one chunk each, never split.
-        for table_text in page_entry.get("tables", []):
-            table_text = table_text.strip()
-            if not table_text:
-                continue
-            chunks.append({
-                "chunk_id": next_chunk_id(),
-                "doc_id": doc_id,
-                "source": source,
-                "page": page_num,
-                "element_type": "table",
-                "text": table_text,
-            })
-
-        # Form key-values: combined into one supplementary chunk per page.
-        key_values = page_entry.get("key_values", [])
-        if key_values:
-            kv_text = "\n".join(
-                f"{kv.get('key', '').strip()}: {kv.get('value', '').strip()}"
-                for kv in key_values
-                if kv.get("key") or kv.get("value")
-            )
-            if kv_text.strip():
-                chunks.append({
-                    "chunk_id": next_chunk_id(),
-                    "doc_id": doc_id,
-                    "source": source,
-                    "page": page_num,
-                    "element_type": "form_fields",
-                    "text": kv_text,
-                })
-
-    return chunks
-
-
-def process_document(s3_client, json_key):
-    doc_id = id_from_key(json_key, DOC_ID_SUFFIX)
-    log.info("Chunking %s (%s)", json_key, doc_id)
-
-    doc_json = read_json_from_s3(s3_client, S3_BUCKET, json_key)
-    source = f"{doc_id}.pdf"
-
-    chunks = build_chunks(doc_id, source, doc_json)
-    log.info("%s -> %d chunks", doc_id, len(chunks))
-
-    out_key = f"{CHUNKS_PREFIX}/{doc_id}/{doc_id}_chunks.json"
-    write_json_to_s3(s3_client, S3_BUCKET, out_key, chunks)
-    log.info("Saved %s", out_key)
-    return {"doc_id": doc_id, "chunk_count": len(chunks), "chunks_key": out_key}
-
-
-def lambda_handler(event, context=None):
-    """event = {"json_key": "<s3 key of one {doc_id}.json>"}. Chunks
-    exactly that one document and returns a small JSON-serializable
-    summary -- intended to be one state in a Step Functions Map over
-    Textract JSON output."""
-    s3_client = get_s3_client()
-    result = process_document(s3_client, event["json_key"])
-    return {"status": "ok", **result}
-#############
-#embedding 
-"""
-Embeds chunks (written by chunking_pipeline.py) with Bedrock Titan Text
-Embeddings V2, and builds a single FAISS index across all documents.
-
-Separate pipeline, by design: it doesn't call Textract and doesn't do any
-chunking. It reads every {doc_id}_chunks.json under CHUNKS_PREFIX, embeds
-each chunk's "text" field one at a time via Bedrock's invoke_model (Titan
-embeddings has no batch endpoint), and writes two files to S3:
-
-    - faiss.index          -> the FAISS vector index (IndexFlatIP). Titan
-                               is asked to return a pre-normalized vector
-                               (normalize=True in the request), so plain
-                               inner product on the raw output is already
-                               cosine similarity -- no extra normalization
-                               step written here.
-    - chunk_metadata.json  -> ordered list of {chunk_id, doc_id, source,
-                               page, element_type, text}, positionally
-                               aligned with the FAISS index. FAISS's
-                               IndexFlatIP only stores vectors, not
-                               metadata, so row i of this list is the
-                               chunk for vector i in the index.
-
-One combined index across all documents, not one per document: retrieval
-needs to search the whole ECMC document set at once.
-
-Single entrypoint: lambda_handler(event, context). Optional event =
-{"doc_id": "..."} to (re-)embed just one document's chunks; omit/empty
-event rebuilds the full combined index. Note this one is heavier than the
-other stages -- it makes one Bedrock call per chunk with no batching, so a
-large corpus can run past a typical Lambda timeout. If the chunk count
-grows enough for that to matter, this is the stage most likely to move to
-a Step Functions Map (one Lambda invocation per chunk, or small batch) or
-an ECS/Docker task instead of a single Lambda call.
-
-No CLI/argparse here on purpose -- see run_all.py for a local/manual run
-of run_embedding(...) directly, or invoke lambda_handler({}) /
-lambda_handler({"doc_id": "..."}) from a REPL/test.
-
-Install:
-    pip install boto3 python-dotenv faiss-cpu numpy
-"""
-
-import json
-import logging
-
-import numpy as np
-import faiss
-
-from aws_utils import get_s3_client, get_bedrock_client, list_s3_keys, id_from_key, read_json_from_s3, write_json_to_s3, write_bytes_to_s3
-from config import (
-    S3_BUCKET,
-    CHUNKS_PREFIX,
-    VECTOR_INDEX_PREFIX,
-    EMBEDDING_MODEL_ID,
-    EMBEDDING_DIMENSIONS,
-)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-CHUNK_KEY_SUFFIX = "_chunks.json"
-
-
-def load_all_chunks(s3_client, keys):
-    chunks = []
-    for key in keys:
-        chunks.extend(read_json_from_s3(s3_client, S3_BUCKET, key))
-    return chunks
-
-
-def embed_text(bedrock_client, text):
-    """One chunk at a time -- Titan Text Embeddings V2 via invoke_model has
-    no batch endpoint. normalize=True asks Titan itself to return a
-    unit-length vector, so cosine similarity reduces to plain inner
-    product later -- no normalization math written in this script."""
-    body = json.dumps({
-        "inputText": text,
-        "dimensions": EMBEDDING_DIMENSIONS,
-        "normalize": True,
-    })
-    response = bedrock_client.invoke_model(
-        modelId=EMBEDDING_MODEL_ID,
-        body=body,
-        contentType="application/json",
-        accept="application/json",
-    )
-    payload = json.loads(response["body"].read())
-    return payload["embedding"]
-
-
-def build_index(bedrock_client, chunks):
-    vectors = []
-    metadata = []
-
-    for i, chunk in enumerate(chunks):
-        text = (chunk.get("text") or "").strip()
-        if not text:
-            continue
-        try:
-            vector = embed_text(bedrock_client, text)
-        except Exception as e:
-            log.error("Embedding failed for %s: %s", chunk.get("chunk_id"), e)
-            continue
-
-        vectors.append(vector)
-        metadata.append({
-            "chunk_id": chunk.get("chunk_id"),
-            "doc_id": chunk.get("doc_id"),
-            "source": chunk.get("source"),
-            "page": chunk.get("page"),
-            "element_type": chunk.get("element_type"),
-            "text": text,
-        })
-
-        if (i + 1) % 25 == 0:
-            log.info("Embedded %d/%d chunks", i + 1, len(chunks))
-
-    if not vectors:
-        return None, []
-
-    matrix = np.array(vectors, dtype="float32")
-    index = faiss.IndexFlatIP(matrix.shape[1])
-    index.add(matrix)
-    return index, metadata
-
-
-def run_embedding(s3_client, bedrock_client, doc_id=None):
-    """Shared by both entrypoints: loads chunk files (optionally filtered
-    to one doc_id), embeds them, builds the FAISS index, and writes both
-    output files to S3. Returns a small JSON-serializable summary."""
-    keys = list_s3_keys(s3_client, S3_BUCKET, CHUNKS_PREFIX, suffix=CHUNK_KEY_SUFFIX)
-    if doc_id:
-        keys = [k for k in keys if id_from_key(k, CHUNK_KEY_SUFFIX) == doc_id]
-
-    if not keys:
-        raise RuntimeError(f"No chunk files found under s3://{S3_BUCKET}/{CHUNKS_PREFIX}")
-
-    log.info("Found %d chunk file(s)", len(keys))
-    chunks = load_all_chunks(s3_client, keys)
-    log.info("Loaded %d total chunks", len(chunks))
-
-    index, metadata = build_index(bedrock_client, chunks)
-    if index is None:
-        raise RuntimeError("No chunks were successfully embedded")
-
-    index_bytes = faiss.serialize_index(index).tobytes()
-    write_bytes_to_s3(s3_client, S3_BUCKET, f"{VECTOR_INDEX_PREFIX}/faiss.index", index_bytes)
-    write_json_to_s3(s3_client, S3_BUCKET, f"{VECTOR_INDEX_PREFIX}/chunk_metadata.json", metadata)
-
-    log.info("Done: %d chunks embedded and indexed", len(metadata))
-    log.info("Wrote %s/faiss.index and %s/chunk_metadata.json", VECTOR_INDEX_PREFIX, VECTOR_INDEX_PREFIX)
-    return {"chunk_files": len(keys), "chunks_embedded": len(metadata)}
-
-
-def lambda_handler(event, context=None):
-    """event = {} to rebuild the full combined index, or {"doc_id": "..."}
-    to (re-)index just one document's chunks. See the module docstring for
-    why this stage may need a Step Functions Map or Docker/ECS instead of
-    a single Lambda call once the corpus grows."""
-    event = event or {}
-    s3_client = get_s3_client()
-    bedrock_client = get_bedrock_client()
-    result = run_embedding(s3_client, bedrock_client, doc_id=event.get("doc_id"))
-    return {"status": "ok", **result}
-###########
-#retrival pipelinr
-"""
-Step 7 -- hybrid retrieval over the chunks embedded in Step 6.
-
-Runs two independent searches over the same chunk set and returns both
-ranked lists, unfused:
-
-    - semantic search  -> FAISS over Titan embeddings (faiss.index)
-    - keyword search   -> BM25 (rank_bm25) over the same chunk text
-
-Fusing the two into a single ranked list is Step 8 (reranking, via
-Reciprocal Rank Fusion) -- kept as a separate step on purpose, so each
-method's own ranking is inspectable on its own before any fusion logic
-touches it.
-
-BM25 tokenization is plain lowercase + \\w+ splitting -- no stemming, no
-lemmatization, no ML -- consistent with keeping this pipeline free of
-heuristic/model-based judgement calls wherever a deterministic option
-exists.
-
-Loads the FAISS index + chunk_metadata.json once from S3 (both written by
-embedding_pipeline.py). Can be run standalone for testing, or imported as
-a module (HybridRetriever) by the reranking/generation stages that follow.
-
-For Lambda/Step Functions, use get_retriever() rather than constructing
-HybridRetriever directly -- it caches the instance at module level, so a
-warm Lambda container reuses the already-loaded index and BM25 corpus
-across invocations instead of reloading and rebuilding them from scratch
-on every call (that reload is the expensive part of this stage; the
-search itself is cheap by comparison).
-
-No CLI/argparse here on purpose -- this and the stages built on top of it
-(reranking, generation) are meant to be invoked as Lambda functions with
-an event dict, not scripts with flags. For local/manual testing, call
-lambda_handler({"query": "..."}) directly from a REPL/test.
-
-Install:
-    pip install boto3 python-dotenv faiss-cpu numpy rank-bm25
-"""
-
-import logging
-import re
-
-import numpy as np
-import faiss
-from rank_bm25 import BM25Okapi
-
-from aws_utils import get_s3_client, get_bedrock_client, read_json_from_s3, read_bytes_from_s3
-from config import (
-    S3_BUCKET,
-    VECTOR_INDEX_PREFIX,
-    HYBRID_CANDIDATE_K,
-)
-from embedding_pipeline import embed_text  # reuse the exact call used to build the index
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-TOKEN_PATTERN = re.compile(r"\w+")
-
-_retriever_cache = {}
-
-
-def tokenize(text):
-    """Plain lowercase word splitting -- deterministic, no stemming/ML."""
-    return TOKEN_PATTERN.findall(text.lower())
-
-
-class HybridRetriever:
-    """Loads the FAISS index + chunk metadata once, builds a matching BM25
-    index over the same chunks, and exposes independent semantic/keyword
-    search. Fusion happens one step later, not here."""
-
-    def __init__(self, s3_client):
-        self.s3_client = s3_client
-        self.metadata = read_json_from_s3(s3_client, S3_BUCKET, f"{VECTOR_INDEX_PREFIX}/chunk_metadata.json")
-
-        index_bytes = read_bytes_from_s3(s3_client, S3_BUCKET, f"{VECTOR_INDEX_PREFIX}/faiss.index")
-        self.index = faiss.deserialize_index(np.frombuffer(index_bytes, dtype="uint8"))
-
-        if self.index.ntotal != len(self.metadata):
-            raise ValueError(
-                f"faiss.index has {self.index.ntotal} vectors but "
-                f"chunk_metadata.json has {len(self.metadata)} entries -- "
-                "they must come from the same embedding_pipeline.py run."
-            )
-
-        tokenized_corpus = [tokenize(chunk["text"]) for chunk in self.metadata]
-        self.bm25 = BM25Okapi(tokenized_corpus)
-
-        log.info("Loaded %d chunks into HybridRetriever", len(self.metadata))
-
-    def semantic_search(self, bedrock_client, query, top_k):
-        query_vector = np.array(embed_text(bedrock_client, query), dtype="float32").reshape(1, -1)
-        scores, indices = self.index.search(query_vector, top_k)
-
-        results = []
-        for rank, (idx, score) in enumerate(zip(indices[0], scores[0]), start=1):
-            if idx == -1:
-                continue
-            chunk = dict(self.metadata[idx])
-            chunk["semantic_rank"] = rank
-            chunk["semantic_score"] = float(score)
-            results.append(chunk)
-        return results
-
-    def keyword_search(self, query, top_k):
-        tokens = tokenize(query)
-        scores = self.bm25.get_scores(tokens)
-        ranked_indices = np.argsort(scores)[::-1][:top_k]
-
-        results = []
-        for rank, idx in enumerate(ranked_indices, start=1):
-            if scores[idx] <= 0:
-                continue
-            chunk = dict(self.metadata[idx])
-            chunk["bm25_rank"] = rank
-            chunk["bm25_score"] = float(scores[idx])
-            results.append(chunk)
-        return results
-
-    def search(self, bedrock_client, query, top_k=None):
-        top_k = top_k or HYBRID_CANDIDATE_K
-        return {
-            "semantic": self.semantic_search(bedrock_client, query, top_k),
-            "keyword": self.keyword_search(query, top_k),
-        }
-
-
-def get_retriever(s3_client=None):
-    """Returns a HybridRetriever cached at module level -- built once per
-    process (i.e. once per Lambda container, across all its warm
-    invocations) instead of reloading the FAISS index and rebuilding the
-    BM25 corpus on every call. Used by this module's own CLI/lambda_handler
-    and imported by reranking_pipeline.py / generation_pipeline.py so they
-    share the same cached instance rather than each building their own."""
-    if "instance" not in _retriever_cache:
-        client = s3_client or get_s3_client()
-        _retriever_cache["instance"] = HybridRetriever(client)
-    return _retriever_cache["instance"]
-
-
-def lambda_handler(event, context=None):
-    """event = {"query": "...", "top_k": optional int}. Returns the
-    unfused semantic + keyword candidate lists. Most callers will want
-    reranking_pipeline.py's or generation_pipeline.py's handler instead --
-    this one is mainly useful for inspecting retrieval on its own."""
-    retriever = get_retriever()
-    bedrock_client = get_bedrock_client()
-    return retriever.search(bedrock_client, event["query"], event.get("top_k"))
-##########
-#reraking
-"""
-Step 8 -- reranking via Reciprocal Rank Fusion (RRF).
-
-Takes the two independent ranked lists produced by Step 7
-(HybridRetriever.search -> "semantic" and "keyword") and combines them into
-one fused ranking:
-
-    rrf_score(chunk) = sum, over each list the chunk appears in, of
-                        1 / (RRF_K + rank_in_that_list)
-
-RRF instead of a separate reranker model: there is no AWS-native
-cross-encoder reranker (unlike, say, Cohere Rerank), so combining the two
-rank lists with a fixed formula is the deterministic substitute -- no
-extra model call, no extra latency, no extra AWS service to provision.
-
-A chunk that only appears in one of the two lists (matched semantically
-but not by keyword, or vice versa) still gets a score from whichever list
-it's in -- it isn't penalized to zero for missing from the other.
-
-Used as a module by the answer-generation stage (Step 9), which needs the
-final fused top-k chunks as the context to answer from.
-
-Also usable directly as a Lambda / Step Functions step (lambda_handler,
-event = {"query": "...", "top_k": optional int}) -- uses
-retrieval_pipeline.get_retriever(), so it shares the same cached
-HybridRetriever instance across warm invocations rather than reloading it.
-
-No CLI/argparse here on purpose -- for local/manual testing, call
-lambda_handler({"query": "..."}) directly from a REPL/test.
-"""
-
-import logging
-
-from aws_utils import get_bedrock_client
-from config import RRF_K, FINAL_TOP_K, HYBRID_CANDIDATE_K
-from retrieval_pipeline import get_retriever
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-
-def reciprocal_rank_fusion(semantic_results, keyword_results, k=RRF_K, top_k=FINAL_TOP_K):
-    """Merges two ranked chunk lists into one, by chunk_id, using RRF.
-    Returns the fused list sorted by rrf_score descending, truncated to
-    top_k."""
-    fused = {}
-
-    for chunk in semantic_results:
-        chunk_id = chunk["chunk_id"]
-        entry = fused.setdefault(chunk_id, dict(chunk))
-        entry["rrf_score"] = entry.get("rrf_score", 0.0) + 1.0 / (k + chunk["semantic_rank"])
-
-    for chunk in keyword_results:
-        chunk_id = chunk["chunk_id"]
-        if chunk_id in fused:
-            fused[chunk_id]["bm25_rank"] = chunk["bm25_rank"]
-            fused[chunk_id]["bm25_score"] = chunk["bm25_score"]
-        else:
-            fused[chunk_id] = dict(chunk)
-        fused[chunk_id]["rrf_score"] = fused[chunk_id].get("rrf_score", 0.0) + 1.0 / (k + chunk["bm25_rank"])
-
-    ranked = sorted(fused.values(), key=lambda c: c["rrf_score"], reverse=True)
-    return ranked[:top_k]
-
-
-def rerank(bedrock_client, retriever, query, candidate_k=None, top_k=None):
-    """Runs Step 7's hybrid search, then fuses the two lists with RRF."""
-    candidate_k = candidate_k or HYBRID_CANDIDATE_K
-    top_k = top_k or FINAL_TOP_K
-
-    results = retriever.search(bedrock_client, query, top_k=candidate_k)
-    return reciprocal_rank_fusion(results["semantic"], results["keyword"], k=RRF_K, top_k=top_k)
-
-
-def lambda_handler(event, context=None):
-    """event = {"query": "...", "top_k": optional int}. Returns the final
-    fused top-k chunk list."""
-    bedrock_client = get_bedrock_client()
-    retriever = get_retriever()
-    return rerank(bedrock_client, retriever, event["query"], top_k=event.get("top_k"))
-########
-#generation
-"""
-Step 9 -- answer generation with Nova Lite via the Bedrock Converse API,
-using chain-of-thought reasoning, grounded in Step 8's fused chunks.
-
-Nova is asked for exactly two things: an answer, and which single chunk_id
-it drew that answer from. It is NOT asked to write the citation's "source"
-or "excerpt" -- those are looked up and sliced directly from the actual
-chunk text in code, after the model responds. This keeps the citation
-grounded to what the source document literally says: the model can only
-choose *which* chunk to point at, it cannot phrase what the chunk contains
-into the citation itself.
-
-Chain-of-thought: Nova is asked to reason step by step in a REASONING
-section first (checking which chunk(s), if any, actually support an
-answer) before committing to a FINAL_JSON line. The reasoning is logged
-for auditing but is not part of the returned answer -- only FINAL_JSON is
-parsed and returned to the caller.
-
-If no chunk supports an answer, Nova is instructed to say so explicitly
-rather than guess, the citation is left as null, AND the answer text
-itself is overridden with a fixed refusal message -- Step 10's hallucination
-control doesn't just leave a missing citation sitting next to whatever
-Nova wrote; a claim with no supporting chunk is replaced outright.
-
-Final return shape (this is the contract the whole chunking/retrieval
-design was built backwards from):
-    {
-      "answer": "...",
-      "citation": {"chunk_id": "...", "source": "...", "excerpt": "..."} | null
-    }
-
-This is the most natural stage to put behind an API Gateway + Lambda for a
-real chat-style endpoint (lambda_handler, event = {"query": "..."}) -- it
-uses retrieval_pipeline.get_retriever(), so a warm Lambda container reuses
-the cached FAISS/BM25 retriever across requests instead of rebuilding it
-per call.
-
-No CLI/argparse here on purpose -- for local/manual testing, call
-lambda_handler({"query": "..."}) directly from a REPL/test.
-"""
-
-import json
-import logging
-import re
-
-from aws_utils import get_bedrock_client
-from config import (
-    NOVA_MODEL_ID,
-    GENERATION_TEMPERATURE,
-    GENERATION_MAX_TOKENS,
-    EXCERPT_CHAR_LENGTH,
-)
-from retrieval_pipeline import get_retriever
-from reranking_pipeline import rerank
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = """You are ECMC's document assistant. Answer questions using ONLY the \
-CONTEXT chunks provided in the user message. Do not use any outside knowledge, \
-and do not guess.
-
-Respond in exactly this format, with these two labeled sections and nothing \
-else before, between, or after them:
-
-REASONING:
-Think step by step. Identify which context chunk(s), if any, are relevant to \
-the question. Check whether a relevant chunk actually answers the question, \
-or only partially. If no chunk answers the question, say so here.
-
-FINAL_JSON:
-A single-line JSON object, exactly this shape:
-{"answer": "<your answer in plain language, or a statement that the documents do not contain this information>", "chunk_id": "<the chunk_id of the ONE chunk that most directly supports your answer, or null if none do>"}
-"""
-
-FINAL_JSON_MARKER = "FINAL_JSON:"
-
-
-def build_context_block(chunks):
-    parts = []
-    for chunk in chunks:
-        parts.append(
-            f"[chunk_id: {chunk['chunk_id']} | source: {chunk['source']} | "
-            f"page: {chunk.get('page')} | type: {chunk.get('element_type')}]\n"
-            f"{chunk['text']}"
-        )
-    return "\n\n".join(parts)
-
-
-def parse_model_response(raw_text):
-    """Splits the REASONING / FINAL_JSON response, logs the reasoning, and
-    parses the JSON object out of the FINAL_JSON section."""
-    if FINAL_JSON_MARKER in raw_text:
-        reasoning_part, _, json_part = raw_text.partition(FINAL_JSON_MARKER)
-    else:
-        # Model didn't follow the format -- fall back to scanning the whole
-        # response for a JSON object rather than failing outright.
-        reasoning_part, json_part = "", raw_text
-
-    log.info("Model reasoning: %s", reasoning_part.strip().replace("REASONING:", "").strip())
-
-    match = re.search(r"\{.*\}", json_part, re.DOTALL)
-    if not match:
-        raise ValueError(f"No JSON object found in model response: {raw_text!r}")
-
-    return json.loads(match.group(0))
-
-
-def build_citation(chunk_id, chunks):
-    if not chunk_id:
-        return None
-    for chunk in chunks:
-        if chunk["chunk_id"] == chunk_id:
-            text = chunk["text"]
-            excerpt = text[:EXCERPT_CHAR_LENGTH] + ("..." if len(text) > EXCERPT_CHAR_LENGTH else "")
-            return {
-                "chunk_id": chunk["chunk_id"],
-                "source": chunk["source"],
-                "excerpt": excerpt,
-            }
-    # Model named a chunk_id that wasn't actually in the context we gave it --
-    # treat that as no citation rather than fabricating one.
-    log.error("Model returned chunk_id %r not present in the provided chunks", chunk_id)
-    return None
-
-
-def generate_answer(bedrock_client, retriever, query):
-    fused_chunks = rerank(bedrock_client, retriever, query)
-
-    if not fused_chunks:
-        return {
-            "answer": "The provided documents do not contain information to answer this question.",
-            "citation": None,
-        }
-
-    context_block = build_context_block(fused_chunks)
-    user_message = f"CONTEXT:\n{context_block}\n\nQUESTION:\n{query}"
-
-    response = bedrock_client.converse(
-        modelId=NOVA_MODEL_ID,
-        system=[{"text": SYSTEM_PROMPT}],
-        messages=[{"role": "user", "content": [{"text": user_message}]}],
-        inferenceConfig={
-            "temperature": GENERATION_TEMPERATURE,
-            "maxTokens": GENERATION_MAX_TOKENS,
-        },
-    )
-
-    raw_text = response["output"]["message"]["content"][0]["text"]
-    parsed = parse_model_response(raw_text)
-
-    answer = parsed.get("answer", "").strip()
-    citation = build_citation(parsed.get("chunk_id"), fused_chunks)
-
-    # Step 10, hallucination control: if no chunk actually backs the answer,
-    # the answer text itself is replaced -- not just left to accompany a
-    # missing citation. Nova can still have written a speculative answer
-    # even after saying chunk_id: null; an uncited claim in a bankruptcy/
-    # financial context is exactly the failure mode this pipeline exists to
-    # avoid, so it isn't passed through as-is.
-    if citation is None:
-        answer = "The provided documents do not contain information to answer this question."
-
-    return {"answer": answer, "citation": citation}
-
-
-def lambda_handler(event, context=None):
-    """event = {"query": "..."}. Returns {"answer": ..., "citation": ...}."""
-    bedrock_client = get_bedrock_client()
-    retriever = get_retriever()
-    return generate_answer(bedrock_client, retriever, event["query"])
-#################
-##eval
-"""
-Runs a fixed list of test questions through the full RAG pipeline
-(retrieval -> RRF fusion -> Nova generation, Steps 7-9) and records each
-result and its latency into an .xlsx file. This is a manual test harness
-for exactly this kind of question -- "does the pipeline answer correctly
-and cite the right chunk, and how long does it take" -- run across a
-batch, rather than one at a time via generation_pipeline.py's CLI.
-
-Single entrypoint: lambda_handler(event, context). event = {"questions":
-[...]} optional -- falls back to the QUESTIONS list below if omitted/empty
-(edit that list directly in this file for a fixed batch you re-run often).
-A Lambda's local disk is ephemeral /tmp, not something a user can open
-afterward, so this writes the .xlsx to /tmp and then uploads it to S3
-under EVAL_OUTPUT_PREFIX, returning the S3 key rather than a local path.
-
-Output: an .xlsx file with two sheets:
-    - Results  -> one row per question: question, answer, chunk_id,
-                  source, excerpt, has_citation, latency_seconds
-    - Summary  -> total questions, how many got a citation vs. were
-                  refused (Step 10's hallucination control), and
-                  average/min/max latency -- all as formulas over the
-                  Results sheet, so they recalculate if a row is edited.
-
-No CLI/argparse here on purpose -- for local/manual testing, call
-lambda_handler({"questions": [...]}) directly from a REPL/test, or run
-run_all.py --run-eval for a local batch run using the QUESTIONS list.
-
-Install:
-    pip install boto3 python-dotenv openpyxl
-"""
-
-import logging
-import time
-
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
-
-from aws_utils import get_s3_client, get_bedrock_client, write_bytes_to_s3
-from config import S3_BUCKET, EVAL_OUTPUT_PREFIX
-from retrieval_pipeline import get_retriever
-from generation_pipeline import generate_answer
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-FONT_NAME = "Arial"
-HEADER_FONT = Font(name=FONT_NAME, bold=True)
-BODY_FONT = Font(name=FONT_NAME)
-
-# Option 1: paste your questions here, one string per line, and run this
-# script with no arguments. Only used if --questions-file is not given (or
-# not found). Leave empty to require --questions-file instead.
-QUESTIONS = [
-    # "What is the deadline to respond to this notice?",
-    # "Who is the borrower listed on the authorization form?",
-]
-
-
-def run_questions(bedrock_client, retriever, questions):
-    """Calls Step 9's generate_answer() once per question, timing each call
-    individually. A failure on one question is recorded as an error row
-    and does not stop the rest of the batch."""
-    rows = []
-    for i, question in enumerate(questions, start=1):
-        log.info("[%d/%d] %s", i, len(questions), question)
-        start = time.perf_counter()
-        error = None
-        try:
-            result = generate_answer(bedrock_client, retriever, question)
-        except Exception as e:
-            log.error("Question %d failed: %s", i, e)
-            result = {"answer": None, "citation": None}
-            error = str(e)
-        elapsed = time.perf_counter() - start
-
-        citation = result.get("citation")
-        rows.append({
-            "question": question,
-            "answer": f"ERROR: {error}" if error else result.get("answer"),
-            "chunk_id": citation["chunk_id"] if citation else "",
-            "source": citation["source"] if citation else "",
-            "excerpt": citation["excerpt"] if citation else "",
-            "has_citation": "Yes" if citation else "No",
-            "latency_seconds": round(elapsed, 3),
-        })
-    return rows
-
-
-def write_xlsx(rows, output_path):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Results"
-
-    headers = ["#", "Question", "Answer", "Chunk ID", "Source", "Excerpt", "Has Citation", "Latency (s)"]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = HEADER_FONT
-
-    for i, row in enumerate(rows, start=1):
-        ws.append([
-            i, row["question"], row["answer"], row["chunk_id"],
-            row["source"], row["excerpt"], row["has_citation"], row["latency_seconds"],
-        ])
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = BODY_FONT
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-
-    widths = {"A": 4, "B": 40, "C": 45, "D": 22, "E": 20, "F": 45, "G": 12, "H": 12}
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
-
-    last_row = 1 + len(rows)
-
-    summary = wb.create_sheet("Summary")
-    summary_rows = [
-        ("Metric", "Value"),
-        ("Total questions", f"=COUNTA(Results!B2:B{last_row})"),
-        ("Answered with citation", f'=COUNTIF(Results!G2:G{last_row},"Yes")'),
-        ("Refused (no citation)", f'=COUNTIF(Results!G2:G{last_row},"No")'),
-        ("Average latency (s)", f"=AVERAGE(Results!H2:H{last_row})"),
-        ("Min latency (s)", f"=MIN(Results!H2:H{last_row})"),
-        ("Max latency (s)", f"=MAX(Results!H2:H{last_row})"),
-    ]
-    for r in summary_rows:
-        summary.append(r)
-    for cell in summary[1]:
-        cell.font = HEADER_FONT
-    for row in summary.iter_rows(min_row=2):
-        for cell in row:
-            cell.font = BODY_FONT
-    summary.column_dimensions["A"].width = 24
-    summary.column_dimensions["B"].width = 16
-
-    wb.save(output_path)
-
-
-def lambda_handler(event, context=None):
-    """event = {"questions": [...]} optional -- falls back to the
-    QUESTIONS list in this file if omitted/empty. Writes the .xlsx to
-    /tmp (the only writable path in Lambda) then uploads it to S3 under
-    EVAL_OUTPUT_PREFIX, and returns the S3 key rather than a local path."""
-    event = event or {}
-    questions = [q.strip() for q in event.get("questions", QUESTIONS) if q.strip()]
-    if not questions:
-        raise ValueError("No questions given in the event and QUESTIONS list is empty")
-
-    bedrock_client = get_bedrock_client()
-    retriever = get_retriever()
-    rows = run_questions(bedrock_client, retriever, questions)
-
-    local_path = "/tmp/eval_results.xlsx"
-    write_xlsx(rows, local_path)
-
-    with open(local_path, "rb") as f:
-        output_key = f"{EVAL_OUTPUT_PREFIX}/eval_results.xlsx"
-        write_bytes_to_s3(get_s3_client(), S3_BUCKET, output_key, f.read())
-
-    return {"status": "ok", "rows": len(rows), "output_key": output_key}
-
-##########
-"""
-Local dev convenience only -- NOT a Lambda function, and not deployed
-anywhere. Since retrieval_pipeline.py / reranking_pipeline.py /
-generation_pipeline.py dropped their CLIs (they're Lambda-only now, each
-with just a lambda_handler(event, context)), this is a thin wrapper so you
-can still test a single question from a terminal, the way you were doing
-with `python generation_pipeline.py --query "..."` before.
-
-Same category of script as run_all.py -- a local orchestration/testing
-tool, not something with a Dockerfile or a Lambda deployment of its own.
-
-Usage:
-    python run_query.py --query "what is the deadline to respond to this notice?"
-    python run_query.py --query "..." --stage retrieval   # unfused semantic+keyword candidates
-    python run_query.py --query "..." --stage rerank      # fused top-k chunks, no generation
-    python run_query.py --query "..." --stage generate    # full answer + citation (default)
-"""
-
-import argparse
-import json
-
-import generation_pipeline
-import reranking_pipeline
-import retrieval_pipeline
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--query", required=True, help="Question to run through the pipeline")
-    parser.add_argument("--stage", choices=["retrieval", "rerank", "generate"], default="generate",
-                         help="Which stage's lambda_handler to call (default: generate, the full answer+citation)")
-    parser.add_argument("--top-k", type=int, default=None)
-    args = parser.parse_args()
-
-    event = {"query": args.query}
-    if args.top_k is not None:
-        event["top_k"] = args.top_k
-
-    handlers = {
-        "retrieval": retrieval_pipeline.lambda_handler,
-        "rerank": reranking_pipeline.lambda_handler,
-        "generate": generation_pipeline.lambda_handler,
-    }
-    result = handlers[args.stage](event)
-    print(json.dumps(result, indent=2, default=str))
-
-
-if __name__ == "__main__":
-    main()
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env in the current working directory
+
+# --- from .env ---------------------------------------------------------
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "bankrupcy-data-bkt")
+
+# --- S3 prefixes ---------------------------------------------------------
+# Everything rooted under ECMC_RAG_v2 instead of ECMC_RAG -- see module
+# docstring. Structure otherwise mirrors v1 exactly.
+SOURCE_PREFIX = "ecmc_org/ECMC_RAG_v2/source_files"
+
+# Used by ecmc_scraper.py (a separate program, not part of the Textract/
+# chunking/embedding/retrieval/generation pipeline) for the scrape run's
+# audit-trail metadata (pdf_catalog.json per run). Kept out of
+# SOURCE_PREFIX on purpose -- SOURCE_PREFIX should contain only the .pdf
+# files textract_sequential_pipeline.py picks up, nothing else.
+SCRAPE_METADATA_PREFIX = "ecmc_org/ECMC_RAG_v2/scrape_metadata"
+
+OUTPUT_JSON_PREFIX = "ecmc_org/ECMC_RAG_v2/textract_output/json"
+OUTPUT_MD_PREFIX = "ecmc_org/ECMC_RAG_v2/textract_output/markdown"
+OUTPUT_TEXT_PREFIX = "ecmc_org/ECMC_RAG_v2/textract_output/text"
+
+# --- Chunking pipeline (chunking_pipeline.py) ---------------------------
+# Which Textract output format chunking reads from. Change this one line
+# to compare RAG accuracy across formats (rerun chunking + embedding +
+# eval after changing it) -- chunking_pipeline.py picks the right S3
+# prefix/suffix/parser based on this value, nothing else needs editing.
+#   "json" -> page-grouped, tables/forms isolated into their own chunks
+#             (richest structure -- current default)
+#   "md"   -> markdown; tables kept as real pipe tables inside chunk text,
+#             but no page numbers, no table/text separation
+#   "txt"  -> flat plain text, no structure at all
+# NOTE: once the layout-aware (title/section-header) chunker is built,
+# this is the value/mapping most likely to change or gain a new option
+# (e.g. a "layout" format sourced from document.get_text(config=...)
+# instead of the plain per-page JSON).
+CHUNK_SOURCE_FORMAT = "json"
+
+# Maps CHUNK_SOURCE_FORMAT -> which S3 prefix/file extension
+# chunking_pipeline.py reads from. Defined here, next to the three
+# OUTPUT_*_PREFIX values above, rather than in chunking_pipeline.py, so
+# every prefix/format mapping lives in one place.
+SOURCE_FORMAT_SETTINGS = {
+    "json": {"prefix": OUTPUT_JSON_PREFIX, "suffix": ".json"},
+    "md":   {"prefix": OUTPUT_MD_PREFIX,   "suffix": ".md"},
+    "txt":  {"prefix": OUTPUT_TEXT_PREFIX, "suffix": ".txt"},
+}
+
+# Writes one {doc_id}_chunks.json per document here, regardless of which
+# CHUNK_SOURCE_FORMAT was used to build it.
+CHUNKS_PREFIX = "ecmc_org/ECMC_RAG_v2/chunks"
+
+# Character-count based sizing (not token-based — Titan has no public
+# offline tokenizer to count against, so character count is used as a
+# plain, deterministic proxy: ~4 characters per token). Carried over from
+# v1 as a starting point -- worth A/B testing once section-header
+# prepending is in, per the AWS Textract Layout benchmark's own finding
+# that smaller, more surgical chunks can help precision.
+CHUNK_CHAR_SIZE = 3200      # ~800 tokens
+CHUNK_CHAR_OVERLAP = 400    # ~100 tokens carried into the next chunk
+
+# --- Embedding pipeline (embedding_pipeline.py) -------------------------
+# Reads every {doc_id}_chunks.json under CHUNKS_PREFIX, embeds each chunk
+# with Bedrock Titan, and writes one combined FAISS index (all documents
+# in a single index, since retrieval searches across the whole ECMC
+# document set, not one file at a time) plus its metadata sidecar here.
+VECTOR_INDEX_PREFIX = "ecmc_org/ECMC_RAG_v2/vector_index"
+
+EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+EMBEDDING_DIMENSIONS = 1024   # Titan v2 supports 256 / 512 / 1024
+
+# --- Retrieval pipeline (retrieval_pipeline.py) --------------------------
+# How many candidates each of semantic search and keyword search returns,
+# independently, before Step 8 fuses them into one ranked list.
+HYBRID_CANDIDATE_K = 20
+
+# --- Reranking pipeline (reranking_pipeline.py) --------------------------
+# Reciprocal Rank Fusion constant (60 is the standard/default value used
+# in the original RRF paper and most hybrid-search implementations, and
+# matches what the AWS layout-aware sample repo uses too).
+RRF_K = 60
+# How many fused chunks get passed on to answer generation (Step 9).
+FINAL_TOP_K = 5
+
+# --- Generation pipeline (generation_pipeline.py) ------------------------
+NOVA_MODEL_ID = "amazon.nova-lite-v1:0"
+GENERATION_TEMPERATURE = 0     # deterministic/grounded, not creative
+GENERATION_MAX_TOKENS = 1024
+# Citation's "excerpt" is the full text of the cited chunk (not a
+# truncated preview) -- see build_citation() in generation_pipeline.py.
+
+# --- Eval pipeline (eval_pipeline.py) ------------------------------------
+# Where lambda_handler uploads its .xlsx output (a Lambda's local disk is
+# ephemeral /tmp, not somewhere a user can retrieve a file from -- the CLI
+# entrypoint just writes to the local filesystem instead, so this prefix is
+# only used by the Lambda path).
+EVAL_OUTPUT_PREFIX = "ecmc_org/ECMC_RAG_v2/eval_results"
+
+# Nova-as-judge grading call (compares the pipeline's actual answer against
+# the client-provided expected answer). Shorter than generation's own
+# GENERATION_MAX_TOKENS since a verdict + one-sentence reasoning is compact.
+EVAL_JUDGE_MAX_TOKENS = 512
+
+# --- Textract feature types ---------------------------------------------
+# LAYOUT was already being requested in v1 (so Textract was already
+# detecting titles/section headers) -- v1 just never used that structure
+# in build_json(). That's the specific gap this v2 rebuild targets.
+ENABLE_FORMS = True        # forms included — key-value pairs extracted as their own element
+ENABLE_SIGNATURES = False  # still deferred
+
+FEATURE_TYPES = ["LAYOUT", "TABLES"]
+if ENABLE_FORMS:
+    FEATURE_TYPES.append("FORMS")
+if ENABLE_SIGNATURES:
+    FEATURE_TYPES.append("SIGNATURES")
+
+# --- Job polling ---------------------------------------------------------
+POLL_INTERVAL_SECONDS = 5
+POLL_TIMEOUT_SECONDS = 1200  # raise further if large/scanned PDFs still time out
+###############
