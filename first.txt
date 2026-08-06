@@ -1,3 +1,307 @@
+#chuncking
+"""
+v2 -- Chunks Textract output (written by textract_sequential_pipeline.py
+v2) into retrieval-ready chunks for embedding, now consuming the new
+"text_blocks" field (title/section-header-tagged paragraphs) that v2's
+Textract stage added.
+
+The actual fix this file makes over v1: v1's chunker built each body-text
+chunk from page["lines"] with zero heading context -- a chunk pulled out
+in isolation had no signal about what topic/section it was even from,
+which both the AWS Textract Layout team's own benchmark and the AWS
+layout-aware-RAG sample repo point to as a real accuracy cost. Here, every
+body-text chunk has its title/section header prepended directly into the
+text that gets embedded, so the chunk is self-describing even out of
+context.
+
+Tables and form key-values are UNCHANGED from v1 -- they still come from
+Textractor's dedicated Table/KeyValue extraction (page["tables"] /
+page["key_values"]), not from the LAYOUT_TABLE/LAYOUT_KEY_VALUE blocks, and
+they are NOT tagged with a heading here either, since v2's Textract stage
+deliberately didn't correlate them with which section they fall under
+(see extract_text_blocks() in textract_sequential_pipeline.py v2). That's
+a known scoping limit, not an oversight -- worth revisiting later if
+tables/forms turn out to need the same treatment.
+
+Same CHUNK_SOURCE_FORMAT toggle as v1 (json / md / txt) is kept for
+consistency with config.py, but only "json" gets the new heading-aware
+treatment -- "md"/"txt" fall back to the same flat build_chunks_from_text()
+v1 used, since text_blocks only exists in the JSON output.
+
+Single entrypoint: lambda_handler(event, context). Expects event =
+{"source_key": "<s3 key of one Textract output file>"} -- one invocation
+chunks one document, same as v1.
+
+No CLI/argparse here on purpose -- for local/manual testing, call
+process_document(...) / lambda_handler({"source_key": "..."}) directly.
+
+Install:
+    pip install boto3 python-dotenv
+"""
+
+import logging
+
+from aws_utils import get_s3_client, id_from_key, read_json_from_s3, read_text_from_s3, write_json_to_s3
+from config import (
+    S3_BUCKET,
+    CHUNKS_PREFIX,
+    CHUNK_CHAR_SIZE,
+    CHUNK_CHAR_OVERLAP,
+    CHUNK_SOURCE_FORMAT,
+    SOURCE_FORMAT_SETTINGS,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger(__name__)
+
+if CHUNK_SOURCE_FORMAT not in SOURCE_FORMAT_SETTINGS:
+    raise ValueError(
+        f"config.CHUNK_SOURCE_FORMAT={CHUNK_SOURCE_FORMAT!r} is not one of {list(SOURCE_FORMAT_SETTINGS)}"
+    )
+
+SOURCE_PREFIX_FOR_CHUNKING = SOURCE_FORMAT_SETTINGS[CHUNK_SOURCE_FORMAT]["prefix"]
+DOC_ID_SUFFIX = SOURCE_FORMAT_SETTINGS[CHUNK_SOURCE_FORMAT]["suffix"]
+
+
+def split_into_chunks(text, size, overlap):
+    """Greedy paragraph-packing splitter -- unchanged from v1. Deterministic,
+    character-count based, no tokenizer dependency, no model calls."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks = []
+    current = ""
+
+    for para in paragraphs:
+        candidate = f"{current}\n\n{para}".strip() if current else para
+
+        if len(candidate) <= size:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            carry = current[-overlap:] if overlap else ""
+            current = f"{carry}\n\n{para}".strip() if carry else para
+            if len(current) <= size:
+                continue
+
+        remainder = current if current else para
+        current = ""
+        step = max(size - overlap, 1)
+        for i in range(0, len(remainder), step):
+            piece = remainder[i:i + size]
+            if len(piece) <= size:
+                chunks.append(piece)
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def group_text_blocks(text_blocks):
+    """Groups consecutive text_blocks that share the same (title,
+    section_header) pair -- text_blocks is already in true reading order
+    (see extract_text_blocks() in textract_sequential_pipeline.py v2), so
+    this just merges adjacent paragraphs under the same heading into one
+    unit before size-based chunking, the same way v1 treated a whole page
+    as one candidate unit before splitting -- just scoped to one heading's
+    worth of paragraphs instead of a whole page."""
+    groups = []
+    current_key = None
+    current_texts = []
+
+    for block in text_blocks:
+        key = (block.get("title"), block.get("section_header"))
+        text = (block.get("text") or "").strip()
+        if not text:
+            continue
+
+        if key != current_key and current_texts:
+            groups.append({"title": current_key[0], "section_header": current_key[1],
+                            "text": "\n\n".join(current_texts)})
+            current_texts = []
+
+        current_key = key
+        current_texts.append(text)
+
+    if current_texts:
+        groups.append({"title": current_key[0], "section_header": current_key[1],
+                        "text": "\n\n".join(current_texts)})
+
+    return groups
+
+
+def build_heading_prefix(title, section_header):
+    """Builds the header text prepended to every chunk under this heading:
+
+        [Title: Borrower's Authorization to Disclose Information]
+        [Section: Section A: Borrower Info]
+
+    Missing pieces are omitted, not printed as "None" -- plenty of ECMC's
+    shorter documents won't have a detected title or section header at all.
+    Returns "" if neither is present, so callers can skip prepending
+    entirely rather than adding a blank line for nothing.
+    """
+    lines = []
+    if title:
+        lines.append(f"[Title: {title}]")
+    if section_header:
+        lines.append(f"[Section: {section_header}]")
+    return "\n".join(lines)
+
+
+def build_chunks_from_json(doc_id, source, doc_json):
+    """Walks the page-grouped Textract JSON and emits chunk records.
+    Chunk numbering is sequential across the whole document, in the
+    document's own page order -- not per-page-restarted -- so chunk_id
+    stays unique and stable, same as v1.
+    """
+    chunks = []
+    seq = 0
+
+    def next_chunk_id():
+        nonlocal seq
+        chunk_id = f"{doc_id}_chunk_{seq:03d}"
+        seq += 1
+        return chunk_id
+
+    for page_entry in doc_json.get("content", []):
+        page_num = page_entry.get("page")
+
+        # Body text: text_blocks grouped by heading, chunked to
+        # CHUNK_CHAR_SIZE, with the heading prepended to every resulting
+        # chunk -- this is the actual fix over v1. Every chunk here is
+        # self-describing even pulled out of context, because its own
+        # embedded text carries what section it's from.
+        for group in group_text_blocks(page_entry.get("text_blocks", [])):
+            heading_prefix = build_heading_prefix(group["title"], group["section_header"])
+            for piece in split_into_chunks(group["text"], CHUNK_CHAR_SIZE, CHUNK_CHAR_OVERLAP):
+                chunk_text = f"{heading_prefix}\n\n{piece}" if heading_prefix else piece
+                chunks.append({
+                    "chunk_id": next_chunk_id(),
+                    "doc_id": doc_id,
+                    "source": source,
+                    "page": page_num,
+                    "element_type": "text",
+                    "title": group["title"],
+                    "section_header": group["section_header"],
+                    "text": chunk_text,
+                })
+
+        # Tables: unchanged from v1 -- always one chunk each, never split,
+        # not tagged with a heading (see module docstring for why).
+        for table_text in page_entry.get("tables", []):
+            table_text = table_text.strip()
+            if not table_text:
+                continue
+            chunks.append({
+                "chunk_id": next_chunk_id(),
+                "doc_id": doc_id,
+                "source": source,
+                "page": page_num,
+                "element_type": "table",
+                "title": None,
+                "section_header": None,
+                "text": table_text,
+            })
+
+        # Form key-values: unchanged from v1 -- combined into one
+        # supplementary chunk per page, not tagged with a heading.
+        key_values = page_entry.get("key_values", [])
+        if key_values:
+            kv_text = "\n".join(
+                f"{kv.get('key', '').strip()}: {kv.get('value', '').strip()}"
+                for kv in key_values
+                if kv.get("key") or kv.get("value")
+            )
+            if kv_text.strip():
+                chunks.append({
+                    "chunk_id": next_chunk_id(),
+                    "doc_id": doc_id,
+                    "source": source,
+                    "page": page_num,
+                    "element_type": "form_fields",
+                    "title": None,
+                    "section_header": None,
+                    "text": kv_text,
+                })
+
+    return chunks
+
+
+def build_chunks_from_text(doc_id, source, text):
+    """Unchanged from v1 -- used when CHUNK_SOURCE_FORMAT is "md" or "txt".
+    Both are a single flat string with no text_blocks/heading structure to
+    walk (that only exists in the JSON output), so this just splits the
+    whole document and tags every chunk generically."""
+    chunks = []
+    seq = 0
+
+    def next_chunk_id():
+        nonlocal seq
+        chunk_id = f"{doc_id}_chunk_{seq:03d}"
+        seq += 1
+        return chunk_id
+
+    for piece in split_into_chunks(text, CHUNK_CHAR_SIZE, CHUNK_CHAR_OVERLAP):
+        chunks.append({
+            "chunk_id": next_chunk_id(),
+            "doc_id": doc_id,
+            "source": source,
+            "page": None,
+            "element_type": "text",
+            "title": None,
+            "section_header": None,
+            "text": piece,
+        })
+
+    return chunks
+
+
+def process_document(s3_client, source_key):
+    doc_id = id_from_key(source_key, DOC_ID_SUFFIX)
+    log.info("Chunking %s (%s) [source format: %s]", source_key, doc_id, CHUNK_SOURCE_FORMAT)
+
+    source = f"{doc_id}.pdf"
+
+    if CHUNK_SOURCE_FORMAT == "json":
+        doc_json = read_json_from_s3(s3_client, S3_BUCKET, source_key)
+        chunks = build_chunks_from_json(doc_id, source, doc_json)
+
+    elif CHUNK_SOURCE_FORMAT == "md":
+        text = read_text_from_s3(s3_client, S3_BUCKET, source_key)
+        chunks = build_chunks_from_text(doc_id, source, text)
+
+    elif CHUNK_SOURCE_FORMAT == "txt":
+        text = read_text_from_s3(s3_client, S3_BUCKET, source_key)
+        chunks = build_chunks_from_text(doc_id, source, text)
+
+    else:
+        raise ValueError(f"Unhandled CHUNK_SOURCE_FORMAT: {CHUNK_SOURCE_FORMAT!r}")
+
+    log.info("%s -> %d chunks", doc_id, len(chunks))
+
+    out_key = f"{CHUNKS_PREFIX}/{doc_id}/{doc_id}_chunks.json"
+    write_json_to_s3(s3_client, S3_BUCKET, out_key, chunks)
+    log.info("Saved %s", out_key)
+    return {"doc_id": doc_id, "chunk_count": len(chunks), "chunks_key": out_key}
+
+
+def lambda_handler(event, context=None):
+    """event = {"source_key": "<s3 key of one Textract output file>"}.
+    Chunks exactly that one document and returns a small JSON-serializable
+    summary -- intended to be one state in a Step Functions Map over
+    Textract output."""
+    s3_client = get_s3_client()
+    result = process_document(s3_client, event["source_key"])
+    return {"status": "ok", **result}
+##########
 """
 v2 -- single driver program, same shape as v1's main.py, grown one stage
 at a time as each v2 pipeline file gets built.
