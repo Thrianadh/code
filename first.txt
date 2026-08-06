@@ -1,4 +1,149 @@
 """
+v2 -- single driver program, same shape as v1's main.py, grown one stage
+at a time as each v2 pipeline file gets built.
+
+Right now only textract_sequential_pipeline.py exists in this v2 folder,
+so this file only imports and runs that stage. chunking_pipeline.py /
+embedding_pipeline.py / generation_pipeline.py don't exist here yet --
+importing them before they exist would break this file immediately (a
+Python import statement runs at load time, whether or not the function
+using it is ever called), so they're left as commented-out blocks marked
+TODO below. Uncomment each block (import line + its call in main()) as
+you build that v2 file, the same way this pipeline grew in v1.
+
+Needs config.py and aws_utils.py in the same folder, a .env file (same
+folder) with AWS_REGION and S3_BUCKET, and AWS credentials available
+through the normal boto3 chain.
+
+Usage:
+    python main_v2.py
+"""
+
+from aws_utils import get_s3_client, list_s3_keys, id_from_key
+from config import S3_BUCKET, SOURCE_PREFIX, OUTPUT_JSON_PREFIX
+
+import textract_sequential_pipeline
+
+# TODO: uncomment once chunking_pipeline.py (v2, reading the new
+# text_blocks field) exists in this folder:
+# import chunking_pipeline
+
+# TODO: uncomment once embedding_pipeline.py exists in this folder
+# (can likely be copied over from v1 unchanged -- it only reads
+# {doc_id}_chunks.json from CHUNKS_PREFIX and doesn't care which
+# CHUNK_SOURCE_FORMAT/layout logic produced them):
+# import embedding_pipeline
+
+# TODO: uncomment once generation_pipeline.py exists in this folder
+# (can likely be copied over from v1 unchanged too, same reasoning):
+# import generation_pipeline
+
+
+def run_textract_for_all():
+    """Runs Textract on every source PDF -- except ones that already have
+    output under OUTPUT_JSON_PREFIX. Each document is a real, often
+    multi-minute Textract job (LAYOUT + TABLES + FORMS), so without this
+    skip check every run reprocesses all documents from scratch, even ones
+    already done. To force a specific document to be reprocessed, delete
+    its {doc_id}.json/.md/.txt from S3 first."""
+    s3_client = get_s3_client()
+    keys = list_s3_keys(s3_client, S3_BUCKET, SOURCE_PREFIX, suffix=textract_sequential_pipeline.DOC_ID_SUFFIX)
+
+    existing_json_keys = list_s3_keys(s3_client, S3_BUCKET, OUTPUT_JSON_PREFIX, suffix=".json")
+    already_done = {id_from_key(k, ".json") for k in existing_json_keys}
+
+    total = len(keys)
+    print(f"[1/?] Textract: {total} source PDF(s) found under {SOURCE_PREFIX}")
+
+    results = []
+    for i, key in enumerate(keys, start=1):
+        doc_id = id_from_key(key, textract_sequential_pipeline.DOC_ID_SUFFIX)
+        if doc_id in already_done:
+            print(f"  [{i}/{total}] SKIP    {key} (already processed)")
+            continue
+
+        print(f"  [{i}/{total}] START   {key} (this is a real Textract job -- can take a minute or more)")
+        event = {"key": key}
+        try:
+            result = textract_sequential_pipeline.lambda_handler(event)
+            print(f"  [{i}/{total}] OK      {key} -> {result}")
+            results.append(result)
+        except Exception as e:
+            print(f"  [{i}/{total}] FAILED  {key}: {e}")
+    return results
+
+
+# TODO: uncomment once chunking_pipeline.py (v2) exists --
+# def run_chunking_for_all():
+#     s3_client = get_s3_client()
+#     prefix = chunking_pipeline.SOURCE_PREFIX_FOR_CHUNKING
+#     keys = list_s3_keys(s3_client, S3_BUCKET, prefix, suffix=chunking_pipeline.DOC_ID_SUFFIX)
+#     print(f"[2/?] Chunking: {len(keys)} file(s) found under {prefix}")
+#     results = []
+#     for source_key in keys:
+#         try:
+#             result = chunking_pipeline.lambda_handler({"source_key": source_key})
+#             print(f"  OK      {source_key} -> {result}")
+#             results.append(result)
+#         except Exception as e:
+#             print(f"  FAILED  {source_key}: {e}")
+#     return results
+
+
+# TODO: uncomment once embedding_pipeline.py exists --
+# def run_embedding():
+#     print("[3/?] Embedding: building the combined index over every chunk in S3")
+#     try:
+#         result = embedding_pipeline.lambda_handler({})
+#         print(f"  OK      {result}")
+#         return result
+#     except Exception as e:
+#         print(f"  FAILED  {e}")
+#         return None
+
+
+# TODO: uncomment once generation_pipeline.py exists --
+# def ask_question(question):
+#     event = {"query": question}
+#     try:
+#         result = generation_pipeline.lambda_handler(event)
+#     except Exception as e:
+#         print(f"  FAILED  {e}")
+#         return None
+#     print(f"\nAnswer: {result.get('answer')}")
+#     citation = result.get("citation")
+#     if citation:
+#         print(f"Source: {citation['source']}")
+#         print(f"Excerpt: {citation['excerpt']}")
+#     else:
+#         print("(no supporting chunk found)")
+#     return result
+#
+#
+# def ask_questions_loop():
+#     print("\nAsk a question about the documents (type 'exit' or 'quit' to stop).")
+#     while True:
+#         question = input("\nQuestion: ").strip()
+#         if not question:
+#             continue
+#         if question.lower() in ("exit", "quit"):
+#             break
+#         ask_question(question)
+
+
+def main():
+    run_textract_for_all()
+
+    # TODO: uncomment as each stage becomes available:
+    # run_chunking_for_all()
+    # run_embedding()
+    # ask_questions_loop()
+
+
+if __name__ == "__main__":
+    main()
+###########
+"""
 v2 -- local batch runner for textract_sequential_pipeline.py ONLY.
 
 Runs Textract across every source PDF under SOURCE_PREFIX (v2 config:
