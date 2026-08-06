@@ -1,3 +1,131 @@
+
+"""
+v2 -- Diagnoses where form/key-value data is going missing: requested from
+Textract at all (config), actually detected by Textract (raw JSON output),
+or dropped during chunking (chunks output). Checks all three layers for
+one document (or every document) so you don't have to guess which stage
+is the problem.
+
+Usage:
+    python diagnose_forms_v2.py --doc-id doc1
+    python diagnose_forms_v2.py                 # checks every document
+"""
+
+import argparse
+
+from aws_utils import get_s3_client, list_s3_keys, read_json_from_s3, id_from_key
+from config import S3_BUCKET, OUTPUT_JSON_PREFIX, CHUNKS_PREFIX, FEATURE_TYPES
+
+JSON_SUFFIX = ".json"
+CHUNK_KEY_SUFFIX = "_chunks.json"
+
+
+def check_config():
+    print("=== Layer 1: config.py ===")
+    print(f"FEATURE_TYPES = {FEATURE_TYPES}")
+    if "FORMS" in FEATURE_TYPES:
+        print("OK: FORMS is requested from Textract.\n")
+        return True
+    else:
+        print("PROBLEM FOUND: 'FORMS' is NOT in FEATURE_TYPES.")
+        print("  Textract was never asked to detect key-value pairs for ANY document,")
+        print("  regardless of what's actually on the page. Fix: in config.py, set")
+        print("  ENABLE_FORMS = True (this is the root cause if it's off).\n")
+        return False
+
+
+def check_raw_textract_json(s3_client, doc_id):
+    """Layer 2: did Textract actually find any key_values for this doc,
+    and did build_json() write them into the .json output."""
+    key = f"{OUTPUT_JSON_PREFIX}/{doc_id}/{doc_id}.json"
+    try:
+        doc_json = read_json_from_s3(s3_client, S3_BUCKET, key)
+    except Exception as e:
+        print(f"  Could not read {key}: {e}")
+        return None
+
+    total_kv = 0
+    pages_with_kv = 0
+    for page_entry in doc_json.get("content", []):
+        kvs = page_entry.get("key_values", [])
+        if kvs:
+            pages_with_kv += 1
+            total_kv += len(kvs)
+
+    print(f"  {key}")
+    print(f"  total key_value pairs across all pages: {total_kv} (on {pages_with_kv} page(s))")
+    if total_kv == 0:
+        print("  PROBLEM (or just a form-less document): Textract's raw output for this")
+        print("  document has zero key_values on every page. If FEATURE_TYPES already")
+        print("  includes FORMS (layer 1 passed), this means Textract itself didn't detect")
+        print("  any key-value pairs on this specific document -- worth opening the PDF and")
+        print("  checking whether it actually has recognizable label/value form fields, or")
+        print("  re-running Textract on just this doc to rule out a stale/incomplete JSON")
+        print("  from an earlier partial run (remember: textract skips already-processed docs).")
+    return total_kv
+
+
+def check_chunks(s3_client, doc_id):
+    """Layer 3: did chunking_pipeline.py turn those key_values (if any)
+    into a form_fields chunk."""
+    key = f"{CHUNKS_PREFIX}/{doc_id}/{doc_id}_chunks.json"
+    try:
+        chunks = read_json_from_s3(s3_client, S3_BUCKET, key)
+    except Exception as e:
+        print(f"  Could not read {key}: {e}")
+        return None
+
+    form_chunks = [c for c in chunks if c["element_type"] == "form_fields"]
+    print(f"  {key}")
+    print(f"  form_fields chunks: {len(form_chunks)}")
+    for c in form_chunks[:2]:
+        print(f"    sample: {c['text'][:200]}")
+    return len(form_chunks)
+
+
+def diagnose_one(s3_client, doc_id):
+    print(f"\n--- {doc_id} ---")
+    print("Layer 2: raw Textract JSON output")
+    total_kv = check_raw_textract_json(s3_client, doc_id)
+
+    print("\nLayer 3: chunking output")
+    total_form_chunks = check_chunks(s3_client, doc_id)
+
+    if total_kv and not total_form_chunks:
+        print("\n  MISMATCH: Textract found key_values but chunking produced 0 form_fields")
+        print("  chunks for this doc -- that WOULD be a real chunking bug. Send me this")
+        print("  doc_id and I'll dig into build_chunks_from_json() specifically for it.")
+    elif total_kv and total_form_chunks:
+        print("\n  OK: key_values found by Textract made it through chunking correctly.")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--doc-id", help="Only check this one document")
+    args = parser.parse_args()
+
+    s3_client = get_s3_client()
+
+    config_ok = check_config()
+
+    if args.doc_id:
+        doc_ids = [args.doc_id]
+    else:
+        keys = list_s3_keys(s3_client, S3_BUCKET, OUTPUT_JSON_PREFIX, suffix=JSON_SUFFIX)
+        doc_ids = sorted({id_from_key(k, JSON_SUFFIX) for k in keys})
+        print(f"Checking {len(doc_ids)} document(s) found under {OUTPUT_JSON_PREFIX}")
+
+    for doc_id in doc_ids:
+        diagnose_one(s3_client, doc_id)
+
+    if not config_ok:
+        print("\nFix layer 1 first (ENABLE_FORMS in config.py), then re-run Textract on")
+        print("affected documents before re-checking layers 2/3.")
+
+
+if __name__ == "__main__":
+    main()
+############
 def run_chunking_for_all():
     s3_client = get_s3_client()
     prefix = chunking_pipeline.SOURCE_PREFIX_FOR_CHUNKING
