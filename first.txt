@@ -1,3 +1,509 @@
+"""
+RAGAS-style evaluation metrics -- faithfulness, answer relevancy, context
+precision, and context recall -- implemented directly against this
+pipeline's own Bedrock stack (Nova as judge, Titan for embeddings) rather
+than the `ragas` pip package, which defaults to OpenAI/langchain wiring
+this project doesn't otherwise depend on. Same REASONING/FINAL_JSON
+convention as generation_pipeline.py's SYSTEM_PROMPT and eval_pipeline.py's
+JUDGE_SYSTEM_PROMPT, so every judge call here is auditable the same way
+(reasoning is logged, only FINAL_JSON is parsed).
+
+Four metrics, each scored 0.0-1.0 (or None if not computable for that row --
+see each function's docstring for when that happens; None is kept distinct
+from 0.0 on purpose, same as eval_pipeline.py's "N/A" verdict for rows with
+no expected_answer):
+
+    faithfulness        -- of the claims the generated answer makes, what
+                            fraction are actually supported by the
+                            retrieved context? Catches hallucination -- an
+                            answer can be fluent and on-topic and still
+                            fail this if it states something the context
+                            doesn't back up.
+    answer_relevancy    -- does the answer actually address the question
+                            asked? Measured indirectly: Nova writes a few
+                            questions the given answer would suit, each is
+                            embedded (Titan, same model used to build the
+                            FAISS index) and compared by cosine similarity
+                            against the real question's embedding. High
+                            similarity means the answer is shaped like a
+                            response to what was actually asked, not just
+                            topically nearby.
+    context_precision   -- of the chunks retrieval handed to generation,
+                            are the relevant ones ranked near the top?
+                            Scored as an average-precision-style number
+                            over Nova's per-chunk relevance judgments, in
+                            the same rank order the chunks were fused in.
+    context_recall      -- does the retrieved context, all together,
+                            contain what's needed to support the
+                            *reference* answer (golden dataset's
+                            expected_answer)? The reference is split into
+                            claims and each is checked against the context.
+                            Needs a ground_truth -- returns None without
+                            one, same convention as eval_pipeline.py's
+                            judge_answer().
+
+Each function takes plain Python values (question / contexts list[str] /
+answer / ground_truth strings) rather than a pipeline object, so they work
+the same whether the caller is v1's eval_pipeline.py or a future v2 one --
+pass in whichever retriever/generation output you already have. Nothing
+here calls retrieval or generation itself; get `contexts` from
+reranking_pipeline.rerank(...)'s fused chunk list (pull out each chunk's
+"text") and `answer` from generation_pipeline.generate_answer(...).
+
+Install:
+    pip install boto3 numpy
+"""
+
+import json
+import logging
+import re
+
+import numpy as np
+
+from config import NOVA_MODEL_ID, GENERATION_TEMPERATURE
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger(__name__)
+
+JUDGE_MAX_TOKENS = 1024
+FINAL_JSON_MARKER = "FINAL_JSON:"
+
+
+def _call_nova_json(bedrock_client, system_prompt, user_message, max_tokens=JUDGE_MAX_TOKENS):
+    """Shared judge call -- same REASONING/FINAL_JSON convention used
+    everywhere else in this codebase. Returns the parsed FINAL_JSON
+    object. Raises if nothing parseable comes back; callers don't catch
+    this, so a bad judge response surfaces as a real error for that
+    question rather than silently becoming a wrong 0.0 score."""
+    response = bedrock_client.converse(
+        modelId=NOVA_MODEL_ID,
+        system=[{"text": system_prompt}],
+        messages=[{"role": "user", "content": [{"text": user_message}]}],
+        inferenceConfig={"temperature": GENERATION_TEMPERATURE, "maxTokens": max_tokens},
+    )
+    raw_text = response["output"]["message"]["content"][0]["text"]
+
+    if FINAL_JSON_MARKER in raw_text:
+        reasoning_part, _, json_part = raw_text.partition(FINAL_JSON_MARKER)
+    else:
+        reasoning_part, json_part = "", raw_text
+    log.info("Judge reasoning: %s", reasoning_part.strip().replace("REASONING:", "").strip())
+
+    match = re.search(r"[\{\[].*[\}\]]", json_part, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON found in judge response: {raw_text!r}")
+    return json.loads(match.group(0))
+
+
+def _cosine_similarity(a, b):
+    a, b = np.array(a), np.array(b)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / denom) if denom else 0.0
+
+
+def _format_contexts(contexts):
+    return "\n\n".join(f"[{i}] {c}" for i, c in enumerate(contexts, start=1))
+
+
+# --------------------------------------------------------------------------
+# Faithfulness
+# --------------------------------------------------------------------------
+
+FAITHFULNESS_SYSTEM_PROMPT = """You are grading whether a generated answer is fully \
+supported by the given context, for a bankruptcy/student-loan document assistant. \
+Break the answer into its individual factual claims, then judge each claim against \
+the context alone -- not outside knowledge, not whether the claim sounds plausible.
+
+Respond in exactly this format, with these two labeled sections and nothing else \
+before, between, or after them:
+
+REASONING:
+List each factual claim the answer makes. For each, note whether the context \
+actually states or directly implies it.
+
+FINAL_JSON:
+A single-line JSON object, exactly this shape:
+{"claims": [{"claim": "<the claim>", "supported": true | false}, ...]}
+If the answer makes no checkable factual claims (e.g. it's a refusal like "the \
+documents do not contain this information"), return {"claims": []}.
+"""
+
+
+def faithfulness(bedrock_client, question, contexts, answer):
+    """Fraction of the answer's factual claims the context actually
+    supports. Returns None (not 0.0) if the answer made no checkable
+    claims at all -- e.g. a refusal -- since that's a different situation
+    than making claims and getting them wrong."""
+    user_message = (
+        f"QUESTION:\n{question}\n\n"
+        f"CONTEXT:\n{_format_contexts(contexts)}\n\n"
+        f"ANSWER:\n{answer}"
+    )
+    result = _call_nova_json(bedrock_client, FAITHFULNESS_SYSTEM_PROMPT, user_message)
+    claims = result.get("claims", [])
+    if not claims:
+        return {"score": None, "claims": []}
+    supported = sum(1 for c in claims if c.get("supported"))
+    return {"score": supported / len(claims), "claims": claims}
+
+
+# --------------------------------------------------------------------------
+# Answer relevancy
+# --------------------------------------------------------------------------
+
+RELEVANCY_QUESTIONS_SYSTEM_PROMPT = """Given an answer, write 3 different questions \
+that this answer would be a good, direct answer to. Write only questions this \
+specific answer actually addresses -- don't invent questions about topics the \
+answer doesn't cover.
+
+Respond in exactly this format, with these two labeled sections and nothing else \
+before, between, or after them:
+
+REASONING:
+Note what the answer is actually about, then draft each question.
+
+FINAL_JSON:
+A single-line JSON object, exactly this shape:
+{"questions": ["<question 1>", "<question 2>", "<question 3>"]}
+"""
+
+
+def answer_relevancy(bedrock_client, embed_fn, question, answer):
+    """Nova writes a few questions the answer would suit; each is embedded
+    (pass in the same embed_text used to build the FAISS index -- e.g.
+    embedding_pipeline.embed_text or embedding_pipeline_v2.embed_text) and
+    compared to the real question by cosine similarity. High average
+    similarity means the answer is actually shaped like a response to what
+    was asked, not just topically nearby or padded with extra detail.
+    Returns None if the answer is a refusal Nova can't derive questions
+    from."""
+    user_message = f"ANSWER:\n{answer}"
+    result = _call_nova_json(bedrock_client, RELEVANCY_QUESTIONS_SYSTEM_PROMPT, user_message)
+    generated_questions = [q for q in result.get("questions", []) if q.strip()]
+    if not generated_questions:
+        return {"score": None, "generated_questions": []}
+
+    question_vector = embed_fn(bedrock_client, question)
+    similarities = [
+        _cosine_similarity(question_vector, embed_fn(bedrock_client, gq))
+        for gq in generated_questions
+    ]
+    return {"score": sum(similarities) / len(similarities), "generated_questions": generated_questions}
+
+
+# --------------------------------------------------------------------------
+# Context precision
+# --------------------------------------------------------------------------
+
+CONTEXT_PRECISION_SYSTEM_PROMPT = """You are judging retrieved context chunks for \
+relevance to a question, for a bankruptcy/student-loan document assistant. The \
+chunks are numbered in the order retrieval ranked them. For each, judge only \
+whether it contains information relevant to answering the question -- not whether \
+it fully answers it alone.
+
+Respond in exactly this format, with these two labeled sections and nothing else \
+before, between, or after them:
+
+REASONING:
+Go through the chunks in order and note whether each is relevant to the question.
+
+FINAL_JSON:
+A single-line JSON object, exactly this shape:
+{"relevance": [true | false, ...]}
+The list must have exactly as many entries as there were numbered chunks, in the \
+same order.
+"""
+
+
+def context_precision(bedrock_client, question, contexts):
+    """Average-precision-style score over the ranked context list: at each
+    position where a chunk is relevant, precision-up-to-that-position is
+    added to a running total, which is then divided by the number of
+    relevant chunks found. This rewards relevant chunks being ranked
+    early, not just present somewhere in the list -- a relevant chunk
+    buried last scores worse than the same chunk ranked first. Returns
+    None if no context was retrieved, or if none of it was judged
+    relevant (keeps "nothing relevant found" distinct from a real
+    fractional score)."""
+    if not contexts:
+        return {"score": None, "relevance": []}
+
+    user_message = f"QUESTION:\n{question}\n\nCHUNKS:\n{_format_contexts(contexts)}"
+    result = _call_nova_json(bedrock_client, CONTEXT_PRECISION_SYSTEM_PROMPT, user_message)
+    relevance = result.get("relevance", [])
+    if len(relevance) != len(contexts):
+        log.error("context_precision: judge returned %d relevance labels for %d chunks -- padding with False",
+                   len(relevance), len(contexts))
+        relevance = (relevance + [False] * len(contexts))[:len(contexts)]
+
+    relevant_count = 0
+    precision_sum = 0.0
+    for i, is_relevant in enumerate(relevance, start=1):
+        if is_relevant:
+            relevant_count += 1
+            precision_sum += relevant_count / i
+
+    if relevant_count == 0:
+        return {"score": None, "relevance": relevance}
+    return {"score": precision_sum / relevant_count, "relevance": relevance}
+
+
+# --------------------------------------------------------------------------
+# Context recall
+# --------------------------------------------------------------------------
+
+CONTEXT_RECALL_SYSTEM_PROMPT = """You are judging whether retrieved context fully \
+covers a reference answer, for a bankruptcy/student-loan document assistant. Break \
+the reference answer into individual sentences/claims, then judge each one against \
+the context alone: could someone verify or derive this claim from the context?
+
+Respond in exactly this format, with these two labeled sections and nothing else \
+before, between, or after them:
+
+REASONING:
+List each sentence/claim in the reference answer. For each, note whether the \
+context supports it.
+
+FINAL_JSON:
+A single-line JSON object, exactly this shape:
+{"claims": [{"claim": "<the claim>", "attributable": true | false}, ...]}
+"""
+
+
+def context_recall(bedrock_client, contexts, ground_truth):
+    """Fraction of the reference (golden dataset expected_answer)'s claims
+    that the retrieved context actually supports. Unlike faithfulness
+    (generated answer vs. context) and context_precision (context vs.
+    question), this checks context against the *correct* answer -- so it
+    measures whether retrieval found everything needed, independent of
+    whether generation used it well. Returns None if there's no
+    ground_truth to check against, matching eval_pipeline.py's
+    judge_answer() "N/A" convention for ungraded rows. Returns 0.0 (not
+    None) if there IS a ground_truth but zero context was retrieved --
+    that's a real failure to measure, not an ungraded row."""
+    if not ground_truth or not ground_truth.strip():
+        return {"score": None, "claims": []}
+    if not contexts:
+        return {"score": 0.0, "claims": []}
+
+    user_message = f"REFERENCE ANSWER:\n{ground_truth}\n\nCONTEXT:\n{_format_contexts(contexts)}"
+    result = _call_nova_json(bedrock_client, CONTEXT_RECALL_SYSTEM_PROMPT, user_message)
+    claims = result.get("claims", [])
+    if not claims:
+        return {"score": None, "claims": []}
+    attributable = sum(1 for c in claims if c.get("attributable"))
+    return {"score": attributable / len(claims), "claims": claims}
+
+
+# --------------------------------------------------------------------------
+# Convenience: run all four for one golden-dataset row
+# --------------------------------------------------------------------------
+
+def score_all(bedrock_client, embed_fn, question, contexts, answer, ground_truth=""):
+    """Runs all four metrics for one question and returns a flat dict of
+    scores (each 0.0-1.0 or None) plus each metric's underlying detail --
+    the shape an eval file can drop straight into extra xlsx columns per
+    row, alongside eval_pipeline.py's existing CORRECT/PARTIALLY_CORRECT/
+    INCORRECT verdict. A handful of Nova calls per question (faithfulness,
+    relevancy-questions plus up to 3 embed calls, precision, recall) on top
+    of generation's own call -- this is eval tooling run offline against a
+    golden dataset, not the live query path, so the extra latency/cost is
+    an accepted tradeoff for staying on this project's existing Bedrock
+    stack instead of pulling in the `ragas` package and its own separate
+    LLM/embeddings wiring."""
+    faith = faithfulness(bedrock_client, question, contexts, answer)
+    relevancy = answer_relevancy(bedrock_client, embed_fn, question, answer)
+    precision = context_precision(bedrock_client, question, contexts)
+    recall = context_recall(bedrock_client, contexts, ground_truth)
+
+    return {
+        "faithfulness": faith["score"],
+        "answer_relevancy": relevancy["score"],
+        "context_precision": precision["score"],
+        "context_recall": recall["score"],
+        "details": {
+            "faithfulness": faith,
+            "answer_relevancy": relevancy,
+            "context_precision": precision,
+            "context_recall": recall,
+        },
+    }
+
+#############
+"""
+Runs ragas_metrics.py against an existing Excel file of question/
+model_answer pairs -- for when answers were already generated elsewhere
+(a previous pipeline run, a different environment, hand-collected test
+transcripts) rather than through this session's live
+generation_pipeline.generate_answer(). Skips Step 9 (generation) entirely
+and takes "model_answer" as given -- only retrieval (Steps 7-8) is re-run
+here, since ragas needs the actual context chunks a faithful/relevant
+answer would have been grounded in, and an Excel file of Q&A pairs
+wouldn't already contain those.
+
+Expected input columns (case-insensitive, any order):
+    question       (required)
+    model_answer   (required) -- the answer to grade
+    expected_answer / ground_truth / reference_answer (optional) -- if
+        present, context_recall is scored too; if absent, context_recall
+        is left as None for every row (same "not computable" convention
+        used throughout ragas_metrics.py) and the other three metrics
+        still run normally.
+
+Output: a new .xlsx (default: <input>_ragas_scored.xlsx) with question,
+model_answer, ground_truth, how many context chunks were retrieved, and
+the four scores -- one row per input row.
+
+Usage:
+    python run_ragas_from_excel.py --input questions.xlsx
+    python run_ragas_from_excel.py --input questions.xlsx --output scored.xlsx
+
+Requires AWS credentials with Bedrock access to NOVA_MODEL_ID and
+EMBEDDING_MODEL_ID (config.py), same as every other stage that calls
+Bedrock -- this only skips generation, not retrieval/embedding/judging.
+
+Install:
+    pip install boto3 python-dotenv faiss-cpu numpy rank-bm25 openpyxl
+"""
+
+import argparse
+import os
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, Alignment
+
+from aws_utils import get_bedrock_client
+from retrieval_pipeline import get_retriever
+from reranking_pipeline import rerank
+from embedding_pipeline import embed_text
+import ragas_metrics
+
+FONT_NAME = "Arial"
+HEADER_FONT = Font(name=FONT_NAME, bold=True)
+BODY_FONT = Font(name=FONT_NAME)
+
+GROUND_TRUTH_HEADER_ALIASES = {"expected_answer", "ground_truth", "reference_answer"}
+
+
+def read_rows(input_path):
+    """Reads the input xlsx, matching headers case-insensitively so
+    "Question"/"question"/"QUESTION" etc. all work. Returns a list of
+    {"question": ..., "model_answer": ..., "ground_truth": ...} dicts --
+    ground_truth is "" if no matching column exists in this file."""
+    wb = load_workbook(input_path, data_only=True)
+    ws = wb.active
+
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    headers = [(h or "").strip().lower() for h in header_row]
+
+    if "question" not in headers:
+        raise ValueError(f"No 'question' column found in {input_path}. Headers found: {header_row}")
+    if "model_answer" not in headers:
+        raise ValueError(f"No 'model_answer' column found in {input_path}. Headers found: {header_row}")
+    question_col = headers.index("question")
+    answer_col = headers.index("model_answer")
+
+    ground_truth_col = next((headers.index(a) for a in GROUND_TRUTH_HEADER_ALIASES if a in headers), None)
+    if ground_truth_col is None:
+        print("No expected_answer/ground_truth/reference_answer column found -- "
+              "context_recall will be None for every row (the other three metrics still run).")
+
+    rows = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[question_col] is None:
+            continue
+        rows.append({
+            "question": str(row[question_col]).strip(),
+            "model_answer": str(row[answer_col] or "").strip(),
+            "ground_truth": str(row[ground_truth_col]).strip()
+                            if ground_truth_col is not None and row[ground_truth_col] else "",
+        })
+    return rows
+
+
+def score_rows(bedrock_client, retriever, rows):
+    results = []
+    for i, row in enumerate(rows, start=1):
+        print(f"[{i}/{len(rows)}] {row['question']}")
+
+        # Re-run retrieval+rerank for this question to get the context
+        # chunks -- faithfulness/context_precision/context_recall all need
+        # them, and the Excel file only has the question and the answer,
+        # not what was retrieved when that answer was originally produced.
+        fused_chunks = rerank(bedrock_client, retriever, row["question"])
+        contexts = [c["text"] for c in fused_chunks]
+
+        scores = ragas_metrics.score_all(
+            bedrock_client, embed_text, row["question"], contexts,
+            row["model_answer"], row["ground_truth"],
+        )
+
+        results.append({
+            **row,
+            "contexts_used": len(contexts),
+            "faithfulness": scores["faithfulness"],
+            "answer_relevancy": scores["answer_relevancy"],
+            "context_precision": scores["context_precision"],
+            "context_recall": scores["context_recall"],
+        })
+    return results
+
+
+def write_output(results, output_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Ragas Scores"
+
+    headers = ["Question", "Model Answer", "Ground Truth", "Contexts Used",
+               "Faithfulness", "Answer Relevancy", "Context Precision", "Context Recall"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = HEADER_FONT
+
+    for r in results:
+        ws.append([
+            r["question"], r["model_answer"], r["ground_truth"], r["contexts_used"],
+            r["faithfulness"], r["answer_relevancy"], r["context_precision"], r["context_recall"],
+        ])
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.font = BODY_FONT
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    widths = {"A": 35, "B": 45, "C": 45, "D": 14, "E": 14, "F": 16, "G": 16, "H": 14}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    wb.save(output_path)
+    print(f"\nSaved {len(results)} scored row(s) to {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Path to the .xlsx with question/model_answer columns")
+    parser.add_argument("--output", default=None,
+                         help="Path for the scored output .xlsx (default: <input>_ragas_scored.xlsx)")
+    args = parser.parse_args()
+
+    output_path = args.output or f"{os.path.splitext(args.input)[0]}_ragas_scored.xlsx"
+
+    rows = read_rows(args.input)
+    if not rows:
+        print("No rows found (or 'question' column was empty for every row).")
+        return
+
+    bedrock_client = get_bedrock_client()
+    retriever = get_retriever()
+
+    results = score_rows(bedrock_client, retriever, rows)
+    write_output(results, output_path)
+
+
+if __name__ == "__main__":
+    main()
+#######################
+
 SYSTEM_PROMPT = """You are ECMC's document assistant. Answer questions using ONLY the \
 CONTEXT chunks provided in the user message. Do not use any outside knowledge, \
 and do not guess.
