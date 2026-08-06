@@ -1,3 +1,18 @@
+def run_chunking_for_all():
+    s3_client = get_s3_client()
+    prefix = chunking_pipeline.SOURCE_PREFIX_FOR_CHUNKING
+    keys = list_s3_keys(s3_client, S3_BUCKET, prefix, suffix=chunking_pipeline.DOC_ID_SUFFIX)
+    print(f"[2/?] Chunking: {len(keys)} file(s) found under {prefix}")
+    results = []
+    for source_key in keys:
+        try:
+            result = chunking_pipeline.lambda_handler({"source_key": source_key})
+            print(f"  OK      {source_key} -> {result}")
+            results.append(result)
+        except Exception as e:
+            print(f"  FAILED  {source_key}: {e}")
+    return results
+###################
 #chuncking
 """
 v2 -- Chunks Textract output (written by textract_sequential_pipeline.py
