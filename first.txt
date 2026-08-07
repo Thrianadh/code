@@ -1,4 +1,19 @@
+Notice of default / consequences (website_nod.pdf)
+"What happens if my loan goes into default?" / "whats the consequences of default" / "wage garnishment" / "are you going to take my paycheck" / "will this hurt my credit" / "collection costs" / "how much extra will I owe in collection costs" / "can the department of education sue me" / "defaulted loan consequences"
 
+Getting out of default (website_nod.pdf)
+"How do I get out of default" / "payment in full" / "what is loan rehabilitation" / "rehab" / "how many payments to rehab my loan" / "loan consolidation" / "can I consolidate to fix my default" / "ICR vs IBR" / "whats income contingent repayment" / "if I pay it all off will it still show on my credit"
+
+Disputing / administrative review
+"How do I request an administrative review" / "I don't think I owe this" / "the balance is wrong" / "I never took out this loan" / "can I dispute this" / "ombudsman" / "who do I contact if ECMC won't help me"
+
+Title IV eligibility during bankruptcy (website_title-iv-and-bkry-info.pdf — this is the document your reported terse-query failures should be resolving against)
+"title 4" / "Title IV" / "title four" / "tital 4 eligibility" / "back to school" / "going back to school" / "I'm going back to school, can I get financial aid" / "how many payments to get title iv back" / "satisfactory repayment arrangement" / "what is a satisfactory repayment arrangement" / "can I get title iv aid again if I'm in chapter 13" / "chapter 7 title iv" / "I already fixed my title iv once, can I do it again" / "six payments title iv"
+
+Authorization to disclose information — worth calling out: there are two different forms in your corpus, one for bankruptcy cases specifically (mailed to "Attn: Bankruptcy", fax 1-877-865-9741) and one general-purpose (fax 877-645-7479). A user asking generically about "the authorization form" is a genuinely good test of whether retrieval/generation picks the right one based on bankruptcy context, or just grabs whichever chunk ranks higher.
+"authorization form" / "how do I let my spouse talk to you about my loan" / "can my lawyer call on my behalf" / "release form" / "bankruptcy authorization form" / "what form do I need if I'm in bankruptcy vs not"
+
+##########
 """You are ECMC's document assistant. Answer questions using \
 ONLY the CONTEXT chunks provided in the user message. Do not use any outside knowledge, \
 and do not guess.
