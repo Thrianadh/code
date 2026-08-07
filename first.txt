@@ -1,3 +1,152 @@
+########diagnose_terse_queries.py
+"""
+Isolates WHERE terse/fragment queries ("title 4", "back to school") and
+vocabulary variants ("title IV" vs "title 4" vs "title four") actually
+fail, so you know whether to fix retrieval (context problem) or the prompt
+(LLM formatting problem) -- fixing the wrong one won't help.
+
+For each test query, three layers are checked independently and reported
+separately:
+
+    1. RETRIEVAL (context layer) -- calls retriever.search() directly and
+       reports how many semantic/keyword hits came back and what the top
+       chunk actually is. If this comes back empty or clearly wrong for a
+       given phrasing, that phrasing has a retrieval problem: the FAISS/
+       BM25 search itself isn't finding the right chunk for that wording,
+       no matter what the prompt says to do with it. This is the layer
+       most likely to break on "title 4" vs "title IV" vs "title four" --
+       BM25 does token matching (4 / IV / four are three unrelated
+       tokens), and Titan embeddings can also drift on very short queries
+       since there's less surrounding context to embed.
+
+    2. FUSION (RRF) -- calls rerank() on top of that, so you can see
+       whether fusion is dropping something retrieval actually found (rare,
+       but distinguishes "retrieval found it but fusion ranked it out of
+       top_k" from "retrieval never found it at all").
+
+    3. GENERATION (LLM layer) -- calls Bedrock directly with
+       generation_pipeline.SYSTEM_PROMPT and whatever context survived
+       steps 1-2, and reports the RAW model output plus whether
+       parse_model_response() succeeded or raised. If retrieval/fusion
+       found perfectly good context but the model still fails to produce
+       a valid FINAL_JSON section (or produces one but with an empty/
+       refusal answer despite good context), that's a genuine LLM/prompt
+       problem, not a context one -- exactly the failure mode rule 0 in
+       the refined prompt was meant to fix.
+
+TEST_QUERIES below covers the two reported failures plus the Title
+IV/4/four vocabulary variants, so you can see in one run whether the
+numeral/roman-numeral/spelled-out forms retrieve the same chunk or not.
+Edit the list to add more.
+
+Usage:
+    python diagnose_terse_queries.py
+
+To test against a DIFFERENT system prompt (e.g. the refined one from this
+conversation) instead of generation_pipeline.py's current SYSTEM_PROMPT,
+paste it into CUSTOM_SYSTEM_PROMPT below and it'll be used instead --
+useful for A/B checking the old vs. refined prompt against the same
+retrieved context without editing generation_pipeline.py itself.
+
+Requires AWS credentials with Bedrock access, and the FAISS index already
+built in S3 (embedding_pipeline.py must have been run at least once).
+"""
+
+from aws_utils import get_bedrock_client
+from config import NOVA_MODEL_ID, GENERATION_TEMPERATURE, GENERATION_MAX_TOKENS, HYBRID_CANDIDATE_K, FINAL_TOP_K
+from retrieval_pipeline import get_retriever
+from reranking_pipeline import rerank
+from generation_pipeline import SYSTEM_PROMPT, build_context_block, parse_model_response
+
+TEST_QUERIES = [
+    # The two reported failures, verbatim:
+    "title 4",
+    "back to school",
+    # Vocabulary variants of the same underlying term -- do these all
+    # retrieve the same chunk, or does phrasing change what comes back?
+    "title IV",
+    "title four",
+    "Title IV letter",
+    # A couple more terse ones from the shared test batches, for coverage:
+    "Requirements: What to send in for the review",
+    "I want to consolidate",
+]
+
+# Leave as None to test generation_pipeline.py's current SYSTEM_PROMPT
+# as-is. Paste an alternate prompt string here to A/B test it against the
+# same queries/context instead.
+CUSTOM_SYSTEM_PROMPT = None
+
+
+def check_retrieval(bedrock_client, retriever, query):
+    results = retriever.search(bedrock_client, query, top_k=HYBRID_CANDIDATE_K)
+    semantic = results["semantic"]
+    keyword = results["keyword"]
+
+    print(f"  RETRIEVAL: {len(semantic)} semantic hit(s), {len(keyword)} keyword hit(s)")
+    if semantic:
+        top = semantic[0]
+        print(f"    top semantic: {top['chunk_id']} (score={top['semantic_score']:.4f}) -- {top['text'][:120]!r}")
+    else:
+        print("    top semantic: NONE")
+    if keyword:
+        top = keyword[0]
+        print(f"    top keyword:  {top['chunk_id']} (score={top['bm25_score']:.4f}) -- {top['text'][:120]!r}")
+    else:
+        print("    top keyword:  NONE (BM25 found zero token overlap)")
+    return results
+
+
+def check_fusion(bedrock_client, retriever, query):
+    fused = rerank(bedrock_client, retriever, query, top_k=FINAL_TOP_K)
+    print(f"  FUSION: {len(fused)} chunk(s) survived RRF into the final context")
+    for c in fused[:3]:
+        print(f"    {c['chunk_id']} (rrf_score={c['rrf_score']:.5f}) -- {c['text'][:120]!r}")
+    return fused
+
+
+def check_generation(bedrock_client, query, fused_chunks):
+    if not fused_chunks:
+        print("  GENERATION: skipped -- no context to generate from (this query is purely a retrieval failure)")
+        return
+
+    system_prompt = CUSTOM_SYSTEM_PROMPT or SYSTEM_PROMPT
+    context_block = build_context_block(fused_chunks)
+    user_message = f"CONTEXT:\n{context_block}\n\nQUESTION:\n{query}"
+
+    response = bedrock_client.converse(
+        modelId=NOVA_MODEL_ID,
+        system=[{"text": system_prompt}],
+        messages=[{"role": "user", "content": [{"text": user_message}]}],
+        inferenceConfig={"temperature": GENERATION_TEMPERATURE, "maxTokens": GENERATION_MAX_TOKENS},
+    )
+    raw_text = response["output"]["message"]["content"][0]["text"]
+
+    print(f"  GENERATION raw output ({len(raw_text)} chars):")
+    print("    " + raw_text.replace("\n", "\n    "))
+
+    try:
+        parsed = parse_model_response(raw_text)
+        print(f"  GENERATION: parsed OK -- answer={parsed.get('answer', '')!r} chunk_id={parsed.get('chunk_id', parsed.get('chunk id'))!r}")
+    except Exception as e:
+        print(f"  GENERATION: FAILED TO PARSE -- {e}")
+        print("    ^ this is an LLM/prompt problem: retrieval/fusion supplied context, "
+              "but the model didn't produce a valid REASONING/FINAL_JSON response for this query.")
+
+
+def main():
+    bedrock_client = get_bedrock_client()
+    retriever = get_retriever()
+
+    for query in TEST_QUERIES:
+        print(f"\n{'=' * 70}\nQUERY: {query!r}\n{'=' * 70}")
+        check_retrieval(bedrock_client, retriever, query)
+        fused_chunks = check_fusion(bedrock_client, retriever, query)
+        check_generation(bedrock_client, query, fused_chunks)
+
+
+if __name__ == "__main__":
+    main()
 ########ragas_metrics.py
 """
 RAGAS-style evaluation metrics -- faithfulness, answer relevancy, context
