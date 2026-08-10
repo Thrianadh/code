@@ -1,3 +1,136 @@
+import os
+ 
+import litellm
+from openpyxl import load_workbook, Workbook
+ 
+from ragas.llms import llm_factory
+from ragas.embeddings.base import embedding_factory
+from ragas.metrics.collections import AnswerRelevancy, NoiseSensitivity
+ 
+INPUT_FILE = r"D:\Users\ntrinadh\Downloads\bankruptcy-pod-dev-swapnil\bankruptcy-pod-dev-swapnil\lambdas\teams_bot_bky\src\group11_output1.xlsx"
+OUTPUT_FILE = r"D:\Users\ntrinadh\Downloads\bankruptcy-pod-dev-swapnil\bankruptcy-pod-dev-swapnil\lambdas\teams_bot_bky\src\ragas_group11_output1.xlsx"
+ 
+REGION = "us-east-1"
+ 
+# NOTE: needs to actually resolve to a model you have Bedrock access to in
+# your region -- if you're on a cross-region inference profile you may need
+# "us.amazon.nova-lite-v1:0" instead.
+LLM_MODEL_ID = "amazon.nova-lite-v1:0"
+EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+ 
+# LiteLLM reads region from this env var for Bedrock calls (see ragas'
+# "Customise models > AWS Bedrock" doc). Uses whatever AWS credentials are
+# already on this machine (env vars / ~/.aws/credentials / role).
+os.environ.setdefault("AWS_REGION_NAME", REGION)
+ 
+# provider="litellm" + client=litellm.completion forces the LiteLLM adapter
+# (auto-detection would also get here since the client is from litellm, but
+# being explicit avoids surprises -- see ragas' "LLM Adapters" doc).
+llm = llm_factory(
+    f"bedrock/{LLM_MODEL_ID}",
+    provider="litellm",
+    client=litellm.completion,
+    temperature=0,
+)
+embeddings = embedding_factory("litellm", model=f"bedrock/{EMBEDDING_MODEL_ID}")
+ 
+answer_relevancy_scorer = AnswerRelevancy(llm=llm, embeddings=embeddings)
+noise_sensitivity_scorer = NoiseSensitivity(llm=llm, mode="relevant")
+ 
+ 
+# ---------------------------------------------------------------------
+# excel io
+# ---------------------------------------------------------------------
+ 
+def read_rows(path):
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    headers = [(h or "").strip().lower() for h in header_row]
+ 
+    q_col = headers.index("question")
+    a_col = headers.index("model answer")
+    g_col = headers.index("ground truth")
+    c_col = headers.index("retrieved context") if "retrieved context" in headers else None
+ 
+    rows = []
+    for r in ws.iter_rows(min_row=2, values_only=True):
+        if not r[q_col]:
+            continue
+        contexts = []
+        if c_col is not None and r[c_col]:
+            contexts = [c.strip() for c in str(r[c_col]).split("|") if c.strip()]
+        rows.append({
+            "question": str(r[q_col]).strip(),
+            "answer": str(r[a_col]).strip() if r[a_col] else "",
+            "reference": str(r[g_col]).strip() if r[g_col] else "",
+            "contexts": contexts,
+        })
+    return rows
+ 
+ 
+def write_rows(path, results):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ragas_results"
+    ws.append(["question", "model_answer", "ground_truth", "answer_relevancy", "noise_sensitivity"])
+    for r in results:
+        ws.append([r["question"], r["answer"], r["reference"], r["answer_relevancy"], r["noise_sensitivity"]])
+    wb.save(path)
+ 
+ 
+# ---------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------
+ 
+def main():
+    rows = read_rows(INPUT_FILE)
+ 
+    results = []
+    for i, row in enumerate(rows, start=1):
+        print(f"[{i}/{len(rows)}] {row['question']}")
+ 
+        answer_relevancy = None
+        noise_sensitivity = None
+ 
+        try:
+            result = answer_relevancy_scorer.score(
+                user_input=row["question"],
+                response=row["answer"],
+            )
+            answer_relevancy = result.value
+        except Exception as e:
+            print(f"  answer_relevancy FAILED: {e}")
+ 
+        if row["contexts"]:
+            try:
+                result = noise_sensitivity_scorer.score(
+                    user_input=row["question"],
+                    response=row["answer"],
+                    reference=row["reference"],
+                    retrieved_contexts=row["contexts"],
+                )
+                noise_sensitivity = result.value
+            except Exception as e:
+                print(f"  noise_sensitivity FAILED: {e}")
+        else:
+            print("  noise_sensitivity SKIPPED -- no 'Retrieved Context' column/value for this row")
+ 
+        results.append({
+            "question": row["question"],
+            "answer": row["answer"],
+            "reference": row["reference"],
+            "answer_relevancy": answer_relevancy,
+            "noise_sensitivity": noise_sensitivity,
+        })
+ 
+    write_rows(OUTPUT_FILE, results)
+    print(f"\nwrote {len(results)} rows to {OUTPUT_FILE}")
+ 
+ 
+if __name__ == "__main__":
+    main()
+#################
 """
 RAGAS-style evaluation for the ECMC RAG pipeline.
 
