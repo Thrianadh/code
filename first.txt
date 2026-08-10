@@ -1,3 +1,265 @@
+"""
+RAGAS-style evaluation for the ECMC RAG pipeline.
+
+Reads an xlsx with Question / Model Answer / Ground truth columns, retrieves
+context for each question through the existing retrieval + reranking
+pipeline, and scores each row on six metrics using Bedrock's Nova Lite as
+the judge model:
+
+  - faithfulness
+  - answer_relevancy
+  - context_precision (with reference)
+  - context_recall
+  - context_entities_recall
+  - noise_sensitivity
+
+Formulas follow the Ragas docs:
+  https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/
+
+Usage:
+    python ragas_eval.py --input qa.xlsx --output scored.xlsx
+"""
+
+import argparse
+import json
+import re
+
+import boto3
+import numpy as np
+from openpyxl import load_workbook, Workbook
+
+from retrieval_pipeline import get_retriever
+from reranking_pipeline import rerank
+from embedding_pipeline import embed_text
+
+# NOTE: this needs to actually resolve to a model you have Bedrock access
+# to in your region - if you're on a cross-region inference profile you
+# may need "us.amazon.nova-lite-v1:0" instead.
+MODEL_ID = "amazon.nova-lite-v1:0"
+REGION = "us-east-1"
+TOP_K = 5
+
+bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+
+
+def call_llm(system_prompt, user_prompt, max_tokens=1024):
+    resp = bedrock.converse(
+        modelId=MODEL_ID,
+        system=[{"text": system_prompt}],
+        messages=[{"role": "user", "content": [{"text": user_prompt}]}],
+        inferenceConfig={"temperature": 0, "maxTokens": max_tokens},
+    )
+    return resp["output"]["message"]["content"][0]["text"]
+
+
+def extract_json(text):
+    match = re.search(r"[\{\[].*[\}\]]", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"no JSON found in model response: {text!r}")
+    return json.loads(match.group(0))
+
+
+def cosine_sim(a, b):
+    a, b = np.array(a), np.array(b)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / denom) if denom else 0.0
+
+
+# ---------------------------------------------------------------------
+# LLM judge calls
+# ---------------------------------------------------------------------
+
+def split_claims(text):
+    system = ('Break the text into a list of individual factual claims. '
+              'Respond with only JSON: {"claims": ["claim 1", "claim 2"]}')
+    result = extract_json(call_llm(system, text))
+    return [c for c in result.get("claims", []) if c.strip()]
+
+
+def claim_supported_by_context(claim, contexts):
+    context_text = "\n\n".join(contexts)
+    system = ('Decide if the claim can be inferred from the context. '
+              'Respond with only JSON: {"verdict": true or false}')
+    user = f"CONTEXT:\n{context_text}\n\nCLAIM:\n{claim}"
+    return bool(extract_json(call_llm(system, user)).get("verdict"))
+
+
+def claim_correct_vs_reference(claim, reference):
+    system = ('Decide if the claim is factually consistent with the reference answer. '
+              'Respond with only JSON: {"verdict": true or false}')
+    user = f"REFERENCE:\n{reference}\n\nCLAIM:\n{claim}"
+    return bool(extract_json(call_llm(system, user)).get("verdict"))
+
+
+def chunk_relevant_to_reference(chunk, reference):
+    system = ('Decide if the context chunk was useful for producing the reference answer. '
+              'Respond with only JSON: {"verdict": true or false}')
+    user = f"REFERENCE:\n{reference}\n\nCHUNK:\n{chunk}"
+    return bool(extract_json(call_llm(system, user)).get("verdict"))
+
+
+def extract_entities(text):
+    system = ('Extract named entities (people, places, organizations, dates, numbers, '
+              'specific terms) from the text. Respond with only JSON: '
+              '{"entities": ["entity 1", "entity 2"]}')
+    result = extract_json(call_llm(system, text))
+    return {e.strip().lower() for e in result.get("entities", []) if e.strip()}
+
+
+def generate_questions_from_answer(answer, n=3):
+    system = (f'Generate {n} different questions that this answer would be a good response to. '
+              'Respond with only JSON: {"questions": ["q1", "q2", "q3"]}')
+    result = extract_json(call_llm(system, answer))
+    return [q for q in result.get("questions", []) if q.strip()]
+
+
+# ---------------------------------------------------------------------
+# metrics
+# ---------------------------------------------------------------------
+
+def faithfulness(answer, contexts):
+    claims = split_claims(answer)
+    if not claims:
+        return None
+    supported = sum(claim_supported_by_context(c, contexts) for c in claims)
+    return supported / len(claims)
+
+
+def context_recall(reference, contexts):
+    claims = split_claims(reference)
+    if not claims:
+        return None
+    supported = sum(claim_supported_by_context(c, contexts) for c in claims)
+    return supported / len(claims)
+
+
+def context_precision(reference, contexts):
+    if not contexts:
+        return None
+    relevance = [chunk_relevant_to_reference(c, reference) for c in contexts]
+
+    relevant_count = 0
+    precision_sum = 0.0
+    for i, is_relevant in enumerate(relevance, start=1):
+        if is_relevant:
+            relevant_count += 1
+            precision_sum += relevant_count / i
+
+    return precision_sum / relevant_count if relevant_count else 0.0
+
+
+def context_entities_recall(reference, contexts):
+    ref_entities = extract_entities(reference)
+    if not ref_entities:
+        return None
+    ctx_entities = set()
+    for c in contexts:
+        ctx_entities |= extract_entities(c)
+    return len(ref_entities & ctx_entities) / len(ref_entities)
+
+
+def noise_sensitivity(answer, reference):
+    # "relevant" mode: fraction of the answer's claims that don't hold up
+    # against the reference answer.
+    claims = split_claims(answer)
+    if not claims:
+        return None
+    incorrect = sum(not claim_correct_vs_reference(c, reference) for c in claims)
+    return incorrect / len(claims)
+
+
+def answer_relevancy(question, answer):
+    questions = generate_questions_from_answer(answer)
+    if not questions:
+        return None
+    q_vec = embed_text(bedrock, question)
+    sims = [cosine_sim(q_vec, embed_text(bedrock, gq)) for gq in questions]
+    return sum(sims) / len(sims)
+
+
+# ---------------------------------------------------------------------
+# excel io
+# ---------------------------------------------------------------------
+
+def read_rows(path):
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    headers = [(h or "").strip().lower() for h in header_row]
+
+    q_col = headers.index("question")
+    a_col = headers.index("model answer")
+    g_col = headers.index("ground truth")
+
+    rows = []
+    for r in ws.iter_rows(min_row=2, values_only=True):
+        if not r[q_col]:
+            continue
+        rows.append({
+            "question": str(r[q_col]).strip(),
+            "answer": str(r[a_col]).strip() if r[a_col] else "",
+            "reference": str(r[g_col]).strip() if r[g_col] else "",
+        })
+    return rows
+
+
+def write_rows(path, results):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ragas_results"
+    ws.append(["question", "model_answer", "ground_truth", "faithfulness",
+               "answer_relevancy", "context_precision", "context_recall",
+               "context_entities_recall", "noise_sensitivity"])
+    for r in results:
+        ws.append([r["question"], r["answer"], r["reference"], r["faithfulness"],
+                   r["answer_relevancy"], r["context_precision"], r["context_recall"],
+                   r["context_entities_recall"], r["noise_sensitivity"]])
+    wb.save(path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="xlsx with Question / Model Answer / Ground truth columns")
+    parser.add_argument("--output", default="ragas_results.xlsx")
+    args = parser.parse_args()
+
+    rows = read_rows(args.input)
+    retriever = get_retriever()
+
+    results = []
+    for i, row in enumerate(rows, start=1):
+        print(f"[{i}/{len(rows)}] {row['question']}")
+
+        try:
+            fused = rerank(bedrock, retriever, row["question"], top_k=TOP_K)
+            contexts = [c["text"] for c in fused]
+
+            results.append({
+                "question": row["question"],
+                "answer": row["answer"],
+                "reference": row["reference"],
+                "faithfulness": faithfulness(row["answer"], contexts),
+                "answer_relevancy": answer_relevancy(row["question"], row["answer"]),
+                "context_precision": context_precision(row["reference"], contexts),
+                "context_recall": context_recall(row["reference"], contexts),
+                "context_entities_recall": context_entities_recall(row["reference"], contexts),
+                "noise_sensitivity": noise_sensitivity(row["answer"], row["reference"]),
+            })
+        except Exception as e:
+            print(f"  FAILED: {e}")
+            results.append({
+                "question": row["question"], "answer": row["answer"], "reference": row["reference"],
+                "faithfulness": None, "answer_relevancy": None, "context_precision": None,
+                "context_recall": None, "context_entities_recall": None, "noise_sensitivity": None,
+            })
+
+    write_rows(args.output, results)
+    print(f"\nwrote {len(results)} rows to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
+#######
 You are ECMC's document assistant. Answer questions using ONLY the CONTEXT chunks provided in the user message. Do not use any outside knowledge, and do not guess.
 
 Write complete, thorough answers with relevant details, conditions, and steps found in the supporting chunks. Do not add filler and do not add details that are not in CONTEXT.
