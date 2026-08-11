@@ -1,3 +1,288 @@
+import json
+import os
+import sys
+from typing import Any, Dict, List, Optional
+
+import boto3
+import pandas as pd
+from datasets import Dataset
+
+# ── RAGAS imports ──────────────────────────────────────────────────────────
+try:
+    from ragas import evaluate
+    from ragas.metrics import (
+        context_precision,
+        context_recall,
+        context_entity_recall,
+        noise_sensitivity,
+        answer_relevancy,
+        faithfulness,
+    )
+except ImportError as exc:
+    print(f"ERROR: ragas not installed. Run: pip install ragas")
+    sys.exit(1)
+
+# ── LangChain AWS imports ──────────────────────────────────────────────────
+try:
+    from langchain_aws import ChatBedrock, BedrockEmbeddings
+    from ragas.llms import LangchainLLMWrapper
+    from ragas.embeddings import LangchainEmbeddingsWrapper
+except ImportError as exc:
+    print(f"ERROR: langchain-aws not installed. Run: pip install langchain-aws")
+    sys.exit(1)
+
+# ── Configuration ──────────────────────────────────────────────────────────
+REGION = "us-east-1"
+LLM_MODEL_ID = "amazon.nova-lite-v1:0"
+EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+
+INPUT_FILE = r"D:\Users\ntrinadh\Downloads\bankruptcy-pod-dev-swapnil\bankruptcy-pod-dev-swapnil\lambdas\teams_bot_bky\src\group11_output1.xlsx"
+OUTPUT_FILE = r"D:\Users\ntrinadh\Downloads\bankruptcy-pod-dev-swapnil\bankruptcy-pod-dev-swapnil\lambdas\teams_bot_bky\src\ragas_group11_output1.xlsx"
+
+# If contexts are stored as pipe-separated string instead of list
+CONTEXT_SEPARATOR = " | "
+
+# ── Bedrock Client Setup ───────────────────────────────────────────────────
+
+def get_bedrock_client():
+    return boto3.client("bedrock-runtime", region_name=REGION)
+
+
+def setup_ragas_llm():
+    """Configure RAGAS to use Bedrock Nova Lite as the judge LLM."""
+    bedrock_llm = ChatBedrock(
+        model_id=LLM_MODEL_ID,
+        region_name=REGION,
+        model_kwargs={"temperature": 0.0, "max_tokens": 1024},
+    )
+    return LangchainLLMWrapper(bedrock_llm)
+
+
+def setup_ragas_embeddings():
+    """Configure RAGAS to use Bedrock Titan Embed v2 for embedding-based metrics."""
+    bedrock_embeddings = BedrockEmbeddings(
+        model_id=EMBEDDING_MODEL_ID,
+        region_name=REGION,
+    )
+    return LangchainEmbeddingsWrapper(bedrock_embeddings)
+
+# ── Data Loading ───────────────────────────────────────────────────────────
+
+def load_input_data(excel_path: str) -> pd.DataFrame:
+    """Load evaluation data from Excel.
+
+    Expected columns:
+      - question
+      - answer
+      - ground_truth
+      - contexts (list or string)
+    """
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f"Input file not found: {excel_path}")
+
+    df = pd.read_excel(excel_path)
+    print(f"Loaded {len(df)} rows from {excel_path}")
+    print(f"Columns: {list(df.columns)}")
+    return df
+
+
+def parse_contexts(raw_contexts) -> List[str]:
+    """Parse contexts column into list of strings.
+
+    Handles:
+      - Python list literal: "['chunk1', 'chunk2']"
+      - Pipe-separated: "chunk1 | chunk2"
+      - Single string: "chunk1"
+      - NaN/None: returns []
+    """
+    if pd.isna(raw_contexts):
+        return []
+
+    if isinstance(raw_contexts, list):
+        return [str(c).strip() for c in raw_contexts if c]
+
+    text = str(raw_contexts).strip()
+
+    # Try JSON/list literal
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text.replace("'", '"'))
+            if isinstance(parsed, list):
+                return [str(c).strip() for c in parsed if c]
+        except Exception:
+            pass
+
+    # Try pipe-separated
+    if CONTEXT_SEPARATOR in text:
+        return [c.strip() for c in text.split(CONTEXT_SEPARATOR) if c.strip()]
+
+    # Single context
+    return [text] if text else []
+
+
+def prepare_ragas_dataset(df: pd.DataFrame) -> Dataset:
+    """Convert DataFrame to RAGAS Dataset format.
+
+    RAGAS expects:
+      - question: str
+      - answer: str
+      - contexts: List[str]
+      - ground_truth: str
+    """
+    required = {"question", "answer", "ground_truth"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Found: {list(df.columns)}")
+
+    # Parse contexts
+    if "contexts" in df.columns:
+        df["contexts"] = df["contexts"].apply(parse_contexts)
+    else:
+        print("WARNING: 'contexts' column not found. Metrics requiring contexts will fail.")
+        df["contexts"] = [[] for _ in range(len(df))]
+
+    # Ensure all values are strings
+    for col in ["question", "answer", "ground_truth"]:
+        df[col] = df[col].fillna("").astype(str)
+
+    # Convert to RAGAS Dataset
+    data = {
+        "question": df["question"].tolist(),
+        "answer": df["answer"].tolist(),
+        "contexts": df["contexts"].tolist(),
+        "ground_truth": df["ground_truth"].tolist(),
+    }
+
+    return Dataset.from_dict(data)
+
+# ── Metric Selection ───────────────────────────────────────────────────────
+
+def get_metrics() -> List[Any]:
+    """Return the list of RAGAS metrics to evaluate.
+
+    Metrics:
+      - context_precision: Measures if relevant contexts are ranked higher
+      - context_recall: Measures if all ground truth info is in retrieved contexts
+      - context_entity_recall: Measures entity coverage in contexts
+      - noise_sensitivity: Measures robustness to irrelevant contexts
+      - answer_relevancy: Measures how relevant the answer is to the question
+      - faithfulness: Measures if answer is grounded in retrieved contexts
+    """
+    metrics = []
+
+    # Context metrics (require contexts + ground_truth)
+    metrics.append(context_precision)
+    metrics.append(context_recall)
+
+    # Context entity recall (requires contexts + ground_truth)
+    try:
+        metrics.append(context_entity_recall)
+    except Exception as exc:
+        print(f"WARNING: context_entity_recall not available in this RAGAS version: {exc}")
+
+    # Noise sensitivity (requires contexts + ground_truth + answer)
+    try:
+        metrics.append(noise_sensitivity)
+    except Exception as exc:
+        print(f"WARNING: noise_sensitivity not available: {exc}")
+
+    # Answer metrics
+    metrics.append(answer_relevancy)
+    metrics.append(faithfulness)
+
+    return metrics
+
+# ── Evaluation ─────────────────────────────────────────────────────────────
+
+def run_evaluation(ragas_dataset: Dataset, metrics: List[Any], llm, embeddings) -> Dataset:
+    """Run RAGAS evaluation with Bedrock models."""
+    print(f"\nRunning RAGAS evaluation with {len(metrics)} metrics...")
+    for m in metrics:
+        print(f"  - {m.name}")
+
+    result = evaluate(
+        dataset=ragas_dataset,
+        metrics=metrics,
+        llm=llm,
+        embeddings=embeddings,
+    )
+
+    return result
+
+# ── Output ─────────────────────────────────────────────────────────────────
+
+def save_results(result_dataset: Dataset, original_df: pd.DataFrame, output_path: str) -> None:
+    """Merge RAGAS scores with original data and save to Excel."""
+    result_df = result_dataset.to_pandas()
+
+    # RAGAS result columns: question, answer, contexts, ground_truth, metric_1, metric_2, ...
+    # We want to keep original columns and add metric scores
+
+    # Identify metric columns (float values between 0 and 1, or NaN)
+    metric_cols = []
+    for col in result_df.columns:
+        if col not in {"question", "answer", "contexts", "ground_truth"}:
+            metric_cols.append(col)
+
+    print(f"\nMetric scores computed: {metric_cols}")
+
+    # Merge with original dataframe (preserve original column order + add metrics)
+    output_df = original_df.copy()
+    for col in metric_cols:
+        output_df[col] = result_df[col].values
+
+    # Save
+    output_df.to_excel(output_path, index=False)
+    print(f"\nSaved results to: {output_path}")
+    print(f"Total rows: {len(output_df)}")
+
+    # Print summary statistics
+    print("\n--- Metric Summary ---")
+    for col in metric_cols:
+        mean_score = output_df[col].mean()
+        print(f"  {col}: {mean_score:.4f} (mean)")
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("ECMC RAGAS Evaluation (Bedrock Nova Lite + Titan Embed)")
+    print("=" * 60)
+    print(f"LLM: {LLM_MODEL_ID}")
+    print(f"Embeddings: {EMBEDDING_MODEL_ID}")
+    print(f"Region: {REGION}")
+    print()
+
+    # 1. Load data
+    df = load_input_data(INPUT_FILE)
+
+    # 2. Prepare RAGAS dataset
+    ragas_dataset = prepare_ragas_dataset(df)
+    print(f"Prepared RAGAS dataset with {len(ragas_dataset)} samples")
+
+    # 3. Setup Bedrock models
+    print("\nInitializing Bedrock models for RAGAS...")
+    llm = setup_ragas_llm()
+    embeddings = setup_ragas_embeddings()
+    print("Bedrock models ready")
+
+    # 4. Select metrics
+    metrics = get_metrics()
+
+    # 5. Run evaluation
+    result = run_evaluation(ragas_dataset, metrics, llm, embeddings)
+
+    # 6. Save results
+    save_results(result, df, OUTPUT_FILE)
+
+    print("\n" + "=" * 60)
+    print("Evaluation complete")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+##################
 import os
 
 import litellm
