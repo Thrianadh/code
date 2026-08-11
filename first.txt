@@ -1,3 +1,12 @@
+REASONING:
+Re-read every CONTEXT chunk in full, specifically looking for information
+that is topically relevant to the question even if the wording differs.
+Identify which context chunk(s), if any, are relevant. Check whether a
+relevant chunk fully answers the question or only partially. Only
+conclude that the documents do not contain this information after
+confirming this for every chunk provided — never default to "not found"
+from a first-pass read.
+############
 #!/usr/bin/env python3
 """
 RAGAS + LangChain Evaluator for RAG Pipelines
