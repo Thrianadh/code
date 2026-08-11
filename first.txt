@@ -1,3 +1,673 @@
+#!/usr/bin/env python3
+"""
+RAGAS + LangChain Evaluator for RAG Pipelines
+==============================================
+Based on: "Evaluating RAG pipelines with Ragas + LangSmith"
+          https://www.langchain.com/blog/evaluating-rag-pipelines-with-ragas-langsmith
+
+This program demonstrates the article's approach adapted for Excel input/output:
+  1. Evaluates RAG outputs using RAGAS metrics
+  2. Uses RagasEvaluatorChain (LangChain integration) when available
+  3. Integrates with LangSmith for dataset tracking & visualization
+  4. Falls back to manual metric computation (no API keys needed)
+
+Metrics (per article):
+  - faithfulness        : factual accuracy of answer vs context
+  - answer_relevancy    : relevance of answer to the question
+  - context_relevancy   : signal-to-noise ratio of retrieved context
+  - context_recall      : coverage of ground_truth in retrieved context
+  - ragas_score         : harmonic mean of the 4 metrics
+
+Input Excel columns:
+  - question      : user query
+  - answer        : model-generated answer
+  - ground_truth  : expected correct answer
+  - contexts      : retrieved chunks (optional; pipe-separated or JSON list)
+
+Output Excel: original columns + metric score columns
+
+Requirements:
+    pip install pandas openpyxl
+    # Optional (for RAGAS library mode):
+    pip install ragas langchain langsmith
+    # Optional (for LangSmith):
+    export LANGCHAIN_API_KEY="your-key"
+    export LANGCHAIN_PROJECT="your-project"
+
+Usage:
+    python ragas_langchain_evaluator.py
+"""
+
+import os
+import re
+import json
+import sys
+import warnings
+from typing import List, Dict, Any, Optional, Callable
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+import pandas as pd
+
+# ── Configuration ──────────────────────────────────────────────────────────
+
+INPUT_FILE = r"input.xlsx"          # <-- your Excel file path
+OUTPUT_FILE = r"ragas_langchain_output.xlsx"  # <-- output path
+CONTEXT_SEPARATOR = " | "
+
+# LangSmith config (optional)
+LANGSMITH_DATASET_NAME = "RAG Evaluation Dataset"
+LANGSMITH_PROJECT_NAME = "ragas-eval-run"
+
+# ── Detect optional dependencies ───────────────────────────────────────────
+
+RAGAS_AVAILABLE = False
+LANGCHAIN_AVAILABLE = False
+LANGSMITH_AVAILABLE = False
+
+# Try RAGAS
+try:
+    import ragas
+    RAGAS_VERSION = getattr(ragas, "__version__", "unknown")
+    RAGAS_AVAILABLE = True
+    print(f"[INFO] RAGAS detected: v{RAGAS_VERSION}")
+except ImportError:
+    RAGAS_VERSION = None
+    print("[INFO] RAGAS not installed. Using manual metric implementation.")
+
+# Try LangChain
+try:
+    from langchain.chains import RetrievalQA
+    from langchain.document_loaders import WebBaseLoader
+    from langchain.indexes import VectorstoreIndexCreator
+    LANGCHAIN_AVAILABLE = True
+    print("[INFO] LangChain detected.")
+except ImportError:
+    print("[INFO] LangChain not installed. QA chain building disabled.")
+
+# Try LangSmith
+try:
+    from langsmith import Client
+    from langsmith.utils import LangSmithError
+    LANGSMITH_AVAILABLE = True
+    print("[INFO] LangSmith detected.")
+except ImportError:
+    print("[INFO] LangSmith not installed. Dataset upload disabled.")
+
+
+# =============================================================================
+# SECTION 1: DATA MODELS
+# =============================================================================
+
+@dataclass
+class RAGSample:
+    question: str
+    answer: str
+    ground_truth: str
+    contexts: Optional[List[str]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RAGASResult:
+    question: str
+    faithfulness: float
+    answer_relevancy: float
+    context_relevancy: float
+    context_recall: float
+    ragas_score: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# =============================================================================
+# SECTION 2: MANUAL RAGAS METRICS (No API / No LLM)
+# =============================================================================
+# Based on the article's explanations of how each metric works under the hood.
+
+class ManualRAGASEvaluator:
+    """
+    Manual implementation of the 4 RAGAS metrics from the LangChain article.
+    No external LLM calls — uses string similarity and concept matching.
+    """
+
+    def __init__(self):
+        self.stopwords = {
+            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+            'would', 'could', 'should', 'may', 'might', 'must', 'shall',
+            'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in',
+            'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into',
+            'through', 'during', 'before', 'after', 'above', 'below',
+            'between', 'under', 'and', 'but', 'or', 'yet', 'so', 'if',
+            'because', 'although', 'though', 'while', 'where', 'when',
+            'that', 'which', 'who', 'whom', 'whose', 'what', 'this',
+            'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+            'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'its',
+            'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs'
+        }
+
+    def _tokenize(self, text: str) -> List[str]:
+        text = re.sub(r'[^\w\s]', ' ', str(text).lower())
+        return [t for t in text.split() if t.strip()]
+
+    def _extract_concepts(self, text: str) -> set:
+        tokens = self._tokenize(text)
+        return {t for t in tokens if t not in self.stopwords and len(t) > 2}
+
+    def _extract_facts(self, text: str) -> List[str]:
+        sentences = re.split(r'[.!?]+', str(text))
+        return [s.strip() for s in sentences if s.strip()]
+
+    def _sentence_similarity(self, s1: str, s2: str) -> float:
+        w1 = set(self._tokenize(s1))
+        w2 = set(self._tokenize(s2))
+        if not w1 or not w2:
+            return 0.0
+        inter = w1 & w2
+        union = w1 | w2
+        return len(inter) / len(union)
+
+    # ── Faithfulness ────────────────────────────────────────────────────────
+    def faithfulness(self, answer: str, contexts: List[str]) -> float:
+        """
+        Measures factual accuracy of generated answer with context provided.
+        (from article): "number of correct statements / total statements"
+        """
+        if not contexts:
+            return 0.0
+        answer_facts = self._extract_facts(answer)
+        ctx_text = ' '.join(contexts)
+        ctx_facts = self._extract_facts(ctx_text)
+        if not answer_facts:
+            return 0.0
+
+        correct = 0
+        for fact in answer_facts:
+            max_sim = max(
+                (self._sentence_similarity(fact, cf) for cf in ctx_facts),
+                default=0.0
+            )
+            if max_sim >= 0.5:
+                correct += 1
+        return correct / len(answer_facts)
+
+    # ── Answer Relevancy ────────────────────────────────────────────────────
+    def answer_relevancy(self, question: str, answer: str) -> float:
+        """
+        Measures how relevant / to-the-point the answer is to the question.
+        (from article): similarity between actual question and probable questions
+        """
+        q_concepts = self._extract_concepts(question)
+        a_concepts = self._extract_concepts(answer)
+        if not a_concepts:
+            return 0.0
+
+        relevant = 0
+        for ac in a_concepts:
+            if ac in q_concepts:
+                relevant += 1
+            else:
+                for qc in q_concepts:
+                    if ac in qc or qc in ac:
+                        relevant += 1
+                        break
+        return relevant / len(a_concepts)
+
+    # ── Context Relevancy ───────────────────────────────────────────────────
+    def context_relevancy(self, question: str, contexts: List[str]) -> float:
+        """
+        Measures signal-to-noise ratio in retrieved contexts.
+        (from article): "sentences required / total sentences in context"
+        """
+        if not contexts:
+            return 0.0
+        q_concepts = self._extract_concepts(question)
+        all_sentences = []
+        for ctx in contexts:
+            all_sentences.extend(self._extract_facts(ctx))
+        if not all_sentences:
+            return 0.0
+
+        required = 0
+        for sent in all_sentences:
+            sent_concepts = self._extract_concepts(sent)
+            if sent_concepts & q_concepts:
+                required += 1
+        return required / len(all_sentences)
+
+    # ── Context Recall ──────────────────────────────────────────────────────
+    def context_recall(self, ground_truth: str, contexts: List[str]) -> float:
+        """
+        Measures ability of retriever to retrieve all necessary information.
+        (from article): check if each ground_truth statement is found in context.
+        """
+        if not contexts or not ground_truth:
+            return 0.0
+        gt_facts = self._extract_facts(ground_truth)
+        ctx_text = ' '.join(contexts)
+        ctx_facts = self._extract_facts(ctx_text)
+        if not gt_facts:
+            return 0.0
+
+        found = 0
+        for gf in gt_facts:
+            max_sim = max(
+                (self._sentence_similarity(gf, cf) for cf in ctx_facts),
+                default=0.0
+            )
+            if max_sim >= 0.5:
+                found += 1
+        return found / len(gt_facts)
+
+    # ── RAGAS Score (harmonic mean) ─────────────────────────────────────────
+    def ragas_score(self, f: float, ar: float, cr: float, cre: float) -> float:
+        """
+        Harmonic mean of the 4 metrics (as described in the article).
+        """
+        vals = [v for v in [f, ar, cr, cre] if v > 0]
+        if not vals:
+            return 0.0
+        n = len(vals)
+        denom = sum(1 / v for v in vals)
+        return n / denom
+
+    def evaluate(self, sample: RAGSample) -> RAGASResult:
+        ctxs = sample.contexts or []
+        f = self.faithfulness(sample.answer, ctxs)
+        ar = self.answer_relevancy(sample.question, sample.answer)
+        cr = self.context_relevancy(sample.question, ctxs)
+        cre = self.context_recall(sample.ground_truth, ctxs)
+        rs = self.ragas_score(f, ar, cr, cre)
+
+        return RAGASResult(
+            question=sample.question,
+            faithfulness=round(f, 4),
+            answer_relevancy=round(ar, 4),
+            context_relevancy=round(cr, 4),
+            context_recall=round(cre, 4),
+            ragas_score=round(rs, 4)
+        )
+
+
+# =============================================================================
+# SECTION 3: RAGAS LIBRARY + LANGCHAIN INTEGRATION
+# =============================================================================
+# Following the article's code patterns:
+#   from ragas.langchain import RagasEvaluatorChain
+#   eval_chains = {m.name: RagasEvaluatorChain(metric=m) for m in metrics}
+
+class RAGASLibraryEvaluator:
+    """
+    Wrapper around RAGAS library + LangChain RagasEvaluatorChain.
+    Uses the exact pattern from the LangChain blog article.
+    """
+
+    def __init__(self):
+        self.available = False
+        self.metrics = {}
+        self.api_version = None
+
+        if not RAGAS_AVAILABLE:
+            return
+
+        # Try modern RAGAS (0.1.x style function metrics)
+        try:
+            from ragas.metrics import (
+                faithfulness, answer_relevancy,
+                context_relevancy, context_recall
+            )
+            self.metrics = {
+                "faithfulness": faithfulness,
+                "answer_relevancy": answer_relevancy,
+                "context_relevancy": context_relevancy,
+                "context_recall": context_recall,
+            }
+            self.api_version = "0.1.x"
+            self.available = True
+            print("[OK] Using RAGAS 0.1.x API (function-based metrics)")
+        except ImportError:
+            # Try newer RAGAS (0.2.x style class metrics)
+            try:
+                from ragas.metrics import (
+                    Faithfulness, AnswerRelevancy,
+                    ContextPrecision, ContextRecall
+                )
+                self.metrics = {
+                    "faithfulness": Faithfulness(),
+                    "answer_relevancy": AnswerRelevancy(),
+                    "context_relevancy": ContextPrecision(),  # closest mapping
+                    "context_recall": ContextRecall(),
+                }
+                self.api_version = "0.2.x"
+                self.available = True
+                print("[OK] Using RAGAS 0.2.x API (class-based metrics)")
+            except ImportError as e:
+                print(f"[WARN] RAGAS import failed: {e}")
+
+    def evaluate_with_library(self, samples: List[RAGSample]) -> Optional[List[Dict[str, float]]]:
+        """
+        Evaluate using RAGAS library evaluate() + HuggingFace Dataset.
+        This mirrors the article's approach but works with our Excel data.
+        """
+        if not self.available:
+            return None
+
+        try:
+            from datasets import Dataset
+            from ragas import evaluate as ragas_evaluate
+
+            data = {
+                "question": [],
+                "answer": [],
+                "contexts": [],
+                "ground_truth": []
+            }
+            for s in samples:
+                data["question"].append(s.question)
+                data["answer"].append(s.answer)
+                data["contexts"].append(s.contexts or [""])
+                data["ground_truth"].append(s.ground_truth)
+
+            dataset = Dataset.from_dict(data)
+            metric_list = list(self.metrics.values())
+
+            result = ragas_evaluate(dataset=dataset, metrics=metric_list)
+            result_df = result.to_pandas()
+
+            scores = []
+            for _, row in result_df.iterrows():
+                scores.append({
+                    "faithfulness": row.get("faithfulness", 0.0),
+                    "answer_relevancy": row.get("answer_relevancy", 0.0),
+                    "context_relevancy": row.get("context_relevancy", row.get("context_precision", 0.0)),
+                    "context_recall": row.get("context_recall", 0.0),
+                })
+            return scores
+
+        except Exception as e:
+            print(f"[ERROR] RAGAS library evaluation failed: {e}")
+            print("[INFO] Falling back to manual evaluator.")
+            return None
+
+    def create_evaluator_chains(self) -> Optional[Dict[str, Any]]:
+        """
+        Create RagasEvaluatorChain wrappers (as shown in the article).
+        Returns dict of {metric_name: chain}.
+        """
+        if not self.available:
+            return None
+
+        try:
+            from ragas.langchain import RagasEvaluatorChain
+            chains = {}
+            for name, metric in self.metrics.items():
+                chains[name] = RagasEvaluatorChain(metric=metric)
+            print("[OK] Created RagasEvaluatorChain wrappers.")
+            return chains
+        except ImportError:
+            print("[INFO] ragas.langchain not available in this version.")
+            return None
+
+
+# =============================================================================
+# SECTION 4: LANGSMITH INTEGRATION
+# =============================================================================
+# Following the article's pattern for dataset creation and run_on_dataset.
+
+class LangSmithIntegration:
+    """
+    LangSmith dataset upload and evaluation runner.
+    Based on the article's code for creating datasets and running evaluations.
+    """
+
+    def __init__(self):
+        self.client = None
+        if LANGSMITH_AVAILABLE:
+            try:
+                self.client = Client()
+                print("[OK] LangSmith client initialized.")
+            except Exception as e:
+                print(f"[WARN] LangSmith client init failed: {e}")
+
+    def upload_dataset(self, samples: List[RAGSample], dataset_name: str = None) -> Optional[str]:
+        """
+        Upload examples to LangSmith as a dataset.
+        (from article): client.create_dataset() + client.create_example()
+        """
+        if not self.client:
+            print("[INFO] LangSmith not available. Skipping dataset upload.")
+            return None
+
+        dataset_name = dataset_name or LANGSMITH_DATASET_NAME
+
+        try:
+            try:
+                dataset = self.client.read_dataset(dataset_name=dataset_name)
+                print(f"[OK] Using existing LangSmith dataset: {dataset.name}")
+            except LangSmithError:
+                dataset = self.client.create_dataset(
+                    dataset_name=dataset_name,
+                    description="RAG evaluation dataset uploaded from Excel"
+                )
+                print(f"[OK] Created new LangSmith dataset: {dataset.name}")
+
+            for s in samples:
+                self.client.create_example(
+                    inputs={"query": s.question},
+                    outputs={"ground_truths": [s.ground_truth]},
+                    dataset_id=dataset.id,
+                )
+            print(f"[OK] Uploaded {len(samples)} examples to LangSmith.")
+            return dataset.id
+
+        except Exception as e:
+            print(f"[ERROR] LangSmith upload failed: {e}")
+            return None
+
+    def run_evaluation(self, dataset_name: str, chain_factory: Callable,
+                       evaluators: List[Any], prediction_key: str = "result") -> Optional[Any]:
+        """
+        Run evaluation on dataset using run_on_dataset (from article).
+        """
+        if not self.client:
+            print("[INFO] LangSmith not available. Skipping run_on_dataset.")
+            return None
+
+        try:
+            from langchain.smith import RunEvalConfig, run_on_dataset
+
+            evaluation_config = RunEvalConfig(
+                custom_evaluators=evaluators,
+                prediction_key=prediction_key,
+            )
+
+            result = run_on_dataset(
+                self.client,
+                dataset_name,
+                chain_factory,
+                evaluation=evaluation_config,
+            )
+            print(f"[OK] LangSmith evaluation complete.")
+            print(f"[INFO] View results at: {getattr(result, 'project_url', 'LangSmith dashboard')}")
+            return result
+
+        except Exception as e:
+            print(f"[ERROR] LangSmith evaluation failed: {e}")
+            return None
+
+
+# =============================================================================
+# SECTION 5: EXCEL I/O UTILITIES
+# =============================================================================
+
+def parse_contexts(raw_value) -> List[str]:
+    if pd.isna(raw_value):
+        return []
+    if isinstance(raw_value, list):
+        return [str(c).strip() for c in raw_value if c]
+    text = str(raw_value).strip()
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text.replace("'", '"'))
+            if isinstance(parsed, list):
+                return [str(c).strip() for c in parsed if c]
+        except Exception:
+            pass
+    if CONTEXT_SEPARATOR in text:
+        return [c.strip() for c in text.split(CONTEXT_SEPARATOR) if c.strip()]
+    return [text] if text else []
+
+
+def load_excel(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Input file not found: {path}")
+    df = pd.read_excel(path)
+    print(f"[OK] Loaded {len(df)} rows from: {path}")
+    print(f"     Columns: {list(df.columns)}")
+    return df
+
+
+def build_samples(df: pd.DataFrame) -> List[RAGSample]:
+    required = {"question", "answer", "ground_truth"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Found: {list(df.columns)}")
+
+    has_ctx = "contexts" in df.columns
+    if not has_ctx:
+        warnings.warn("'contexts' column not found. Context metrics will be 0.")
+
+    samples = []
+    for _, row in df.iterrows():
+        ctxs = parse_contexts(row["contexts"]) if has_ctx else None
+        samples.append(RAGSample(
+            question=str(row.get("question", "")),
+            answer=str(row.get("answer", "")),
+            ground_truth=str(row.get("ground_truth", "")),
+            contexts=ctxs
+        ))
+    return samples
+
+
+def save_results(df: pd.DataFrame, results: List[RAGASResult], output_path: str) -> pd.DataFrame:
+    out = df.copy()
+    out["faithfulness"] = [r.faithfulness for r in results]
+    out["answer_relevancy"] = [r.answer_relevancy for r in results]
+    out["context_relevancy"] = [r.context_relevancy for r in results]
+    out["context_recall"] = [r.context_recall for r in results]
+    out["ragas_score"] = [r.ragas_score for r in results]
+    out.to_excel(output_path, index=False)
+    print(f"[OK] Saved results to: {output_path}")
+    return out
+
+
+# =============================================================================
+# SECTION 6: REPORTING
+# =============================================================================
+
+def print_summary(results: List[RAGASResult]):
+    print("\n" + "=" * 75)
+    print("  RAGAS EVALUATION SUMMARY")
+    print("  (Based on: Evaluating RAG pipelines with Ragas + LangSmith)")
+    print("=" * 75)
+
+    print(f"\n  {'#':<4} {'Question':<28} {'Faith':<7} {'Relv':<7} {'CtxRel':<7} {'Recall':<7} {'RAGAS':<7}")
+    print("  " + "-" * 64)
+    for i, r in enumerate(results):
+        q = r.question[:25] + "..." if len(r.question) > 28 else r.question
+        print(f"  {i+1:<4} {q:<28} {r.faithfulness:<7.3f} {r.answer_relevancy:<7.3f} "
+              f"{r.context_relevancy:<7.3f} {r.context_recall:<7.3f} {r.ragas_score:<7.3f}")
+
+    print("  " + "-" * 64)
+    for attr in ["faithfulness", "answer_relevancy", "context_relevancy", "context_recall", "ragas_score"]:
+        avg = sum(getattr(r, attr) for r in results) / len(results)
+        print(f"  {'Average ' + attr:<30} : {avg:.4f}")
+
+    print("=" * 75)
+    print("""
+  METRIC DEFINITIONS (from article)
+  ───────────────────────────────────────────────────────────────────────────
+  Faithfulness      → Factual accuracy of answer vs retrieved context
+  Answer Relevancy  → How relevant / to-the-point the answer is
+  Context Relevancy → Signal-to-noise ratio in retrieved contexts
+  Context Recall    → Coverage of ground_truth info in retrieved context
+  RAGAS Score       → Harmonic mean of the 4 metrics above
+    """)
+
+
+# =============================================================================
+# SECTION 7: MAIN
+# =============================================================================
+
+def main():
+    print("=" * 75)
+    print("  RAGAS + LANGCHAIN EVALUATOR")
+    print("  Article: Evaluating RAG pipelines with Ragas + LangSmith")
+    print("=" * 75)
+    print()
+
+    # ── 1. Load Excel ───────────────────────────────────────────────────────
+    df = load_excel(INPUT_FILE)
+    samples = build_samples(df)
+
+    # ── 2. Initialize evaluators ────────────────────────────────────────────
+    manual_eval = ManualRAGASEvaluator()
+    lib_eval = RAGASLibraryEvaluator()
+    ls = LangSmithIntegration()
+
+    # ── 3. Choose evaluation mode ───────────────────────────────────────────
+    results = []
+
+    # Try RAGAS library first (if available and working)
+    lib_scores = None
+    if lib_eval.available:
+        print("\n[3a] Attempting RAGAS library evaluation...")
+        lib_scores = lib_eval.evaluate_with_library(samples)
+
+    if lib_scores:
+        print("[OK] Using RAGAS library scores.")
+        for i, s in enumerate(samples):
+            sc = lib_scores[i]
+            # Compute harmonic mean for ragas_score
+            vals = [sc["faithfulness"], sc["answer_relevancy"],
+                    sc["context_relevancy"], sc["context_recall"]]
+            vals = [v for v in vals if v > 0]
+            ragas = len(vals) / sum(1/v for v in vals) if vals else 0.0
+            results.append(RAGASResult(
+                question=s.question,
+                faithfulness=round(sc["faithfulness"], 4),
+                answer_relevancy=round(sc["answer_relevancy"], 4),
+                context_relevancy=round(sc["context_relevancy"], 4),
+                context_recall=round(sc["context_recall"], 4),
+                ragas_score=round(ragas, 4)
+            ))
+    else:
+        print("\n[3b] Using manual RAGAS metric implementation...")
+        results = [manual_eval.evaluate(s) for s in samples]
+
+    # ── 4. Save results ─────────────────────────────────────────────────────
+    save_results(df, results, OUTPUT_FILE)
+
+    # ── 5. Print summary ────────────────────────────────────────────────────
+    print_summary(results)
+
+    # ── 6. Optional LangSmith upload ────────────────────────────────────────
+    if ls.client:
+        print("\n[6] Uploading to LangSmith...")
+        ls.upload_dataset(samples, LANGSMITH_DATASET_NAME)
+        print("[INFO] To run full LangSmith evaluation with a QA chain,")
+        print("       use the LangSmith dashboard or implement chain_factory.")
+
+    print("\n[DONE] Evaluation complete.")
+
+
+if __name__ == "__main__":
+    main()
+#############
 """
 RAGAS Manual Evaluation — Excel Input/Output
 =============================================
