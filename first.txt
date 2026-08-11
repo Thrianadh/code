@@ -1,3 +1,337 @@
+#!/usr/bin/env python3
+"""RAGAS Evaluation Script for ECMC RAG Pipeline — Version-Agnostic.
+
+Handles both RAGAS 0.1.x and 0.2.x APIs.
+Uses AWS Bedrock (Nova Lite + Titan Embed) as judge LLM and embeddings.
+
+Input Excel columns required:
+  - question: The user query
+  - answer: The model-generated answer
+  - ground_truth: The expected/correct answer
+  - contexts: Retrieved chunks (list, pipe-separated string, or JSON string)
+
+Output Excel: original columns + metric score columns
+
+Usage:
+    python ragas_evaluate_v2.py
+"""
+
+import json
+import os
+import sys
+import warnings
+from typing import Any, Dict, List, Optional
+
+import boto3
+import pandas as pd
+from datasets import Dataset
+
+# ── Detect RAGAS version and import accordingly ──────────────────────────────
+
+RAGAS_VERSION = None
+METRICS = {}
+
+try:
+    import ragas
+    RAGAS_VERSION = getattr(ragas, "__version__", "unknown")
+    print(f"RAGAS version detected: {RAGAS_VERSION}")
+except ImportError:
+    print("ERROR: RAGAS is not installed.")
+    print(f"Run: {sys.executable} -m pip install ragas")
+    sys.exit(1)
+
+# Try RAGAS 0.2.x API first (current default from pip)
+try:
+    from ragas import evaluate
+    from ragas.metrics import (
+        ContextPrecision,
+        ContextRecall,
+        ContextEntityRecall,
+        Faithfulness,
+        AnswerRelevancy,
+    )
+    # NoiseSensitivity might not exist in all 0.2.x versions
+    try:
+        from ragas.metrics import NoiseSensitivity
+        METRICS["noise_sensitivity"] = NoiseSensitivity()
+    except ImportError:
+        warnings.warn("NoiseSensitivity not available in this RAGAS version. Skipping.")
+
+    METRICS["context_precision"] = ContextPrecision()
+    METRICS["context_recall"] = ContextRecall()
+    METRICS["context_entity_recall"] = ContextEntityRecall()
+    METRICS["faithfulness"] = Faithfulness()
+    METRICS["answer_relevancy"] = AnswerRelevancy()
+    API_VERSION = "0.2.x"
+    print("Using RAGAS 0.2.x API (class-based metrics)")
+
+except ImportError:
+    # Fall back to RAGAS 0.1.x API
+    try:
+        from ragas import evaluate
+        from ragas.metrics import (
+            context_precision,
+            context_recall,
+            context_entity_recall,
+            faithfulness,
+            answer_relevancy,
+        )
+        try:
+            from ragas.metrics import noise_sensitivity
+            METRICS["noise_sensitivity"] = noise_sensitivity
+        except ImportError:
+            warnings.warn("noise_sensitivity not available. Skipping.")
+
+        METRICS["context_precision"] = context_precision
+        METRICS["context_recall"] = context_recall
+        METRICS["context_entity_recall"] = context_entity_recall
+        METRICS["faithfulness"] = faithfulness
+        METRICS["answer_relevancy"] = answer_relevancy
+        API_VERSION = "0.1.x"
+        print("Using RAGAS 0.1.x API (function-based metrics)")
+
+    except ImportError as e:
+        print(f"ERROR: Could not import RAGAS metrics: {e}")
+        print("Your RAGAS version might be incompatible.")
+        print(f"Installed version: {RAGAS_VERSION}")
+        print("Try: pip install --upgrade ragas")
+        sys.exit(1)
+
+# ── LangChain AWS imports ──────────────────────────────────────────────────
+
+try:
+    from langchain_aws import ChatBedrock, BedrockEmbeddings
+except ImportError:
+    print("ERROR: langchain-aws not installed.")
+    print(f"Run: {sys.executable} -m pip install langchain-aws")
+    sys.exit(1)
+
+# RAGAS wrapper imports (version-dependent)
+try:
+    # RAGAS 0.2.x
+    from ragas.llms import LangchainLLMWrapper
+    from ragas.embeddings import LangchainEmbeddingsWrapper
+except ImportError:
+    try:
+        # RAGAS 0.1.x
+        from ragas.llms import LangchainLLMWrapper
+        from ragas.embeddings import LangchainEmbeddingsWrapper
+    except ImportError:
+        # Some versions don't need explicit wrappers
+        LangchainLLMWrapper = None
+        LangchainEmbeddingsWrapper = None
+
+# ── Configuration ──────────────────────────────────────────────────────────
+REGION = "us-east-1"
+LLM_MODEL_ID = "amazon.nova-lite-v1:0"
+EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+
+INPUT_FILE = r"D:\Users\ntrinadh\Downloads\bankruptcy-pod-dev-swapnil\bankruptcy-pod-dev-swapnil\lambdas\teams_bot_bky\src\group11_output1.xlsx"
+OUTPUT_FILE = r"D:\Users\ntrinadh\Downloads\bankruptcy-pod-dev-swapnil\bankruptcy-pod-dev-swapnil\lambdas\teams_bot_bky\src\ragas_group11_output1.xlsx"
+
+CONTEXT_SEPARATOR = " | "
+
+# ── Bedrock Setup ──────────────────────────────────────────────────────────
+
+def setup_bedrock_llm():
+    """Create Bedrock LLM for RAGAS evaluation."""
+    llm = ChatBedrock(
+        model_id=LLM_MODEL_ID,
+        region_name=REGION,
+        model_kwargs={"temperature": 0.0, "max_tokens": 1024},
+    )
+    if LangchainLLMWrapper:
+        return LangchainLLMWrapper(llm)
+    return llm
+
+
+def setup_bedrock_embeddings():
+    """Create Bedrock embeddings for RAGAS evaluation."""
+    emb = BedrockEmbeddings(
+        model_id=EMBEDDING_MODEL_ID,
+        region_name=REGION,
+    )
+    if LangchainEmbeddingsWrapper:
+        return LangchainEmbeddingsWrapper(emb)
+    return emb
+
+# ── Data Loading ───────────────────────────────────────────────────────────
+
+def load_input_data(excel_path: str) -> pd.DataFrame:
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f"Input file not found: {excel_path}")
+    df = pd.read_excel(excel_path)
+    print(f"Loaded {len(df)} rows from {excel_path}")
+    print(f"Columns: {list(df.columns)}")
+    return df
+
+
+def parse_contexts(raw_contexts) -> List[str]:
+    """Parse contexts into list of strings."""
+    if pd.isna(raw_contexts):
+        return []
+    if isinstance(raw_contexts, list):
+        return [str(c).strip() for c in raw_contexts if c]
+    text = str(raw_contexts).strip()
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text.replace("'", '"'))
+            if isinstance(parsed, list):
+                return [str(c).strip() for c in parsed if c]
+        except Exception:
+            pass
+    if CONTEXT_SEPARATOR in text:
+        return [c.strip() for c in text.split(CONTEXT_SEPARATOR) if c.strip()]
+    return [text] if text else []
+
+
+def prepare_ragas_dataset(df: pd.DataFrame) -> Dataset:
+    required = {"question", "answer", "ground_truth"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Found: {list(df.columns)}")
+
+    if "contexts" in df.columns:
+        df["contexts"] = df["contexts"].apply(parse_contexts)
+    else:
+        print("WARNING: 'contexts' column not found. Context metrics will score 0.")
+        df["contexts"] = [[] for _ in range(len(df))]
+
+    for col in ["question", "answer", "ground_truth"]:
+        df[col] = df[col].fillna("").astype(str)
+
+    data = {
+        "question": df["question"].tolist(),
+        "answer": df["answer"].tolist(),
+        "contexts": df["contexts"].tolist(),
+        "ground_truth": df["ground_truth"].tolist(),
+    }
+    return Dataset.from_dict(data)
+
+# ── Evaluation ─────────────────────────────────────────────────────────────
+
+def run_evaluation(ragas_dataset: Dataset, llm, embeddings) -> Dataset:
+    metric_list = list(METRICS.values())
+    print(f"\nRunning RAGAS evaluation with {len(metric_list)} metrics:")
+    for name, metric in METRICS.items():
+        print(f"  - {name}")
+
+    # RAGAS 0.2.x uses evaluate() with llm and embeddings kwargs
+    # RAGAS 0.1.x uses evaluate() with the same kwargs
+    try:
+        result = evaluate(
+            dataset=ragas_dataset,
+            metrics=metric_list,
+            llm=llm,
+            embeddings=embeddings,
+        )
+    except TypeError as e:
+        # Some versions might not accept embeddings parameter
+        print(f"Warning: {e}. Retrying without embeddings parameter...")
+        result = evaluate(
+            dataset=ragas_dataset,
+            metrics=metric_list,
+            llm=llm,
+        )
+
+    return result
+
+# ── Output ─────────────────────────────────────────────────────────────────
+
+def save_results(result_dataset: Dataset, original_df: pd.DataFrame, output_path: str) -> None:
+    result_df = result_dataset.to_pandas()
+
+    # Identify metric columns (not in original input columns)
+    input_cols = {"question", "answer", "contexts", "ground_truth"}
+    metric_cols = [c for c in result_df.columns if c not in input_cols]
+
+    print(f"\nMetric scores computed: {metric_cols}")
+
+    output_df = original_df.copy()
+    for col in metric_cols:
+        output_df[col] = result_df[col].values
+
+    output_df.to_excel(output_path, index=False)
+    print(f"\nSaved results to: {output_path}")
+    print(f"Total rows: {len(output_df)}")
+
+    print("\n--- Metric Summary ---")
+    for col in metric_cols:
+        mean_score = output_df[col].mean()
+        print(f"  {col}: {mean_score:.4f} (mean)")
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("ECMC RAGAS Evaluation")
+    print(f"RAGAS API: {API_VERSION}")
+    print(f"LLM: {LLM_MODEL_ID}")
+    print(f"Embeddings: {EMBEDDING_MODEL_ID}")
+    print("=" * 60)
+    print()
+
+    df = load_input_data(INPUT_FILE)
+    ragas_dataset = prepare_ragas_dataset(df)
+    print(f"Prepared dataset with {len(ragas_dataset)} samples")
+
+    print("\nInitializing Bedrock models...")
+    llm = setup_bedrock_llm()
+    embeddings = setup_bedrock_embeddings()
+    print("Models ready")
+
+    result = run_evaluation(ragas_dataset, llm, embeddings)
+    save_results(result, df, OUTPUT_FILE)
+
+    print("\n" + "=" * 60)
+    print("Evaluation complete")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+########
+#!/usr/bin/env python3
+"""Check RAGAS installation and version."""
+
+import sys
+import subprocess
+
+print("Python executable:", sys.executable)
+print("Python version:", sys.version)
+print()
+
+# Check if ragas is installed
+try:
+    import ragas
+    print(f"RAGAS version: {ragas.__version__}")
+    print(f"RAGAS location: {ragas.__file__}")
+    print()
+
+    # Try listing available metrics
+    print("Available metrics in ragas.metrics:")
+    import ragas.metrics as m
+    for attr in dir(m):
+        if not attr.startswith("_"):
+            print(f"  - {attr}")
+    print()
+
+    # Try the evaluate function
+    from ragas import evaluate
+    print("ragas.evaluate: OK")
+
+except ImportError as e:
+    print(f"ERROR: {e}")
+    print()
+    print("RAGAS is not installed in this Python environment.")
+    print(f"Current environment: {sys.executable}")
+    print()
+    print("Try one of these:")
+    print(f"  {sys.executable} -m pip install ragas datasets pandas openpyxl langchain-aws boto3")
+    print()
+    print("Or if using conda:")
+    print(f"  conda install -c conda-forge ragas")
+##############
 import json
 import os
 import sys
