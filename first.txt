@@ -1,3 +1,436 @@
+"""
+RAGAS Manual Evaluation — Excel Input/Output
+=============================================
+Standalone evaluator (no LLM/API required) based on:
+"RAGAS for RAG in LLMs: A Comprehensive Guide to Evaluation Metrics"
+
+Metrics evaluated:
+  - faithfulness
+  - answer_relevancy
+  - answer_correctness
+  - context_precision
+  - context_recall
+
+Input : Excel file with columns: question, answer, ground_truth
+        Optional column: contexts (retrieved documents)
+Output: Excel file with original columns + 5 metric score columns
+
+Requirements:
+    pip install pandas openpyxl
+
+Usage:
+    python ragas_excel_evaluator.py
+"""
+
+import os
+import re
+import json
+import warnings
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, asdict
+
+import pandas as pd
+
+# ── Configuration ──────────────────────────────────────────────────────────
+
+INPUT_FILE = r"input.xlsx"      # <-- Change this to your Excel path
+OUTPUT_FILE = r"ragas_output.xlsx"  # <-- Change this to desired output path
+CONTEXT_SEPARATOR = " | "       # Separator if contexts are pipe-delimited
+
+
+# =============================================================================
+# SECTION 1: DATA MODEL
+# =============================================================================
+
+@dataclass
+class RAGSample:
+    """Single row of RAG evaluation data."""
+    question: str
+    answer: str
+    ground_truth: str
+    contexts: Optional[List[str]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RAGASResult:
+    """Evaluation results for a single sample."""
+    question: str
+    faithfulness: float
+    answer_relevancy: float
+    answer_correctness: float
+    context_precision: float
+    context_recall: float
+    overall_ragas_score: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# =============================================================================
+# SECTION 2: MANUAL RAGAS METRICS (No LLM / No API)
+# =============================================================================
+
+class ManualRAGASEvaluator:
+    """
+    Manual implementation of the 5 core RAGAS metrics.
+    Based on formulas from the Medium article.
+    """
+
+    def __init__(self):
+        self.stopwords = {
+            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+            'would', 'could', 'should', 'may', 'might', 'must', 'shall',
+            'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in',
+            'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into',
+            'through', 'during', 'before', 'after', 'above', 'below',
+            'between', 'under', 'and', 'but', 'or', 'yet', 'so', 'if',
+            'because', 'although', 'though', 'while', 'where', 'when',
+            'that', 'which', 'who', 'whom', 'whose', 'what', 'this',
+            'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+            'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'its',
+            'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs'
+        }
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _tokenize(self, text: str) -> List[str]:
+        text = re.sub(r'[^\w\s]', ' ', str(text).lower())
+        return [t for t in text.split() if t.strip()]
+
+    def _extract_concepts(self, text: str) -> set:
+        tokens = self._tokenize(text)
+        return {t for t in tokens if t not in self.stopwords and len(t) > 2}
+
+    def _extract_facts(self, text: str) -> List[str]:
+        sentences = re.split(r'[.!?]+', str(text))
+        return [s.strip() for s in sentences if s.strip()]
+
+    def _sentence_similarity(self, sent1: str, sent2: str) -> float:
+        words1 = set(self._tokenize(sent1))
+        words2 = set(self._tokenize(sent2))
+        if not words1 or not words2:
+            return 0.0
+        intersection = words1 & words2
+        union = words1 | words2
+        return len(intersection) / len(union)
+
+    # ── Metric 1: Faithfulness ──────────────────────────────────────────────
+    def faithfulness(self, answer: str, contexts: List[str]) -> float:
+        """
+        Faithfulness = Correct Facts / Total Facts
+        Measures factual accuracy of the answer based on retrieved documents.
+        """
+        if not contexts:
+            return 0.0
+
+        answer_facts = self._extract_facts(answer)
+        context_text = ' '.join(contexts)
+        context_facts = self._extract_facts(context_text)
+
+        if not answer_facts:
+            return 0.0
+
+        correct = 0
+        for fact in answer_facts:
+            max_sim = max(
+                (self._sentence_similarity(fact, cf) for cf in context_facts),
+                default=0.0
+            )
+            if max_sim >= 0.5:
+                correct += 1
+
+        return correct / len(answer_facts)
+
+    # ── Metric 2: Answer Relevancy ──────────────────────────────────────────
+    def answer_relevancy(self, question: str, answer: str) -> float:
+        """
+        Answer Relevancy = Relevant Concepts / Total Concepts
+        Evaluates how relevant the answer is to the original question.
+        """
+        q_concepts = self._extract_concepts(question)
+        a_concepts = self._extract_concepts(answer)
+
+        if not a_concepts:
+            return 0.0
+
+        relevant = 0
+        for ac in a_concepts:
+            if ac in q_concepts:
+                relevant += 1
+            else:
+                for qc in q_concepts:
+                    if ac in qc or qc in ac:
+                        relevant += 1
+                        break
+
+        return relevant / len(a_concepts)
+
+    # ── Metric 3: Answer Correctness ────────────────────────────────────────
+    def answer_correctness(self, answer: str, ground_truth: str) -> float:
+        """
+        Measures correctness of generated answer vs ground truth.
+        Combines semantic similarity (Jaccard) and factual overlap (F1).
+        """
+        if not ground_truth:
+            return 0.0
+
+        a_concepts = self._extract_concepts(answer)
+        gt_concepts = self._extract_concepts(ground_truth)
+
+        if not a_concepts or not gt_concepts:
+            return 0.0
+
+        intersection = a_concepts & gt_concepts
+        union = a_concepts | gt_concepts
+        jaccard = len(intersection) / len(union) if union else 0.0
+
+        a_facts = self._extract_facts(answer)
+        gt_facts = self._extract_facts(ground_truth)
+
+        matched = 0
+        for af in a_facts:
+            for gf in gt_facts:
+                if self._sentence_similarity(af, gf) >= 0.6:
+                    matched += 1
+                    break
+
+        precision = matched / len(a_facts) if a_facts else 0.0
+        recall = matched / len(gt_facts) if gt_facts else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+        return 0.5 * jaccard + 0.5 * f1
+
+    # ── Metric 4: Context Precision ─────────────────────────────────────────
+    def context_precision(self, question: str, contexts: List[str]) -> float:
+        """
+        Context Precision = Relevant Sentences / Total Sentences Retrieved
+        Measures precision of retrieved documents.
+        """
+        if not contexts:
+            return 0.0
+
+        q_concepts = self._extract_concepts(question)
+        all_sentences = []
+        for ctx in contexts:
+            all_sentences.extend(self._extract_facts(ctx))
+
+        if not all_sentences:
+            return 0.0
+
+        relevant = 0
+        for sent in all_sentences:
+            sent_concepts = self._extract_concepts(sent)
+            if sent_concepts & q_concepts:
+                relevant += 1
+
+        return relevant / len(all_sentences)
+
+    # ── Metric 5: Context Recall ────────────────────────────────────────────
+    def context_recall(self, question: str, contexts: List[str], ground_truth: str) -> float:
+        """
+        Context Recall = Relevant Sentences Retrieved / Total Relevant Sentences Available
+        Assesses coverage of retrieved documents against ground truth.
+        """
+        if not contexts or not ground_truth:
+            return 0.0
+
+        gt_facts = self._extract_facts(ground_truth)
+        context_text = ' '.join(contexts)
+        context_facts = self._extract_facts(context_text)
+
+        if not gt_facts:
+            return 0.0
+
+        retrieved = 0
+        for gf in gt_facts:
+            max_sim = max(
+                (self._sentence_similarity(gf, cf) for cf in context_facts),
+                default=0.0
+            )
+            if max_sim >= 0.5:
+                retrieved += 1
+
+        return retrieved / len(gt_facts)
+
+    # ── Overall RAGAS Score ─────────────────────────────────────────────────
+    def overall_score(self, f: float, ar: float, ac: float, cp: float, cr: float) -> float:
+        """Average of all 5 metrics."""
+        return (f + ar + ac + cp + cr) / 5.0
+
+    # ── Evaluate single sample ──────────────────────────────────────────────
+    def evaluate(self, sample: RAGSample) -> RAGASResult:
+        contexts = sample.contexts or []
+
+        f = self.faithfulness(sample.answer, contexts)
+        ar = self.answer_relevancy(sample.question, sample.answer)
+        ac = self.answer_correctness(sample.answer, sample.ground_truth)
+        cp = self.context_precision(sample.question, contexts)
+        cr = self.context_recall(sample.question, contexts, sample.ground_truth)
+        overall = self.overall_score(f, ar, ac, cp, cr)
+
+        return RAGASResult(
+            question=sample.question,
+            faithfulness=round(f, 4),
+            answer_relevancy=round(ar, 4),
+            answer_correctness=round(ac, 4),
+            context_precision=round(cp, 4),
+            context_recall=round(cr, 4),
+            overall_ragas_score=round(overall, 4)
+        )
+
+
+# =============================================================================
+# SECTION 3: EXCEL I/O
+# =============================================================================
+
+def parse_contexts(raw_value) -> List[str]:
+    """Parse contexts from various Excel formats."""
+    if pd.isna(raw_value):
+        return []
+    if isinstance(raw_value, list):
+        return [str(c).strip() for c in raw_value if c]
+
+    text = str(raw_value).strip()
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text.replace("'", '"'))
+            if isinstance(parsed, list):
+                return [str(c).strip() for c in parsed if c]
+        except Exception:
+            pass
+
+    if CONTEXT_SEPARATOR in text:
+        return [c.strip() for c in text.split(CONTEXT_SEPARATOR) if c.strip()]
+
+    return [text] if text else []
+
+
+def load_excel(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Input file not found: {path}")
+    df = pd.read_excel(path)
+    print(f"[OK] Loaded {len(df)} rows from: {path}")
+    print(f"     Columns: {list(df.columns)}")
+    return df
+
+
+def build_samples(df: pd.DataFrame) -> List[RAGSample]:
+    required = {"question", "answer", "ground_truth"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Found: {list(df.columns)}")
+
+    has_contexts = "contexts" in df.columns
+    if not has_contexts:
+        warnings.warn("'contexts' column not found. Faithfulness, Context Precision, and Context Recall will be 0.")
+
+    samples = []
+    for _, row in df.iterrows():
+        contexts = parse_contexts(row["contexts"]) if has_contexts else None
+        samples.append(RAGSample(
+            question=str(row["question"]),
+            answer=str(row["answer"]),
+            ground_truth=str(row["ground_truth"]),
+            contexts=contexts
+        ))
+    return samples
+
+
+def save_results(df: pd.DataFrame, results: List[RAGASResult], output_path: str):
+    """Merge metric scores back into original DataFrame and save."""
+    output_df = df.copy()
+
+    output_df["faithfulness"] = [r.faithfulness for r in results]
+    output_df["answer_relevancy"] = [r.answer_relevancy for r in results]
+    output_df["answer_correctness"] = [r.answer_correctness for r in results]
+    output_df["context_precision"] = [r.context_precision for r in results]
+    output_df["context_recall"] = [r.context_recall for r in results]
+    output_df["overall_ragas_score"] = [r.overall_ragas_score for r in results]
+
+    output_df.to_excel(output_path, index=False)
+    print(f"[OK] Saved results to: {output_path}")
+    return output_df
+
+
+# =============================================================================
+# SECTION 4: REPORTING
+# =============================================================================
+
+def print_summary(results: List[RAGASResult]):
+    print("\n" + "=" * 70)
+    print("  RAGAS EVALUATION SUMMARY")
+    print("=" * 70)
+
+    metric_names = ["faithfulness", "answer_relevancy", "answer_correctness",
+                    "context_precision", "context_recall", "overall_ragas_score"]
+
+    # Per-row table
+    print(f"\n  {'#':<4} {'Question':<30} {'Faith':<7} {'Relv':<7} {'Corr':<7} {'Prec':<7} {'Recall':<7} {'Overall':<8}")
+    print("  " + "-" * 66)
+    for i, r in enumerate(results):
+        q = r.question[:27] + "..." if len(r.question) > 30 else r.question
+        print(f"  {i+1:<4} {q:<30} {r.faithfulness:<7.3f} {r.answer_relevancy:<7.3f} "
+              f"{r.answer_correctness:<7.3f} {r.context_precision:<7.3f} {r.context_recall:<7.3f} {r.overall_ragas_score:<8.3f}")
+
+    print("  " + "-" * 66)
+
+    # Averages
+    for name in metric_names:
+        avg = sum(getattr(r, name) for r in results) / len(results)
+        print(f"  {'Average ' + name:<30} : {avg:.4f}")
+
+    print("=" * 70)
+
+    # Interpretation
+    print("""
+  INTERPRETATION GUIDE (from article)
+  ─────────────────────────────────────────────────────────────────────
+  Faithfulness       > 0.80  →  Facts in answer are supported by context
+  Answer Relevancy   > 0.75  →  Answer is relevant to the question
+  Answer Correctness > 0.80  →  Answer matches ground truth
+  Context Precision  > 0.70  →  Retrieved docs are mostly relevant
+  Context Recall     > 0.80  →  Retrieved docs cover ground truth well
+  Overall Score      > 0.75  →  Good overall RAG performance
+    """)
+
+
+# =============================================================================
+# SECTION 5: MAIN
+# =============================================================================
+
+def main():
+    print("=" * 70)
+    print("  RAGAS EXCEL EVALUATOR")
+    print("  Metrics: faithfulness | answer_relevancy | answer_correctness")
+    print("           context_precision | context_recall")
+    print("=" * 70)
+
+    # 1. Load data
+    df = load_excel(INPUT_FILE)
+
+    # 2. Build samples
+    samples = build_samples(df)
+
+    # 3. Evaluate
+    evaluator = ManualRAGASEvaluator()
+    results = [evaluator.evaluate(s) for s in samples]
+
+    # 4. Save
+    output_df = save_results(df, results, OUTPUT_FILE)
+
+    # 5. Report
+    print_summary(results)
+
+    print("\n[DONE] Evaluation complete.")
+
+
+if __name__ == "__main__":
+    main()
+######################
 #!/usr/bin/env python3
 """RAGAS Evaluation Script for ECMC RAG Pipeline — Version-Agnostic.
 
