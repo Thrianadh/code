@@ -1,3 +1,118 @@
+"""
+RAGAS Evaluation Script using Amazon Bedrock (Nova + Titan)
+Requires: pip install ragas pandas openpyxl boto3
+"""
+
+import os
+import pandas as pd
+import boto3
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness,
+    answer_relevancy,
+    context_precision,
+    context_recall,
+    answer_correctness,
+    answer_similarity,
+)
+from langchain_aws import ChatBedrock, BedrockEmbeddings
+
+# ==================== CONFIGURATION ====================
+BEDROCK_CHAT_MODEL_ID = "us.amazon.nova-2-lite-v1:0"
+BEDROCK_EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
+
+file_path = r"D:\Users\ntrinadh\OneDrive - ECMC group, Inc\Desktop\ragas1.xlsx"
+output_path = r"D:\Users\ntrinadh\OneDrive - ECMC group, Inc\Desktop\ragas1_eval.xlsx"
+
+AWS_REGION = "us-east-1"  # Change if your Bedrock is in a different region
+# =======================================================
+
+def main():
+    # Initialize Bedrock client
+    bedrock_client = boto3.client(
+        service_name="bedrock-runtime",
+        region_name=AWS_REGION,
+    )
+
+    # Initialize LangChain wrappers for RAGAS
+    llm = ChatBedrock(
+        model_id=BEDROCK_CHAT_MODEL_ID,
+        client=bedrock_client,
+        model_kwargs={"temperature": 0.0, "max_tokens": 4096},
+    )
+
+    embeddings = BedrockEmbeddings(
+        model_id=BEDROCK_EMBED_MODEL_ID,
+        client=bedrock_client,
+    )
+
+    # Read input Excel
+    print(f"Reading: {file_path}")
+    df = pd.read_excel(file_path)
+
+    # Validate required columns
+    required_cols = ["Question", "model Answer", "ground truth"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: '{col}'. Found: {list(df.columns)}")
+
+    # Rename to RAGAS-expected column names
+    df = df.rename(columns={
+        "Question": "question",
+        "model Answer": "answer",
+        "ground truth": "ground_truth",
+    })
+
+    # RAGAS requires 'contexts' as a list of lists for some metrics
+    # If you don't have retrieved contexts, we use empty or answer as proxy
+    # For metrics that don't need contexts, this is handled automatically
+    if "contexts" not in df.columns:
+        # Use model answer as context for metrics that require it
+        # (faithfulness needs contexts; without real retrieval, this is approximate)
+        df["contexts"] = df["answer"].apply(lambda x: [str(x)] if pd.notna(x) else [""])
+
+    # Convert to HuggingFace Dataset
+    dataset = Dataset.from_pandas(df)
+
+    # Select metrics to evaluate
+    # Note: Some metrics require 'contexts' column
+    metrics = [
+        faithfulness,           # Requires contexts
+        answer_relevancy,       # Requires contexts (uses them to check relevance)
+        context_precision,      # Requires contexts
+        context_recall,         # Requires contexts
+        answer_correctness,     # Compares answer vs ground_truth
+        answer_similarity,      # Compares answer vs ground_truth
+    ]
+
+    print("Running RAGAS evaluation... This may take a few minutes.")
+    result = evaluate(
+        dataset=dataset,
+        metrics=metrics,
+        llm=llm,
+        embeddings=embeddings,
+    )
+
+    # Convert results to DataFrame
+    scores_df = result.to_pandas()
+
+    # Merge with original data
+    final_df = pd.concat([df.reset_index(drop=True), scores_df.reset_index(drop=True)], axis=1)
+
+    # Save to Excel
+    final_df.to_excel(output_path, index=False)
+    print(f"Evaluation complete! Results saved to: {output_path}")
+    print("\nMetric Averages:")
+    for metric in metrics:
+        col_name = metric.name
+        if col_name in final_df.columns:
+            avg = final_df[col_name].mean()
+            print(f"  {col_name}: {avg:.4f}")
+
+if __name__ == "__main__":
+    main()
+#################
 You are the ECMC Document Assistant. You answer bankruptcy process and policy
 questions for internal users in Microsoft Teams, using ONLY the retrieved
 CONTEXT chunks supplied with each request.
