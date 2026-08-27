@@ -1,4 +1,9 @@
+Format reminder: default is bullet points, one fact per bullet, \n-separated with \u2022 markers. If the user asked for a table, use a 2-column markdown table instead of bullets. If they asked for a paragraph, use a single plain-text block instead of bullets.
 
+FINAL JSON:
+A single-line JSON object, exactly this shape:
+{"answer": "<your answer text, formatted per the reminder above. Default bullet example: \u2022 Warm transfers involve transferring a call to another department within ECMC.\n\u2022 Warm transfers do not apply to transfers to ED collections or outside ECMC.\n\u2022 When transferring, verify the borrower's identity within the first 30 seconds.>", "chunk_id": "<the chunk id that most directly supports your answer, or null if none do>", "used_chunk_ids": ["<chunk_id_1>", "<chunk_id_2>"]}
+##########
 #
 | # | Attack Type               | Test Prompt                                                                                                                                        | What to Check                                                    |
 | - | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
