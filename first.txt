@@ -1,3 +1,11 @@
+Each bullet must be one crisp sentence or key thought.
+
+Each bullet MUST appear on its own separate fine. NEVER place multiple bullets on the same line.
+
+This still applies when there is only one key fact — output it as a single \u2022 bullet, not a plain sentence. A one-item list is still a list.
+
+
+########
 This still applies when there is only one key fact — output it as a single \u2022 bullet, not a plain sentence. A one-item list is still a list.
 
 CORRECT EXAMPLE — single fact (user asks "What is a Pell Grant?" with no format request):
