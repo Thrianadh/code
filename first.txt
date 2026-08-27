@@ -1,3 +1,9 @@
+The fix for Defect Id_11 I have already shared the screenshots with you and the default bullet-point behavior and format overrides are now working as expected.
+
+
+
+Below are the test queries I ran frequently to verify the fix. You can use the same set or different questions for your validation
+#############
 Each bullet must be one crisp sentence or key thought.
 
 Each bullet MUST appear on its own separate fine. NEVER place multiple bullets on the same line.
