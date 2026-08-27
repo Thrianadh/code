@@ -1,3 +1,8 @@
+This still applies when there is only one key fact — output it as a single \u2022 bullet, not a plain sentence. A one-item list is still a list.
+
+CORRECT EXAMPLE — single fact (user asks "What is a Pell Grant?" with no format request):
+\u2022 A Pell Grant is federal financial aid that does not need to be repaid unless the recipient withdraws from school.
+############
 Format reminder: default is bullet points, one fact per bullet, \n-separated with \u2022 markers. If the user asked for a table, use a 2-column markdown table instead of bullets. If they asked for a paragraph, use a single plain-text block instead of bullets.
 
 FINAL JSON:
